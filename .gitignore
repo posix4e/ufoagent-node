@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+build/_work/
+build/__pycache__/
+dist/
+installer/Output/
+.venv/
+venv/
+.ruff_cache/
+*.spec.bak
+.DS_Store
+agent.token
+config.json

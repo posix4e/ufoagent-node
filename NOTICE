@@ -1,0 +1,12 @@
+UFOAgent node agent (ufoagent-node)
+Copyright 2026 UFOAgent
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product is designed to install, configure, and run Microsoft UFO2
+("UFO²: The Desktop AgentOS"), which is a separate project licensed under the
+MIT License: https://github.com/microsoft/UFO
+
+UFO2 is not bundled in this repository; it is installed alongside the agent on
+the target Windows machine. All UFO2 trademarks and copyrights belong to their
+respective owners.
