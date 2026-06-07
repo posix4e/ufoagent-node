@@ -58,7 +58,7 @@ jobs:
 
       - name: Build installer
         shell: pwsh
-        run: '& "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.ver.outputs.version }}" installer\ufoagent.iss'
+        run: '& "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=${{ steps.ver.outputs.version }}" installer\ufoagent.iss'
 
       - name: Sign installer (Azure Trusted Signing)
         if: env.SIGNING_ENDPOINT != ''
