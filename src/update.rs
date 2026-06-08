@@ -201,12 +201,20 @@ mod win {
             data.Anonymous.pFile = &mut file_info as *mut _;
 
             let mut action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
-            let data_ptr = &mut data as *mut _ as *mut core::ffi::c_void;
-            let status = WinVerifyTrust(HWND::default(), &mut action, data_ptr);
+            let status = WinVerifyTrust(
+                HWND::default(),
+                &mut action,
+                &mut data as *mut _ as *mut core::ffi::c_void,
+            );
 
-            // Always release the state data, regardless of the verdict.
+            // Always release the state data, regardless of the verdict. Re-borrow `data` here
+            // (rather than reuse a cached pointer) so the CLOSE write is seen as observed.
             data.dwStateAction = WTD_STATEACTION_CLOSE;
-            let _ = WinVerifyTrust(HWND::default(), &mut action, data_ptr);
+            let _ = WinVerifyTrust(
+                HWND::default(),
+                &mut action,
+                &mut data as *mut _ as *mut core::ffi::c_void,
+            );
 
             if status != 0 {
                 bail!("Authenticode verification failed (status 0x{:08x})", status);
