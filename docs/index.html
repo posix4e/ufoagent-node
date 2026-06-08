@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>UFOAgent — run Microsoft UFO2 with auto-refreshed LLM credentials</title>
+<meta name="description" content="Open-source Windows agent for Microsoft UFO2. Download, install, link — your machine gets short-lived LLM credentials, kept fresh automatically.">
+<style>
+  :root { color-scheme: dark; --bg:#0b0d10; --card:#14171c; --line:#232831; --fg:#e6e8eb; --muted:#8b95a3; --accent:#2b6cff; --accent2:#6ea8fe; }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body { margin:0; font:16px/1.65 ui-sans-serif,system-ui,-apple-system,sans-serif; background:var(--bg); color:var(--fg);
+         background-image: radial-gradient(800px 400px at 50% -10%, #16213e55, transparent); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 1.25rem; }
+  header { text-align:center; padding: 5rem 0 2rem; }
+  .logo { font-size: 3.2rem; }
+  h1 { font-size: clamp(1.8rem, 4vw, 2.6rem); margin:.6rem 0 .3rem; letter-spacing:-.02em; }
+  .tag { color:var(--muted); font-size:1.15rem; max-width:560px; margin:.4rem auto 0; }
+  .cta { margin: 2rem 0 .6rem; display:flex; gap:.8rem; justify-content:center; flex-wrap:wrap; }
+  .btn { display:inline-flex; align-items:center; gap:.5rem; padding:.85rem 1.4rem; border-radius:10px; font-weight:700; text-decoration:none; }
+  .btn.primary { background:var(--accent); color:#fff; box-shadow:0 6px 24px #2b6cff44; }
+  .btn.primary:hover { background:#3b78ff; }
+  .btn.ghost { background:#1b2027; color:var(--fg); border:1px solid var(--line); }
+  .sub { color:var(--muted); font-size:.85rem; }
+  section { margin: 2.5rem 0; }
+  h2 { font-size:1.2rem; border-bottom:1px solid var(--line); padding-bottom:.4rem; }
+  .grid { display:grid; grid-template-columns: repeat(auto-fit,minmax(220px,1fr)); gap:1rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1.1rem 1.2rem; }
+  .card .n { color:var(--accent2); font-weight:700; font-size:.8rem; letter-spacing:.08em; }
+  .card h3 { margin:.3rem 0 .4rem; font-size:1.05rem; }
+  .card p { margin:0; color:var(--muted); font-size:.95rem; }
+  code { background:#0e1116; border:1px solid var(--line); border-radius:6px; padding:.12rem .4rem; font-size:.85em; }
+  ul.feat { list-style:none; padding:0; margin:0; display:grid; gap:.5rem; }
+  ul.feat li::before { content:"✦ "; color:var(--accent2); }
+  a { color:var(--accent2); }
+  footer { text-align:center; color:var(--muted); font-size:.85rem; padding:3rem 0 4rem; border-top:1px solid var(--line); margin-top:3rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="logo">🛸</div>
+    <h1>UFOAgent</h1>
+    <p class="tag">Run Microsoft <strong>UFO2</strong> on your Windows machine with short-lived LLM credentials — fetched and refreshed automatically. You never handle a key.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/posix4e/ufoagent-node/releases/latest/download/ufoagent-setup.exe">⬇ Download for Windows</a>
+      <a class="btn ghost" href="https://github.com/posix4e/ufoagent-node">View source</a>
+    </div>
+    <div class="sub">Open-source · Apache-2.0 · auto-updating · <a href="https://github.com/posix4e/ufoagent-node/releases">all releases</a></div>
+  </header>
+
+  <section>
+    <h2>How it works</h2>
+    <div class="grid">
+      <div class="card"><div class="n">STEP 1</div><h3>Download &amp; install</h3><p>Run <code>ufoagent-setup.exe</code>. It installs UFO2 + the <code>ufoagentd</code> daemon and registers a background task.</p></div>
+      <div class="card"><div class="n">STEP 2</div><h3>Link your machine</h3><p>The agent shows a short pairing code. Approve it in your dashboard — no keys to copy.</p></div>
+      <div class="card"><div class="n">STEP 3</div><h3>UFO2 just runs</h3><p>The daemon keeps a fresh credential in UFO2's <code>agents.yaml</code> and calls your LLM provider directly.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Why</h2>
+    <ul class="feat">
+      <li><strong>No long-lived keys on disk</strong> — the control plane vends short-lived credentials; the machine token is stored with Windows DPAPI.</li>
+      <li><strong>Signed &amp; auto-updating</strong> — the daemon self-updates from signed GitHub Releases.</li>
+      <li><strong>Bring your own Windows</strong> — install on any Windows 10/11 box.</li>
+      <li><strong>Pure standard library</strong> — the daemon has zero runtime dependencies.</li>
+    </ul>
+  </section>
+
+  <section>
+    <h2>For developers</h2>
+    <div class="card">
+      <p style="margin-bottom:.6rem">UFOAgent is a control plane (Cloudflare Worker) + this open-source node agent for <a href="https://github.com/microsoft/UFO">Microsoft UFO2</a>. The control plane is a credential <em>broker</em>, never an LLM proxy.</p>
+      <p>CLI: <code>ufoagentd link</code> · <code>ufoagentd run-daemon</code> · <code>ufoagentd update</code>. Build from source with PyInstaller + Inno Setup — see the <a href="https://github.com/posix4e/ufoagent-node#build-from-source-windows">README</a>.</p>
+    </div>
+  </section>
+
+  <footer>
+    🛸 UFOAgent · <a href="https://github.com/posix4e/ufoagent-node">github.com/posix4e/ufoagent-node</a><br>
+    Not affiliated with Microsoft. UFO2 is MIT-licensed by its authors.
+  </footer>
+</div>
+</body>
+</html>
