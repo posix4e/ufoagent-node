@@ -91,7 +91,8 @@ fn main() -> Result<()> {
             control_plane,
             name,
             pause,
-        } => cmd_link(control_plane, name, pause)?,
+            force,
+        } => cmd_link(control_plane, name, pause, force)?,
         Cmd::Refresh => {
             let c = Config::load();
             let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
@@ -168,12 +169,30 @@ fn cmd_status() {
     println!("config_dir:    {}", config::config_dir().display());
 }
 
-fn cmd_link(control_plane: Option<String>, name: Option<String>, pause: bool) -> Result<()> {
+fn cmd_link(
+    control_plane: Option<String>,
+    name: Option<String>,
+    pause: bool,
+    force: bool,
+) -> Result<()> {
     let mut c = Config::load();
     if control_plane.is_some() {
         c.control_plane = control_plane;
     }
     c.save()?;
+
+    // Avoid duplicate node records on reinstall: skip if already linked unless --force.
+    if !force && store::get_token().is_some() {
+        println!("\n  This machine is already linked. Re-run with --force to link again");
+        println!("  (that registers a new, separate node).\n");
+        if pause {
+            println!("  Press Enter to close…");
+            let mut buf = String::new();
+            let _ = std::io::stdin().read_line(&mut buf);
+        }
+        return Ok(());
+    }
+
     let cp = ControlPlane::new(&c.control_plane_url(), None);
     let host = name.unwrap_or_else(|| hostname().unwrap_or_else(|| "windows-node".to_string()));
     let announce = |code: &str, uri: &str| {

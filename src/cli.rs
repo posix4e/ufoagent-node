@@ -22,6 +22,9 @@ pub enum Cmd {
         /// Wait for Enter before exiting, so a tray-spawned console stays readable.
         #[arg(long)]
         pause: bool,
+        /// Link again even if already linked (creates a new, separate node record).
+        #[arg(long)]
+        force: bool,
     },
     /// Non-interactive configure (control plane / token / ufo_home).
     Configure {

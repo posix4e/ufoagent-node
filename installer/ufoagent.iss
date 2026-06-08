@@ -36,6 +36,8 @@ Filename: "{app}\ufoagent.exe"; Parameters: "bootstrap"; Flags: runhidden nowait
 Filename: "schtasks"; \
   Parameters: "/Create /TN ""UFOAgent Tray"" /TR ""\""{app}\ufoagent.exe\"" tray"" /SC ONLOGON /F"; \
   Flags: runhidden
+; Launch the tray now so the 🛸 manager appears immediately (it FreeConsole()s its own window).
+Filename: "{app}\ufoagent.exe"; Parameters: "tray"; Flags: nowait runhidden
 ; Offer to link now (opens a console showing a scannable QR — approve from your phone).
 Filename: "{app}\ufoagent.exe"; Parameters: "link --pause"; \
   Description: "Link this machine to UFOAgent now"; Flags: postinstall nowait skipifsilent

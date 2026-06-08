@@ -80,6 +80,11 @@ mod imp {
     }
 
     pub fn run(_version: &str) -> Result<()> {
+        // Drop the console window Windows allocates for this console-subsystem exe when the tray
+        // is launched by the installer or the logon task — leave just the 🛸 tray icon.
+        unsafe {
+            let _ = windows::Win32::System::Console::FreeConsole();
+        }
         let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
 
         let proxy = event_loop.create_proxy();
@@ -139,7 +144,7 @@ mod imp {
                 Event::UserEvent(Ev::Tick) => m_status.set_text(status_line()),
                 Event::UserEvent(Ev::Menu(e)) => {
                     if e.id == id_link {
-                        spawn_console(&["link", "--pause"]);
+                        spawn_console(&["link", "--force", "--pause"]);
                     } else if e.id == id_repair {
                         spawn_console(&["repair"]);
                     } else if e.id == id_run {
