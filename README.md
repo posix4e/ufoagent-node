@@ -39,7 +39,7 @@ Cross-platform code builds on macOS/Linux for dev; Windows-only bits (`service`,
 `version`/`status`/`configure`, a `run-daemon` smoke, `service install/uninstall`, and a live `link_start`).
 
 ## Install (users)
-Download `ufoagent-setup.exe` from [Releases](https://github.com/posix4e/ufoagent-node/releases), run it
+Download `ufoagent-setup.exe` from [Releases](https://github.com/ufoagent/ufoagent-node/releases), run it
 (installs the service, provisions UFO2, opens the linker). Approve the pairing code in your dashboard.
 
 ## Status
