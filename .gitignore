@@ -1,15 +1,6 @@
-__pycache__/
-*.pyc
-*.egg-info/
-.eggs/
-build/_work/
-build/__pycache__/
-dist/
-installer/Output/
-.venv/
-venv/
-.ruff_cache/
-*.spec.bak
+/target
 .DS_Store
-agent.token
+# local agent state (never commit)
 config.json
+agent.token
+status.json

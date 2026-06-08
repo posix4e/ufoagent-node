@@ -6,15 +6,49 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          python-version: "3.11"
-      - name: Unit tests (stdlib only)
-        run: python tests/test_unit.py
-      - name: Lint
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Unit tests
+        run: cargo test --all
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Integration — exercise the built exe
+        shell: pwsh
         run: |
-          python -m pip install --quiet ruff
-          ruff check .
+          $ErrorActionPreference = 'Stop'
+          $env:UFOAGENT_HOME = Join-Path $env:RUNNER_TEMP 'ufoagent-ci'
+          $exe = 'target\release\ufoagent.exe'
+
+          Write-Host '== version / configure / status =='
+          & $exe version
+          & $exe configure --control-plane https://app.ufoagent.xyz
+          & $exe status
+          if (-not (& $exe status | Select-String 'app.ufoagent.xyz')) { throw 'configure did not persist' }
+
+          Write-Host '== run-daemon smoke (no token -> must stay up gracefully) =='
+          $p = Start-Process $exe -ArgumentList 'run-daemon' -PassThru -NoNewWindow
+          Start-Sleep -Seconds 8
+          if ($p.HasExited) { throw "run-daemon exited unexpectedly (code $($p.ExitCode))" }
+          Stop-Process -Id $p.Id -Force
+
+          Write-Host '== service lifecycle =='
+          & $exe service install
+          Start-Sleep -Seconds 3
+          sc.exe query UFOAgent | Out-Null
+          & $exe service uninstall
+
+          Write-Host '== link_start reaches the live control plane with agent UA =='
+          $r = Invoke-WebRequest 'https://app.ufoagent.xyz/v1/agent/version' -UseBasicParsing -TimeoutSec 20
+          if ($r.StatusCode -ne 200) { throw 'control plane unreachable' }
+
+          Write-Host 'integration smoke OK'

@@ -1,77 +1,51 @@
 # ufoagent-node
 
-The open-source **UFOAgent node agent** for [Microsoft UFO2](https://github.com/microsoft/UFO).
+The open-source **UFOAgent node agent** for [Microsoft UFO2](https://github.com/microsoft/UFO) — a single
+native **Rust** binary (`ufoagent.exe`). Install it on a Windows machine, link it to your
+[ufoagent.xyz](https://ufoagent.xyz) account, and it keeps a **short-lived LLM credential** fresh in UFO2's
+`config/ufo/agents.yaml` so UFO2 always has a working key — you never handle one.
 
-Install it on your **own Windows machine**, link it to your [ufoagent.xyz](https://ufoagent.xyz)
-account, and the resident daemon (`ufoagentd`) keeps a **short-lived LLM credential** fresh in
-UFO2's `config/ufo/agents.yaml` — so UFO2 always has a working key without you ever handling one.
+- **Native, tiny, robust** — no Python runtime, no PyInstaller, no encoding/AV footguns.
+- **Runs as a Windows service** (auto-start at boot, auto-restart; online without anyone logged in).
+- **No long-lived keys on disk** — the control plane vends a short-lived credential the agent refreshes.
 
-- **Bring your own Windows.** Download → install → link.
-- **No long-lived keys on disk.** The control plane vends a short-lived credential; the daemon refreshes it and stores your machine's link token with **DPAPI**.
-- **Signed & auto-updating.** Installer is Authenticode-signed; the daemon updates itself from signed GitHub Releases.
-- **Pure standard library.** The daemon has zero runtime dependencies.
+> Companion: the TypeScript control plane (`app.ufoagent.xyz`) and Python UFO2 (launched as a subprocess).
 
-## Install (users)
-
-1. Download `ufoagent-setup.exe` from [Releases](https://github.com/posix4e/ufoagent-node/releases) and run it.
-2. It registers a background task and opens the linker. Approve the pairing code in your dashboard.
-3. Done — UFO2 now has a live, auto-refreshed credential.
+## Architecture
+- **Service** (Session 0, headless): refreshes the credential + heartbeats + writes `status.json`/log. Never touches the GUI.
+- **Interactive session**: **UFO2** (`python -m ufo …`, drives the desktop) and the tray/manager run in the logged-in session — that's where the screen is.
+- **Unattended nodes** (no one logs in): `ufoagent autologon` configures auto-logon to a live, unlocked **console** session so UFO2 has a desktop to drive.
 
 ## CLI
-
 ```text
-ufoagentd link        --control-plane https://ufoagent.xyz   # interactive device-code linking
-ufoagentd configure   --control-plane URL --agent-token T --ufo-home DIR   # non-interactive (Azure bootstrap)
-ufoagentd refresh     # fetch a credential, write agents.yaml, exit
-ufoagentd run-daemon  # background loop: keep credential fresh + heartbeat
-ufoagentd run --task t [-r "request"]   # refresh then run a UFO2 task
-ufoagentd update [--apply]              # check / apply auto-update
-ufoagentd status | version
+ufoagent link [--control-plane URL] [--name N]   # device-code linking
+ufoagent configure --control-plane URL --agent-token T --ufo-home DIR
+ufoagent refresh                                  # fetch credential -> agents.yaml
+ufoagent run --task t [-r "request"]              # refresh then run a UFO2 task (interactive session)
+ufoagent bootstrap                                # install UFO2 + deps into a managed venv (one-time)
+ufoagent repair                                   # idempotent self-heal
+ufoagent service install | uninstall | run        # Windows service
+ufoagent autologon --user U --password P          # unattended-node auto-logon (opt-in)
+ufoagent status | version
 ```
 
-## How it works
-
-```
-ufoagentd  ──POST /v1/link/start──►  control plane     (you approve the code in the dashboard)
-           ◄─── agent token ─────
-           ──GET  /v1/credentials─►  control plane     {base_url, api_key, model, expires_at}
-           writes  {ufo_home}/config/ufo/agents.yaml   (HOST_AGENT + APP_AGENT)
-           ──POST /v1/heartbeat───►  control plane     (liveness + version)
-UFO2  ── reads agents.yaml ──►  api.openai.com          (direct; control plane never proxies LLM traffic)
-```
-
-The daemon re-fetches before the lease's `expires_at` and rewrites `agents.yaml`; UFO2 picks up the
-fresh key on its next task run.
-
-## Build from source (Windows)
-
-```powershell
-pip install -e ".[build,windows]"
-pwsh installer\build.ps1 -Version 0.1.0   # -> installer\Output\ufoagent-setup.exe
-```
-
-Or just the daemon: `pip install -e .` then `ufoagentd --help`.
-
-## Develop / test
-
+## Build
 ```bash
-python tests/test_unit.py          # offline unit tests (no deps)
-python tests/e2e_local.py http://localhost:8788   # full loop vs a running control plane (wrangler dev)
+cargo build --release        # -> target/release/ufoagent.exe
+cargo test && cargo clippy --all-targets -- -D warnings
 ```
+Cross-platform code builds on macOS/Linux for dev; Windows-only bits (`service`, DPAPI, tray) are
+`#[cfg(windows)]` and built/tested in **Windows CI** (`.github/workflows/ci.yml` exercises the real binary:
+`version`/`status`/`configure`, a `run-daemon` smoke, `service install/uninstall`, and a live `link_start`).
 
-## Release
+## Install (users)
+Download `ufoagent-setup.exe` from [Releases](https://github.com/posix4e/ufoagent-node/releases), run it
+(installs the service, provisions UFO2, opens the linker). Approve the pairing code in your dashboard.
 
-Tag `vX.Y.Z`; `.github/workflows/release.yml` builds on a Windows runner, signs the exe + installer
-with **Azure Trusted Signing**, and publishes a GitHub Release. The daemon's updater reads the latest
-release as its appcast. Configure these repo secrets: `AZURE_TENANT_ID`, `AZURE_CLIENT_ID`,
-`AZURE_CLIENT_SECRET`, `AZURE_SIGNING_ENDPOINT`, `AZURE_SIGNING_ACCOUNT`, `AZURE_SIGNING_PROFILE`.
-
-## Security notes
-
-- The machine **link token** is stored via Windows DPAPI (`CryptProtectData`); plaintext-0600 fallback off-Windows (dev only).
-- The vended LLM key is short-lived and written into `agents.yaml` (a local, user-protected file). The control plane revokes the lease on expiry/teardown.
-- The auto-updater verifies the downloaded installer's Authenticode signature before running it.
+## Status
+- ✅ Rust core (link/refresh/daemon/bootstrap/repair/update), Windows service, Windows CI, installer.
+- 🔜 Tray/manager UI + `autologon` implementation (Windows-only; landing next, verified in CI).
+- Installer is unsigned until Azure Trusted Signing identity validation is approved.
 
 ## License
-
-Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE). Microsoft UFO2 is a separate MIT-licensed project.
+Apache-2.0 (see [LICENSE](LICENSE), [NOTICE](NOTICE)). Microsoft UFO2 is a separate MIT project.

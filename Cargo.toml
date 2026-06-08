@@ -1,0 +1,32 @@
+[package]
+name = "ufoagent"
+version = "0.2.0"
+edition = "2021"
+description = "UFOAgent node agent — links a Windows machine running Microsoft UFO2 to the UFOAgent control plane and keeps short-lived LLM credentials fresh."
+license = "Apache-2.0"
+repository = "https://github.com/posix4e/ufoagent-node"
+
+[[bin]]
+name = "ufoagent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ureq = { version = "2", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+log = "0.4"
+simplelog = "0.12"
+dirs = "5"
+
+# Windows-only: service now; tray (tray-icon/muda/rfd) + DPAPI land in the next iteration.
+# cfg-gated so `cargo check`/`test` run on macOS/Linux.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

@@ -1,10 +1,8 @@
 name: release
 
-# Tag a version to build, sign, and publish the Windows installer:
-#   git tag v0.1.1 && git push origin v0.1.1
-#
-# Required repo secrets (Azure Trusted Signing — reuses the same SP as the control plane):
-#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+# Tag a version to build, sign, and publish the Windows installer:  git tag v0.2.0 && git push --tags
+# Signing secrets (Azure Trusted Signing — set once validation is approved):
+#   AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET,
 #   AZURE_SIGNING_ENDPOINT, AZURE_SIGNING_ACCOUNT, AZURE_SIGNING_PROFILE
 
 on:
@@ -12,41 +10,33 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write   # create the GitHub Release
-  id-token: write   # Azure OIDC (optional)
+  contents: write
 
 jobs:
   build:
     runs-on: windows-latest
     env:
-      # `secrets` can't be used in `if:` directly, so surface presence via env.
       SIGNING_ENDPOINT: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
     steps:
       - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Derive version
         id: ver
         shell: bash
         run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Install build deps
-        run: python -m pip install --upgrade pip pyinstaller pywin32
+      - name: Build (release)
+        run: cargo build --release
 
-      - name: Freeze ufoagentd.exe
-        run: pyinstaller build/ufoagentd.spec --noconfirm --distpath dist --workpath build/_work
-
-      - name: Sign ufoagentd.exe (Azure Trusted Signing)
+      - name: Sign ufoagent.exe (Azure Trusted Signing)
         if: env.SIGNING_ENDPOINT != ''
         uses: azure/trusted-signing-action@v0
         with:
           endpoint: ${{ secrets.AZURE_SIGNING_ENDPOINT }}
           trusted-signing-account-name: ${{ secrets.AZURE_SIGNING_ACCOUNT }}
           certificate-profile-name: ${{ secrets.AZURE_SIGNING_PROFILE }}
-          files-folder: dist
+          files-folder: target/release
           files-folder-filter: exe
         env:
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -77,5 +67,7 @@ jobs:
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: installer/Output/ufoagent-setup.exe
           generate_release_notes: true
+          files: |
+            installer/Output/ufoagent-setup.exe
+            target/release/ufoagent.exe
