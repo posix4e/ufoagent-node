@@ -1,3 +1,4 @@
+mod autologon;
 mod bootstrap;
 mod cli;
 mod config;
@@ -110,6 +111,12 @@ fn main() -> Result<()> {
         }
         Cmd::Service { action } => service::run_action(&action)?,
         Cmd::Tray => tray::run(VERSION)?,
+        Cmd::Autologon {
+            user,
+            password,
+            domain,
+            disable,
+        } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
     }
     Ok(())
 }

@@ -32,9 +32,14 @@ Name: "{group}\Repair UFOAgent"; Filename: "{app}\ufoagent.exe"; Parameters: "re
 Filename: "{app}\ufoagent.exe"; Parameters: "service install"; Flags: runhidden
 ; Provision UFO2 + dependencies in the background (one-time, large download).
 Filename: "{app}\ufoagent.exe"; Parameters: "bootstrap"; Flags: runhidden nowait
+; Run the tray/manager in the user's interactive session at every logon.
+Filename: "schtasks"; \
+  Parameters: "/Create /TN ""UFOAgent Tray"" /TR ""\""{app}\ufoagent.exe\"" tray"" /SC ONLOGON /F"; \
+  Flags: runhidden
 ; Offer to link now (opens a console showing the pairing code).
 Filename: "{app}\ufoagent.exe"; Parameters: "link"; \
   Description: "Link this machine to UFOAgent now"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
 Filename: "{app}\ufoagent.exe"; Parameters: "service uninstall"; Flags: runhidden; RunOnceId: "SvcUninstall"
+Filename: "schtasks"; Parameters: "/Delete /TN ""UFOAgent Tray"" /F"; Flags: runhidden; RunOnceId: "TrayTask"

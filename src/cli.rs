@@ -65,6 +65,17 @@ pub enum Cmd {
     },
     /// System-tray manager UI (Windows).
     Tray,
+    /// Configure unattended auto-logon (Windows).
+    Autologon {
+        #[arg(long)]
+        user: String,
+        #[arg(long)]
+        password: Option<String>,
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        disable: bool,
+    },
 }
 
 #[derive(Subcommand)]

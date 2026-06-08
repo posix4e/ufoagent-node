@@ -20,10 +20,12 @@ log = "0.4"
 simplelog = "0.12"
 dirs = "5"
 
-# Windows-only: service now; tray (tray-icon/muda/rfd) + DPAPI land in the next iteration.
-# cfg-gated so `cargo check`/`test` run on macOS/Linux.
+# Windows-only (cfg-gated so `cargo check`/`test` run on macOS/Linux; built+verified in Windows CI).
 [target.'cfg(windows)'.dependencies]
 windows-service = "0.7"
+tray-icon = "0.19"
+tao = "0.30"
+winreg = "0.52"
 
 [profile.release]
 opt-level = "z"
