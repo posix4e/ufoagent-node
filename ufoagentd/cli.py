@@ -1,6 +1,6 @@
 """ufoagentd command-line interface.
 
-  ufoagentd link        --control-plane https://ufoagent.xyz   # interactive device-code linking
+  ufoagentd link        --control-plane https://app.ufoagent.xyz   # interactive device-code linking
   ufoagentd configure   --control-plane URL --agent-token T --ufo-home DIR  # non-interactive
   ufoagentd refresh     # fetch a credential, write agents.yaml, exit
   ufoagentd run-daemon  # background loop: keep credential fresh + heartbeat
@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import platform as _platform
 import socket
 import subprocess
@@ -25,6 +26,9 @@ from .credentials import refresh_once, run_daemon
 from .linker import LinkError, link
 from .updater import apply_update, check
 
+# Control plane lives on the app. subdomain (ufoagent.xyz is the marketing site).
+DEFAULT_CONTROL_PLANE = "https://app.ufoagent.xyz"
+
 
 def platform_string() -> str:
     return f"{_platform.system()} {_platform.release()}".strip()
@@ -32,9 +36,7 @@ def platform_string() -> str:
 
 def _control_plane(args, *, require_token: bool) -> ControlPlane:
     cfg = store.load_config()
-    base = getattr(args, "control_plane", None) or cfg.get("control_plane")
-    if not base:
-        raise SystemExit("No control plane configured. Pass --control-plane or run `ufoagentd configure` first.")
+    base = getattr(args, "control_plane", None) or cfg.get("control_plane") or DEFAULT_CONTROL_PLANE
     token = store.get_token() if require_token else None
     if require_token and not token:
         raise SystemExit("This machine is not linked. Run `ufoagentd link` first.")
@@ -42,14 +44,17 @@ def _control_plane(args, *, require_token: bool) -> ControlPlane:
 
 
 def _ufo_home(args) -> str:
+    # Managed default so credential refresh + heartbeat work even before UFO2 is installed;
+    # agents.yaml is written here and UFO2 reads it when it runs.
     home = getattr(args, "ufo_home", None) or store.load_config().get("ufo_home")
     if not home:
-        raise SystemExit("UFO2 home unknown. Pass --ufo-home or set it via `ufoagentd configure`.")
-    return home
+        home = os.path.join(str(store.config_dir()), "ufo")
+    return str(home)
 
 
 def cmd_link(args) -> int:
-    cfg = store.update_config(control_plane=args.control_plane, ufo_home=args.ufo_home)
+    cp_url = args.control_plane or store.load_config().get("control_plane") or DEFAULT_CONTROL_PLANE
+    cfg = store.update_config(control_plane=cp_url, ufo_home=args.ufo_home)
     cp = ControlPlane(cfg["control_plane"])
     name = args.name or socket.gethostname()
 
@@ -169,6 +174,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles default to cp1252; force UTF-8 so ✓/emoji output never crashes.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except Exception:
+            pass
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     args = build_parser().parse_args(argv)
     return args.func(args)

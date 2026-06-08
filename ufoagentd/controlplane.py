@@ -8,6 +8,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
+from . import __version__
+
 
 class ControlPlaneError(Exception):
     def __init__(self, status: int, code: str, message: str):
@@ -42,7 +44,8 @@ class ControlPlane:
     def _request(self, method: str, path: str, body: dict | None = None, auth: bool = False) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        headers = {"accept": "application/json"}
+        # Explicit User-Agent: the default "Python-urllib/x" is blocked by Cloudflare's bot rules.
+        headers = {"accept": "application/json", "user-agent": f"ufoagentd/{__version__}"}
         if data is not None:
             headers["content-type"] = "application/json"
         if auth:

@@ -25,7 +25,7 @@ WizardStyle=modern
 Source: "..\dist\ufoagentd.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\Link this machine"; Filename: "{app}\ufoagentd.exe"; Parameters: "link --control-plane https://ufoagent.xyz"
+Name: "{group}\Link this machine"; Filename: "{app}\ufoagentd.exe"; Parameters: "link --control-plane https://app.ufoagent.xyz"
 
 [Run]
 ; Register a background task that keeps credentials fresh + heartbeats.
@@ -33,7 +33,7 @@ Filename: "schtasks"; \
   Parameters: "/Create /TN ""UFOAgent Daemon"" /TR ""\""{app}\ufoagentd.exe\"" run-daemon"" /SC ONLOGON /RL HIGHEST /F"; \
   Flags: runhidden
 ; Offer to link immediately after install.
-Filename: "{app}\ufoagentd.exe"; Parameters: "link --control-plane https://ufoagent.xyz"; \
+Filename: "{app}\ufoagentd.exe"; Parameters: "link --control-plane https://app.ufoagent.xyz"; \
   Description: "Link this machine to UFOAgent now"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
