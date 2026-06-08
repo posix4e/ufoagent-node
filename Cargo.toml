@@ -1,6 +1,6 @@
 [package]
 name = "ufoagent"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "UFOAgent node agent — links a Windows machine running Microsoft UFO2 to the UFOAgent control plane and keeps short-lived LLM credentials fresh."
 license = "Apache-2.0"
@@ -19,6 +19,8 @@ anyhow = "1"
 log = "0.4"
 simplelog = "0.12"
 dirs = "5"
+# Pure-Rust QR rendering for the link flow (default features drop image/svg → tiny; unicode render only).
+qrcode = { version = "0.14", default-features = false }
 
 # Windows-only (cfg-gated so `cargo check`/`test` run on macOS/Linux; built+verified in Windows CI).
 [target.'cfg(windows)'.dependencies]
@@ -26,6 +28,12 @@ windows-service = "0.7"
 tray-icon = "0.19"
 tao = "0.30"
 winreg = "0.52"
+# UTF-8 console (QR glyphs) + Authenticode verification for self-update.
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_Security_WinTrust",
+] }
 
 [profile.release]
 opt-level = "z"

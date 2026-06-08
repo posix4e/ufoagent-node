@@ -5,6 +5,7 @@ mod config;
 mod controlplane;
 mod daemon;
 mod linker;
+mod qr;
 mod repair;
 mod service;
 mod status;
@@ -50,7 +51,20 @@ fn init_logging() {
     let _ = CombinedLogger::init(loggers);
 }
 
+/// Make the console emit UTF-8 so the QR's block glyphs (and ✓) render and scan.
+#[cfg(windows)]
+fn set_utf8_console() {
+    use windows::Win32::System::Console::SetConsoleOutputCP;
+    // 65001 = CP_UTF8.
+    unsafe {
+        let _ = SetConsoleOutputCP(65001);
+    }
+}
+#[cfg(not(windows))]
+fn set_utf8_console() {}
+
 fn main() -> Result<()> {
+    set_utf8_console();
     init_logging();
     match Cli::parse().cmd {
         Cmd::Version => println!("{VERSION}"),
@@ -76,7 +90,8 @@ fn main() -> Result<()> {
         Cmd::Link {
             control_plane,
             name,
-        } => cmd_link(control_plane, name)?,
+            pause,
+        } => cmd_link(control_plane, name, pause)?,
         Cmd::Refresh => {
             let c = Config::load();
             let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
@@ -105,8 +120,16 @@ fn main() -> Result<()> {
                 "current={} min_version={} update_required={}",
                 s.current, s.min_version, s.update_required
             );
-            if apply && s.update_required {
-                println!("auto-apply not implemented yet — re-run the installer");
+            if apply {
+                match update::maybe_self_update(&c, VERSION, Some(&s.min_version)) {
+                    Ok(true) => {
+                        println!("update downloaded + verified; installer launched (service will restart)")
+                    }
+                    Ok(false) => println!(
+                        "no update applied (already current, disabled, or signature check refused — see log)"
+                    ),
+                    Err(e) => println!("update failed: {e}"),
+                }
             }
         }
         Cmd::Service { action } => service::run_action(&action)?,
@@ -145,7 +168,7 @@ fn cmd_status() {
     println!("config_dir:    {}", config::config_dir().display());
 }
 
-fn cmd_link(control_plane: Option<String>, name: Option<String>) -> Result<()> {
+fn cmd_link(control_plane: Option<String>, name: Option<String>, pause: bool) -> Result<()> {
     let mut c = Config::load();
     if control_plane.is_some() {
         c.control_plane = control_plane;
@@ -154,11 +177,26 @@ fn cmd_link(control_plane: Option<String>, name: Option<String>) -> Result<()> {
     let cp = ControlPlane::new(&c.control_plane_url(), None);
     let host = name.unwrap_or_else(|| hostname().unwrap_or_else(|| "windows-node".to_string()));
     let announce = |code: &str, uri: &str| {
-        println!("\n  Link this machine: open  {uri}\n  and confirm the code:  {code}\n");
+        println!("\n  Link this machine — approve from your phone or another device.");
+        println!(
+            "  Scan the code below (or open the link), sign in, and confirm. Nothing to type.\n"
+        );
+        match qr::unicode(uri) {
+            Ok(q) => println!("{q}"),
+            Err(e) => log::warn!("could not render QR code: {e}"),
+        }
+        println!("  Pairing code:  {code}");
+        println!("  Or open:       {uri}\n");
+        println!("  Waiting for approval…");
     };
     let (agent_id, token) = linker::link(&cp, &host, &daemon::platform(), announce, 600)?;
     store::set_token(&token)?;
-    println!("linked: agent={agent_id} name={host}");
+    println!("\n  Linked \u{2713}  as {host}  (agent {agent_id})\n");
+    if pause {
+        println!("  Press Enter to close…");
+        let mut buf = String::new();
+        let _ = std::io::stdin().read_line(&mut buf);
+    }
     Ok(())
 }
 

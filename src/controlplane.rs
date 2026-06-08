@@ -33,6 +33,17 @@ pub struct LinkStart {
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
+pub struct Heartbeat {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub min_version: Option<String>,
+    #[serde(default)]
+    pub server_time: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 pub struct LinkPoll {
     pub status: String,
     #[serde(default)]
@@ -132,12 +143,11 @@ impl ControlPlane {
         self.get_json("/v1/credentials", true)
     }
 
-    pub fn heartbeat(&self, agent_version: &str, platform: &str) -> Result<()> {
-        let _: serde_json::Value = self.post_json(
+    pub fn heartbeat(&self, agent_version: &str, platform: &str) -> Result<Heartbeat> {
+        self.post_json(
             "/v1/heartbeat",
             serde_json::json!({ "agent_version": agent_version, "platform": platform }),
             true,
-        )?;
-        Ok(())
+        )
     }
 }

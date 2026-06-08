@@ -36,10 +36,23 @@ Filename: "{app}\ufoagent.exe"; Parameters: "bootstrap"; Flags: runhidden nowait
 Filename: "schtasks"; \
   Parameters: "/Create /TN ""UFOAgent Tray"" /TR ""\""{app}\ufoagent.exe\"" tray"" /SC ONLOGON /F"; \
   Flags: runhidden
-; Offer to link now (opens a console showing the pairing code).
-Filename: "{app}\ufoagent.exe"; Parameters: "link"; \
+; Offer to link now (opens a console showing a scannable QR — approve from your phone).
+Filename: "{app}\ufoagent.exe"; Parameters: "link --pause"; \
   Description: "Link this machine to UFOAgent now"; Flags: postinstall nowait skipifsilent
 
 [UninstallRun]
 Filename: "{app}\ufoagent.exe"; Parameters: "service uninstall"; Flags: runhidden; RunOnceId: "SvcUninstall"
 Filename: "schtasks"; Parameters: "/Delete /TN ""UFOAgent Tray"" /F"; Flags: runhidden; RunOnceId: "TrayTask"
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  // Auto-update / reinstall: the running service locks ufoagent.exe. `net stop` blocks until the
+  // service has fully stopped (unlike `sc stop`), releasing the lock before [Files] copies the new
+  // exe. The idempotent `service install` in [Run] restarts it. Errors (not installed/running) are
+  // ignored — on a fresh install there's nothing to stop.
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop UFOAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+end;

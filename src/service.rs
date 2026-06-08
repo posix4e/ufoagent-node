@@ -88,9 +88,13 @@ mod imp {
         Ok(())
     }
 
+    const DESCRIPTION: &str = "UFOAgent node daemon — keeps LLM credentials fresh";
+
     pub fn install() -> Result<()> {
-        let manager =
-            ServiceManager::local_computer(None::<&str>, ServiceManagerAccess::CREATE_SERVICE)?;
+        let manager = ServiceManager::local_computer(
+            None::<&str>,
+            ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE,
+        )?;
         let info = ServiceInfo {
             name: OsString::from(SERVICE_NAME),
             display_name: OsString::from("UFOAgent"),
@@ -103,11 +107,37 @@ mod imp {
             account_name: None,
             account_password: None,
         };
-        let service =
-            manager.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)?;
-        let _ = service.set_description("UFOAgent node daemon — keeps LLM credentials fresh");
-        service.start::<OsString>(&[])?;
-        Ok(())
+        // Idempotent: on a fresh box, create + start. On reinstall/auto-update the service
+        // already exists (create fails) — fall back to opening it and ensuring it's running.
+        // (The installer replaces the exe in-place at the same path, so the existing service
+        // entry already points at the new binary.)
+        match manager.create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START) {
+            Ok(service) => {
+                let _ = service.set_description(DESCRIPTION);
+                service.start::<OsString>(&[])?;
+                Ok(())
+            }
+            Err(create_err) => {
+                match manager.open_service(
+                    SERVICE_NAME,
+                    ServiceAccess::START | ServiceAccess::QUERY_STATUS,
+                ) {
+                    Ok(service) => {
+                        let _ = service.set_description(DESCRIPTION);
+                        let running = matches!(
+                            service.query_status()?.current_state,
+                            ServiceState::Running | ServiceState::StartPending
+                        );
+                        if !running {
+                            service.start::<OsString>(&[])?;
+                        }
+                        Ok(())
+                    }
+                    // Couldn't create AND couldn't open → surface the original create error.
+                    Err(_) => Err(create_err.into()),
+                }
+            }
+        }
     }
 
     pub fn uninstall() -> Result<()> {

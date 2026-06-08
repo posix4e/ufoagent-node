@@ -41,11 +41,17 @@ jobs:
           if ($p.HasExited) { throw "run-daemon exited unexpectedly (code $($p.ExitCode))" }
           Stop-Process -Id $p.Id -Force
 
-          Write-Host '== service lifecycle =='
+          Write-Host '== service lifecycle (incl. idempotent reinstall) =='
           & $exe service install
           Start-Sleep -Seconds 3
           sc.exe query UFOAgent | Out-Null
+          & $exe service install   # second time must succeed (idempotent), not error on EXISTS
+          sc.exe query UFOAgent | Out-Null
           & $exe service uninstall
+
+          Write-Host '== update check (check-only; must not install) + link help =='
+          & $exe update            # hits /v1/agent/version, prints current/min/update_required
+          & $exe link --help | Out-Null
 
           Write-Host '== link_start reaches the live control plane with agent UA =='
           $r = Invoke-WebRequest 'https://app.ufoagent.xyz/v1/agent/version' -UseBasicParsing -TimeoutSec 20

@@ -139,7 +139,7 @@ mod imp {
                 Event::UserEvent(Ev::Tick) => m_status.set_text(status_line()),
                 Event::UserEvent(Ev::Menu(e)) => {
                     if e.id == id_link {
-                        spawn_console(&["link"]);
+                        spawn_console(&["link", "--pause"]);
                     } else if e.id == id_repair {
                         spawn_console(&["repair"]);
                     } else if e.id == id_run {

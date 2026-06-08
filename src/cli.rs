@@ -13,12 +13,15 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Interactive device-code linking.
+    /// Interactive device-code linking (shows a scannable QR to approve from any device).
     Link {
         #[arg(long)]
         control_plane: Option<String>,
         #[arg(long)]
         name: Option<String>,
+        /// Wait for Enter before exiting, so a tray-spawned console stays readable.
+        #[arg(long)]
+        pause: bool,
     },
     /// Non-interactive configure (control plane / token / ufo_home).
     Configure {

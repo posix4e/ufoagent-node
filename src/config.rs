@@ -7,6 +7,9 @@ use std::path::PathBuf;
 /// Control plane lives on the app. subdomain (ufoagent.xyz is the marketing site).
 pub const DEFAULT_CONTROL_PLANE: &str = "https://app.ufoagent.xyz";
 
+/// GitHub repo the self-updater pulls signed releases from.
+pub const DEFAULT_UPDATE_REPO: &str = "ufoagent/ufoagent-node";
+
 /// Per-machine config dir. Override with UFOAGENT_HOME (used by tests / non-Windows dev).
 pub fn config_dir() -> PathBuf {
     if let Ok(p) = std::env::var("UFOAGENT_HOME") {
@@ -34,6 +37,12 @@ pub struct Config {
     pub ufo_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
+    /// Kill-switch for service self-update (default on).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_update: Option<bool>,
+    /// Override the GitHub repo updates are pulled from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_repo: Option<String>,
 }
 
 impl Config {
@@ -55,6 +64,16 @@ impl Config {
         self.control_plane
             .clone()
             .unwrap_or_else(|| DEFAULT_CONTROL_PLANE.to_string())
+    }
+
+    pub fn auto_update_enabled(&self) -> bool {
+        self.auto_update.unwrap_or(true)
+    }
+
+    pub fn update_repo(&self) -> String {
+        self.update_repo
+            .clone()
+            .unwrap_or_else(|| DEFAULT_UPDATE_REPO.to_string())
     }
 
     /// Managed default so refresh/heartbeat work even before UFO2 is installed.
