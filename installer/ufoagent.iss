@@ -28,6 +28,8 @@ Source: "..\dist\ufoagentd.exe"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\Link this machine"; Filename: "{app}\ufoagentd.exe"; Parameters: "link --control-plane https://app.ufoagent.xyz"
 
 [Run]
+; Provision UFO2 + dependencies in the background (one-time, large download).
+Filename: "{app}\ufoagentd.exe"; Parameters: "bootstrap"; Flags: runhidden nowait
 ; Register a background task that keeps credentials fresh + heartbeats.
 Filename: "schtasks"; \
   Parameters: "/Create /TN ""UFOAgent Daemon"" /TR ""\""{app}\ufoagentd.exe\"" run-daemon"" /SC ONLOGON /RL HIGHEST /F"; \

@@ -105,6 +105,14 @@ def cmd_run(args) -> int:
     return subprocess.run(cmd, cwd=home).returncode
 
 
+def cmd_bootstrap(args) -> int:
+    from .bootstrap import bootstrap as run_bootstrap
+
+    info = run_bootstrap(args.ufo_home, args.ref)
+    print(f"UFO2 provisioned: ufo_home={info['ufo_home']} python={info['python']}")
+    return 0
+
+
 def cmd_update(args) -> int:
     cp = _control_plane(args, require_token=False)
     status = check(cp)
@@ -162,6 +170,11 @@ def build_parser() -> argparse.ArgumentParser:
     pn.add_argument("--control-plane")
     pn.add_argument("--ufo-home")
     pn.set_defaults(func=cmd_run)
+
+    pb = sub.add_parser("bootstrap", help="Install UFO2 + dependencies into a managed home (one-time, large)")
+    pb.add_argument("--ufo-home")
+    pb.add_argument("--ref", default="main")
+    pb.set_defaults(func=cmd_bootstrap)
 
     pu = sub.add_parser("update", help="Check (and optionally apply) updates")
     pu.add_argument("--apply", action="store_true")
