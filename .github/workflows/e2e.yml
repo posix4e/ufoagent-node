@@ -58,6 +58,10 @@ jobs:
           $ErrorActionPreference = 'Stop'
           # Stop Defender re-scanning the freshly-built unsigned binaries on every launch.
           Add-MpPreference -ExclusionPath "$env:ProgramFiles\UFOAgent", (Join-Path (Get-Location) 'target\release') -ErrorAction SilentlyContinue
+          # Remove git from PATH so the installer's background bootstrap must use the zip download
+          # (the setup process + its [Run] children inherit this env).
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
+          if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' } else { Write-Host 'git removed from PATH for install' }
           $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
           "INNO_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "installing: $env:SETUP"
@@ -107,6 +111,38 @@ jobs:
           if ($r.StatusCode -ne 200) { throw 'control plane unreachable from the node' }
           Write-Host 'standard commands OK'
 
+      - name: Wait for the installer to auto-provision UFO2 (no git)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # The installer kicked off `ufoagent bootstrap` in the background (git was stripped from
+          # PATH at install, so it must use the zip download). Poll the INSTALLED exe's status until
+          # UFO2 is provisioned, streaming the agent log so download -> venv -> pip shows live.
+          $exe  = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          $deadline = (Get-Date).AddMinutes(12); $seen = 0; $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) {
+                $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }
+                $seen = $lines.Count
+              }
+            }
+            $st = & $exe status | Out-String
+            if (($st -notmatch 'ufo_home:\s+\(unset\)') -and ($st -notmatch 'python:\s+\(unset\)')) {
+              Write-Host $st; $ok = $true; break
+            }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) {
+            Write-Host '::error::installer did not auto-provision UFO2 within 12 minutes'
+            if (Test-Path $alog) { Write-Host '--- agent log ---'; Get-Content $alog | Write-Host }
+            & $exe status | Write-Host
+            throw 'auto-provision timed out'
+          }
+          Write-Host 'installer auto-provisioned UFO2 (no git) OK'
+
       - name: Capture install diagnostics (always)
         if: always()
         shell: pwsh
@@ -140,35 +176,6 @@ jobs:
           Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
           if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
-
-      - name: Provision UFO2 with git removed from PATH (no-git zip path)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $env:UFOAGENT_HOME = Join-Path $env:RUNNER_TEMP 'ufoagent-e2e'
-          $env:PATH = (($env:PATH -split ';') |
-            Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
-          if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' }
-          else { Write-Host 'git removed from PATH' }
-          & 'target\release\ufoagent.exe' bootstrap
-          $st = & 'target\release\ufoagent.exe' status | Out-String
-          Write-Host $st
-          if ($st -match 'ufo_home:\s+\(unset\)') { throw 'bootstrap did not record a ufo_home' }
-          if ($st -match 'python:\s+\(unset\)') { throw 'bootstrap did not record a python interpreter' }
-          Write-Host 'auto-provision (no git) OK'
-
-      - name: Capture provision log (always)
-        if: always()
-        shell: pwsh
-        run: |
-          $diag = Join-Path $env:RUNNER_TEMP 'diag'
-          New-Item -ItemType Directory -Force -Path $diag | Out-Null
-          $plog = Join-Path $env:RUNNER_TEMP 'ufoagent-e2e\logs\ufoagent.log'
-          if (Test-Path $plog) {
-            Write-Host '===== provision log (tail) ====='
-            Get-Content $plog -Tail 200 | Write-Host
-            Copy-Item $plog (Join-Path $diag 'provision-ufoagent.log') -ErrorAction SilentlyContinue
-          } else { Write-Host '(no provision log)' }
 
       - name: Upload diagnostics (always)
         if: always()
