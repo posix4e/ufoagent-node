@@ -279,12 +279,15 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
           $shots = "$env:RUNNER_TEMP\shots"
-          $out = "$env:RUNNER_TEMP\local-run.txt"
-          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r','ci local smoke' -RedirectStandardOutput $out -RedirectStandardError "$env:RUNNER_TEMP\local-run.err.txt"
+          # Unique request string so we assert THIS local run in the shared agent log (cmd_run logs
+          # `running UFO2: ... request=...` per-record, unlike the block-buffered stdout).
+          $marker = "ci-local-smoke-$($env:GITHUB_RUN_ID)"
+          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r',$marker
           $deadline = (Get-Date).AddMinutes(2); $ok = $false
           while ((Get-Date) -lt $deadline) {
-            if ((Test-Path $out) -and (Select-String -Path $out -Pattern 'running UFO2' -Quiet)) { $ok = $true; break }
+            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern "running UFO2.*$marker" -Quiet)) { $ok = $true; break }
             Start-Sleep -Seconds 3
           }
           try {
@@ -293,9 +296,8 @@ jobs:
             $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
             $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-run.png')); $g.Dispose(); $bmp.Dispose()
           } catch {}
-          if (Test-Path $out) { Get-Content $out | Write-Host }
           Get-Process python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (-not $ok) { throw 'local `ufoagent run` did not reach `running UFO2`' }
+          if (-not $ok) { Get-Content $alog -Tail 30 | Write-Host; throw 'local `ufoagent run` did not reach `running UFO2`' }
           Write-Host 'local run_task launched UFO2 OK'
 
       - name: Taskbar — click a tray menu item (FlaUI), assert it lands in the log
