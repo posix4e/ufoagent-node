@@ -1,25 +1,33 @@
 // Headful GUI test: launch `ufoagent tray`, find the 🛸 tray icon, open its menu, invoke an item.
 //
-// First cut is diagnostic-heavy: it dumps the taskbar / notification-area UIA subtree so the CI
-// log reveals the real structure on the runner (Windows Server 2025), since the system tray is
-// notoriously layout-specific (Win11 overflow flyout, etc.). Exit codes: 0 pass, 2 icon not
-// found, 3 menu item not found, 1 launch/automation error.
+// Logs the taskbar/notification-area UIA subtree (Server 2025's tray layout is finicky) AND saves
+// a screenshot at each step (launched / overflow / icon / menu / after-repair / failures) into the
+// screenshots dir (args[1]) so CI can upload visual evidence of the click-through.
+// Exit codes: 0 pass, 2 icon not found, 3 menu item not found, 1 launch/automation error.
 
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
 using System.Threading;
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
+using FlaUI.Core.Capturing;
 using FlaUI.Core.Definitions;
 using FlaUI.UIA3;
 
 internal static class Program
 {
+    private static string _shots = "shots";
+    private static int _n = 0;
+
     private static int Main(string[] args)
     {
         var exe = args.Length > 0 ? args[0] : @"target\release\ufoagent.exe";
-        Console.WriteLine($"[tray-test] launching: {exe} tray");
+        _shots = args.Length > 1 ? args[1] : "shots";
+        try { Directory.CreateDirectory(_shots); } catch { }
+
+        Console.WriteLine($"[tray-test] launching: {exe} tray (screenshots -> {_shots})");
         Application app;
         try { app = Application.Launch(exe, "tray"); }
         catch (Exception e) { Console.Error.WriteLine($"[tray-test] launch failed: {e.Message}"); return 1; }
@@ -29,6 +37,7 @@ internal static class Program
             using var automation = new UIA3Automation();
             var desktop = automation.GetDesktop();
             Thread.Sleep(5000); // give the tray icon time to register
+            Shot("launched");
 
             DumpTaskbar(desktop);
 
@@ -41,24 +50,28 @@ internal static class Program
                 Thread.Sleep(1500);
             }
             else { Console.WriteLine("[tray-test] no overflow chevron found; trying the visible area"); }
+            Shot("overflow");
 
             // Match the tray-icon BUTTON named ~UFOAgent — NOT a Window (e.g. the 'UFOAgent setup'
             // installer/bootstrap console, which would otherwise match and have no Repair menu).
             var icon = FindButton(desktop, "UFOAgent");
-            if (icon == null) { Console.Error.WriteLine("[tray-test] FAIL: UFOAgent tray icon (button) not found"); return 2; }
+            if (icon == null) { Console.Error.WriteLine("[tray-test] FAIL: UFOAgent tray icon (button) not found"); Shot("FAIL-no-icon"); return 2; }
             Console.WriteLine($"[tray-test] found tray icon: '{Name(icon)}' [{Type(icon)}]");
+            Shot("icon-found");
 
-            try { icon.RightClick(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] right-click failed: {e.Message}"); return 1; }
+            try { icon.RightClick(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] right-click failed: {e.Message}"); Shot("FAIL-rightclick"); return 1; }
             Thread.Sleep(1500);
+            Shot("menu-open");
 
             var repair = desktop.FindAllDescendants()
                 .FirstOrDefault(e => Type(e) == ControlType.MenuItem.ToString()
                                      && Name(e).IndexOf("Repair", StringComparison.OrdinalIgnoreCase) >= 0);
-            if (repair == null) { Console.Error.WriteLine("[tray-test] FAIL: 'Repair' menu item not found after right-click"); return 3; }
+            if (repair == null) { Console.Error.WriteLine("[tray-test] FAIL: 'Repair' menu item not found after right-click"); Shot("FAIL-no-menu"); return 3; }
 
             Console.WriteLine($"[tray-test] invoking menu item: '{Name(repair)}'");
-            try { repair.Click(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke failed: {e.Message}"); return 1; }
+            try { repair.Click(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke failed: {e.Message}"); Shot("FAIL-invoke"); return 1; }
             Thread.Sleep(1500);
+            Shot("after-repair");
 
             Console.WriteLine("[tray-test] PASS: opened the tray menu and invoked Repair");
             return 0;
@@ -66,12 +79,24 @@ internal static class Program
         catch (Exception e)
         {
             Console.Error.WriteLine($"[tray-test] automation error: {e}");
+            Shot("FAIL-exception");
             return 1;
         }
         finally
         {
             try { foreach (var p in Process.GetProcessesByName("ufoagent")) p.Kill(); } catch { }
         }
+    }
+
+    private static void Shot(string label)
+    {
+        try
+        {
+            var path = Path.Combine(_shots, $"{_n++:00}-{label}.png");
+            Capture.Screen().ToFile(path);
+            Console.WriteLine($"[tray-test] screenshot: {path}");
+        }
+        catch (Exception e) { Console.WriteLine($"[tray-test] screenshot failed: {e.Message}"); }
     }
 
     private static AutomationElement FindByNameContains(AutomationElement root, string needle)
