@@ -19,6 +19,8 @@ SolidCompression=yes
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=admin
 WizardStyle=modern
+; We append {app} to the system PATH below, so notify other processes of the env change.
+ChangesEnvironment=yes
 
 [Files]
 Source: "..\target\release\ufoagent.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -26,16 +28,25 @@ Source: "..\target\release\ufoagent.exe"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 Name: "{group}\Link this machine"; Filename: "{app}\ufoagent.exe"; Parameters: "link"
 Name: "{group}\Repair UFOAgent"; Filename: "{app}\ufoagent.exe"; Parameters: "repair"
+; Launch the tray manager for every user at logon (replaces the old schtasks ONLOGON task —
+; a Startup-folder shortcut is simpler and more reliable). Inno removes it on uninstall.
+Name: "{commonstartup}\UFOAgent"; Filename: "{app}\ufoagent.exe"; Parameters: "tray"
+
+[Registry]
+; Add the install dir to the system PATH so `ufoagent` works from any prompt (idempotent via Check).
+Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"; \
+  ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}"; \
+  Check: NeedsAddPath('{app}')
 
 [Run]
 ; Install + start the Windows service (keeps LLM credentials fresh + heartbeats).
 Filename: "{app}\ufoagent.exe"; Parameters: "service install"; Flags: runhidden
-; Provision UFO2 + dependencies in the background (one-time, large download).
-Filename: "{app}\ufoagent.exe"; Parameters: "bootstrap"; Flags: runhidden nowait
-; Run the tray/manager in the user's interactive session at every logon.
-Filename: "schtasks"; \
-  Parameters: "/Create /TN ""UFOAgent Tray"" /TR ""\""{app}\ufoagent.exe\"" tray"" /SC ONLOGON /F"; \
-  Flags: runhidden
+; Provision UFO2 + dependencies (one-time, large download). Run in a VISIBLE console via
+; `cmd /c start` so the user sees progress and any failure stays on screen (`--pause`). `nowait`
+; keeps the installer from blocking on the long download; the console lives on independently.
+Filename: "{cmd}"; \
+  Parameters: "/c start ""UFOAgent setup"" ""{app}\ufoagent.exe"" bootstrap --pause"; \
+  Flags: nowait
 ; Launch the tray now so the 🛸 manager appears immediately (it FreeConsole()s its own window).
 Filename: "{app}\ufoagent.exe"; Parameters: "tray"; Flags: nowait runhidden
 ; Offer to link now (opens a console showing a scannable QR — approve from your phone).
@@ -44,9 +55,24 @@ Filename: "{app}\ufoagent.exe"; Parameters: "link --pause"; \
 
 [UninstallRun]
 Filename: "{app}\ufoagent.exe"; Parameters: "service uninstall"; Flags: runhidden; RunOnceId: "SvcUninstall"
-Filename: "schtasks"; Parameters: "/Delete /TN ""UFOAgent Tray"" /F"; Flags: runhidden; RunOnceId: "TrayTask"
 
 [Code]
+// True when {app} is not already on the system PATH — keeps reinstalls from appending duplicates.
+function NeedsAddPath(Param: string): Boolean;
+var
+  OrigPath: string;
+begin
+  if not RegQueryStringValue(HKEY_LOCAL_MACHINE,
+    'SYSTEM\CurrentControlSet\Control\Session Manager\Environment',
+    'Path', OrigPath) then
+  begin
+    Result := True;
+    exit;
+  end;
+  Result := Pos(';' + Uppercase(ExpandConstant(Param)) + ';',
+                ';' + Uppercase(OrigPath) + ';') = 0;
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;

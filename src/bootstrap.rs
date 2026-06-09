@@ -1,30 +1,27 @@
-//! Provision Microsoft UFO2 into a managed home: git clone + venv + pip install.
-//! UFO2 stays Python; this just sets it up and records ufo_home + the venv python.
+//! Provision Microsoft UFO2 into a managed home: download source zip + venv + pip install.
+//! No external tools required — fetches the GitHub source archive over HTTP and unpacks it with
+//! Windows' built-in tar, and auto-installs Python if none is present. UFO2 stays Python; this
+//! just sets it up and records ufo_home + the venv python.
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use log::info;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::config::Config;
+use crate::controlplane::USER_AGENT;
 
 /// UFO2 pins some packages with no Python 3.11 wheel (build-from-source fails on modern
 /// setuptools). Rewrite those to wheel-backed versions.
 const PIN_OVERRIDES: &[(&str, &str)] = &[("pandas==1.4.3", "pandas==1.5.3")];
 
-const UFO_GIT: &str = "https://github.com/microsoft/UFO.git";
+/// GitHub source-archive endpoint. No `git` needed — we download the branch zip and unpack it
+/// with the `tar.exe` shipped in Windows (libarchive, reads zips).
+const UFO_ARCHIVE_BASE: &str = "https://github.com/microsoft/UFO/archive/refs/heads";
 
-fn which(name: &str) -> Option<PathBuf> {
-    let exe = if cfg!(windows) {
-        format!("{name}.exe")
-    } else {
-        name.to_string()
-    };
-    let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|d| d.join(&exe))
-        .find(|p| p.is_file())
-}
+/// Pinned CPython used when no system interpreter is found (UFO2 is Python; can't drop it).
+#[cfg(windows)]
+const PYTHON_VERSION: &str = "3.11.9";
 
 fn venv_python(home: &Path) -> PathBuf {
     if cfg!(windows) {
@@ -34,7 +31,55 @@ fn venv_python(home: &Path) -> PathBuf {
     }
 }
 
-fn base_python() -> Result<PathBuf> {
+/// Stream a URL to `dest`. Uses the custom User-Agent (Cloudflare/GitHub block the default).
+fn download(url: &str, dest: &Path) -> Result<()> {
+    let resp = ureq::get(url)
+        .set("user-agent", USER_AGENT)
+        .call()
+        .map_err(|e| anyhow!("download failed for {url}: {e}"))?;
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut reader = resp.into_reader();
+    let mut file =
+        std::fs::File::create(dest).with_context(|| format!("creating {}", dest.display()))?;
+    std::io::copy(&mut reader, &mut file).with_context(|| format!("writing {url}"))?;
+    Ok(())
+}
+
+/// Download the UFO2 source archive for `git_ref` and unpack it into `home`, stripping the
+/// `UFO-<ref>/` directory the archive nests everything under.
+fn fetch_ufo(home: &Path, git_ref: &str) -> Result<()> {
+    std::fs::create_dir_all(home)?;
+    let url = format!("{UFO_ARCHIVE_BASE}/{git_ref}.zip");
+    let safe: String = git_ref
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let zip = home
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("ufo-{safe}.zip"));
+    info!("downloading microsoft/UFO@{git_ref} -> {}", home.display());
+    download(&url, &zip)?;
+    // Windows' built-in tar (bsdtar) reads zips; --strip-components=1 drops the top folder.
+    let mut c = Command::new("tar");
+    c.arg("-xf").arg(&zip).arg("-C").arg(home);
+    c.arg("--strip-components=1");
+    let r = run(c, "extract UFO archive");
+    let _ = std::fs::remove_file(&zip);
+    r?;
+    if !home.join("requirements.txt").exists() {
+        bail!(
+            "UFO archive extracted but requirements.txt is missing under {} — extraction may have failed",
+            home.display()
+        );
+    }
+    Ok(())
+}
+
+/// Probe for a usable system interpreter via the launcher / PATH, then known install dirs.
+fn find_python() -> Option<PathBuf> {
     for cand in [
         vec!["py", "-3.11"],
         vec!["py", "-3.10"],
@@ -51,12 +96,81 @@ fn base_python() -> Result<PathBuf> {
             if o.status.success() {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
                 if !s.is_empty() {
-                    return Ok(PathBuf::from(s));
+                    return Some(PathBuf::from(s));
                 }
             }
         }
     }
-    bail!("no system Python 3.10/3.11 found; install Python and re-run `ufoagent bootstrap`")
+    // A just-installed interpreter won't be on *this* process's PATH yet — check the standard
+    // install locations directly.
+    #[cfg(windows)]
+    for dir in python_install_dirs() {
+        let p = dir.join("python.exe");
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn python_install_dirs() -> Vec<PathBuf> {
+    let mut v = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        v.push(PathBuf::from(pf).join("Python311"));
+    }
+    if let Ok(la) = std::env::var("LocalAppData") {
+        v.push(
+            PathBuf::from(la)
+                .join("Programs")
+                .join("Python")
+                .join("Python311"),
+        );
+    }
+    v
+}
+
+/// Download and silently install the official python.org build. Windows-only (UFO2 only runs
+/// on Windows; elsewhere we just ask the user to install Python).
+#[cfg(windows)]
+fn install_python(scratch_dir: &Path) -> Result<()> {
+    let url = format!(
+        "https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-amd64.exe"
+    );
+    let installer = scratch_dir.join(format!("python-{PYTHON_VERSION}-amd64.exe"));
+    info!("downloading Python {PYTHON_VERSION} installer…");
+    download(&url, &installer)?;
+    info!("installing Python {PYTHON_VERSION} (silent, all users)…");
+    let mut c = Command::new(&installer);
+    c.args([
+        "/quiet",
+        "InstallAllUsers=1",
+        "PrependPath=1",
+        "Include_launcher=1",
+    ]);
+    let r = run(c, "Python installer");
+    let _ = std::fs::remove_file(&installer);
+    r
+}
+
+fn base_python(scratch_dir: &Path) -> Result<PathBuf> {
+    if let Some(p) = find_python() {
+        return Ok(p);
+    }
+    #[cfg(windows)]
+    {
+        info!("no system Python 3.10/3.11 found — installing Python {PYTHON_VERSION}…");
+        install_python(scratch_dir)?;
+        if let Some(p) = find_python() {
+            return Ok(p);
+        }
+        bail!("Python {PYTHON_VERSION} installed but no interpreter was found afterward");
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = scratch_dir;
+        bail!("no system Python 3.10/3.11 found; install Python and re-run `ufoagent bootstrap`")
+    }
 }
 
 fn run(mut cmd: Command, what: &str) -> Result<()> {
@@ -79,17 +193,13 @@ pub fn bootstrap(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, Pa
     }
 
     if !home.join("requirements.txt").exists() {
-        let git = which("git").context("git not found; install Git and retry")?;
-        info!("git clone microsoft/UFO -> {}", home.display());
-        let mut c = Command::new(git);
-        c.args(["clone", "--depth", "1", "--branch", git_ref, UFO_GIT])
-            .arg(&home);
-        run(c, "git clone")?;
+        fetch_ufo(&home, git_ref)?;
     }
 
     let vpy = venv_python(&home);
     if !vpy.exists() {
-        let base = base_python()?;
+        let scratch = home.parent().unwrap_or_else(|| Path::new("."));
+        let base = base_python(scratch)?;
         info!("creating venv (base: {})", base.display());
         let mut c = Command::new(base);
         c.arg("-m").arg("venv").arg(home.join(".venv"));

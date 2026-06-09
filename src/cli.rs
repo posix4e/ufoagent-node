@@ -7,8 +7,9 @@ use clap::{Parser, Subcommand};
     about = "UFOAgent node agent for Microsoft UFO2"
 )]
 pub struct Cli {
+    /// Defaults to the system-tray manager when no subcommand is given (bare `ufoagent.exe`).
     #[command(subcommand)]
-    pub cmd: Cmd,
+    pub cmd: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -52,6 +53,10 @@ pub enum Cmd {
         ufo_home: Option<String>,
         #[arg(long = "ref", default_value = "main")]
         git_ref: String,
+        /// Wait for Enter before exiting (keeps an installer-spawned console readable,
+        /// especially on failure).
+        #[arg(long)]
+        pause: bool,
     },
     /// Idempotently fix config / re-provision / refresh.
     Repair,

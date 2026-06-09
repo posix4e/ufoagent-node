@@ -1,4 +1,5 @@
 /target
+/installer/Output
 .DS_Store
 # local agent state (never commit)
 config.json
