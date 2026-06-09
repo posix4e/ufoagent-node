@@ -37,17 +37,33 @@ fn ws_url(control_plane: &str) -> String {
 /// Run the WS client until `should_stop`, reconnecting with backoff. Meant to run on its own thread.
 pub fn run(version: &str, should_stop: impl Fn() -> bool) {
     let mut backoff = 2u64;
+    let mut announced_unlinked = false;
     while !should_stop() {
+        // Not linked yet is the normal state on a fresh install, not an error — say so once,
+        // then quietly poll for the token instead of spamming the log on every backoff.
+        if store::get_token().is_none() {
+            if !announced_unlinked {
+                log::info!("ws: waiting for this machine to be linked");
+                announced_unlinked = true;
+            }
+            sleep_unless_stopped(30, &should_stop);
+            continue;
+        }
+        announced_unlinked = false;
         match connect_and_serve(version, &should_stop) {
             Ok(()) => backoff = 2,
             Err(e) => log::warn!("ws: {e}"),
         }
-        let mut slept = 0;
-        while slept < backoff && !should_stop() {
-            std::thread::sleep(Duration::from_secs(1));
-            slept += 1;
-        }
+        sleep_unless_stopped(backoff, &should_stop);
         backoff = (backoff * 2).min(60);
+    }
+}
+
+fn sleep_unless_stopped(secs: u64, should_stop: &impl Fn() -> bool) {
+    let mut slept = 0;
+    while slept < secs && !should_stop() {
+        std::thread::sleep(Duration::from_secs(1));
+        slept += 1;
     }
 }
 
