@@ -3,6 +3,8 @@ name: ci
 # Build once, then test the real artifact. `build` lints/tests/compiles and produces the Inno
 # installer; `test` downloads that installer, runs it (with live logging), waits for UFO2 to
 # auto-provision, then drives the INSTALLED 🛸 tray with FlaUI. One pipeline, no rebuilds.
+# On main, when EVERY test passes, `publish-beta` ships that exact installer to the rolling
+# `beta` prerelease. Production stays on v* tags -> `latest` (release.yml).
 on:
   push:
     branches: [main]
@@ -36,7 +38,11 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           choco install innosetup --no-progress -y
-          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0-ci 'installer\ufoagent.iss'
+          # Stamp crate version + short sha so beta installs are identifiable in Add/Remove
+          # Programs (tagged releases pass the bare version — see release.yml).
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
+          $sha = '${{ github.sha }}'.Substring(0, 7)
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$ver-beta.$sha" 'installer\ufoagent.iss'
           $setup = Get-ChildItem -Recurse -Filter 'ufoagent-setup.exe' | Select-Object -First 1 -ExpandProperty FullName
           if (-not $setup) { throw 'installer not produced' }
           Copy-Item $setup (Join-Path $env:RUNNER_TEMP 'ufoagent-setup.exe')
@@ -180,3 +186,38 @@ jobs:
           Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
           if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
+
+  publish-beta:
+    name: publish rolling beta (main, all tests green)
+    # The beta channel moves ONLY when the full pipeline passed on main — lint/unit/build, real
+    # installer install, no-git auto-provision, and the headful tray GUI click-through. What ships
+    # is the exact artifact those tests ran, at a stable URL:
+    #   https://github.com/ufoagent/ufoagent-node/releases/download/beta/ufoagent-setup.exe
+    needs: [build, test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dl
+      - name: Update the rolling beta prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test -f dl/ufoagent-setup.exe
+          # Re-point the beta tag at this commit (the release follows its tag).
+          git tag -f beta "$GITHUB_SHA"
+          git push -f origin beta
+          if ! gh release view beta >/dev/null 2>&1; then
+            gh release create beta --prerelease --title "UFOAgent beta (rolling)" \
+              --notes "Rolling beta: the newest main build that passed the full install + provision + tray GUI test suite. Want stable? Grab the latest production release instead."
+          fi
+          gh release upload beta dl/ufoagent-setup.exe --clobber
+          echo "beta -> $GITHUB_SHA"
