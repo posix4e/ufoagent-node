@@ -25,12 +25,21 @@ internal static class Program
     {
         var exe = args.Length > 0 ? args[0] : @"target\release\ufoagent.exe";
         _shots = args.Length > 1 ? args[1] : "shots";
+        // --attach: a tray is already running (it's the run_task executor) — drive that one instead
+        // of launching a second instance.
+        var attach = args.Contains("--attach");
         try { Directory.CreateDirectory(_shots); } catch { }
 
-        Console.WriteLine($"[tray-test] launching: {exe} tray (screenshots -> {_shots})");
-        Application app;
-        try { app = Application.Launch(exe, "tray"); }
-        catch (Exception e) { Console.Error.WriteLine($"[tray-test] launch failed: {e.Message}"); return 1; }
+        if (attach)
+        {
+            Console.WriteLine($"[tray-test] attaching to the running tray (screenshots -> {_shots})");
+        }
+        else
+        {
+            Console.WriteLine($"[tray-test] launching: {exe} tray (screenshots -> {_shots})");
+            try { Application.Launch(exe, "tray"); }
+            catch (Exception e) { Console.Error.WriteLine($"[tray-test] launch failed: {e.Message}"); return 1; }
+        }
 
         try
         {

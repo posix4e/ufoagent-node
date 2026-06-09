@@ -209,10 +209,13 @@ mod imp {
                 Event::UserEvent(Ev::Tick) => m_status.set_text(status_line()),
                 Event::UserEvent(Ev::Menu(e)) => {
                     if e.id == id_link {
+                        log::info!("tray: menu action — link");
                         spawn_console(&["link", "--force", "--pause"]);
                     } else if e.id == id_repair {
+                        log::info!("tray: menu action — repair");
                         spawn_console(&["repair"]);
                     } else if e.id == id_run {
+                        log::info!("tray: menu action — run a task");
                         let exes = exe().to_string_lossy().to_string();
                         let ps = format!(
                             "$r = Read-Host 'Task request'; & '{exes}' run --task adhoc -r $r; Read-Host 'done — press Enter'"

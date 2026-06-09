@@ -195,9 +195,126 @@ jobs:
           if (-not $done) { throw 'repair command did not reach done within 2 minutes' }
           Write-Host 'linked smoke OK: enqueue -> DO push -> agent WS -> execute -> result'
 
-      - name: Headful tray click-through on the installed app (FlaUI)
+      - name: Start the tray (run_task executor, Session 1)
+        if: env.CI_AGENT_TOKEN != ''
         shell: pwsh
-        run: dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe" "$env:RUNNER_TEMP\shots"
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          # run_task runs UFO2 on the interactive desktop via the tray; start it and wait until it
+          # advertises liveness (the marker the service checks before queuing a task).
+          Start-Process $exe -ArgumentList 'tray'
+          $alive = "$env:ProgramData\UFOAgent\tasks\tray-alive"
+          $deadline = (Get-Date).AddMinutes(2)
+          while ((Get-Date) -lt $deadline -and -not (Test-Path $alive)) { Start-Sleep -Seconds 2 }
+          if (-not (Test-Path $alive)) { throw 'tray did not start (no tray-alive marker)' }
+          Write-Host 'tray running; tray-alive present'
+
+      - name: Remote run_task — dashboard command runs UFO2 on the desktop (screenshot + log assert)
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          $shots = "$env:RUNNER_TEMP\shots"; New-Item -ItemType Directory -Force -Path $shots | Out-Null
+          function Save-Shot($name) {
+            try {
+              Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
+              $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size)
+              $bmp.Save((Join-Path $shots "$name.png")); $g.Dispose(); $bmp.Dispose()
+              Write-Host "screenshot: $name.png"
+            } catch { Write-Host "screenshot $name failed: $($_.Exception.Message)" }
+          }
+          $hdr = @{ authorization = "Bearer $env:CI_ADMIN_TOKEN"; 'content-type' = 'application/json' }
+          $base = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/commands"
+          $body = '{"kind":"run_task","request":"open Notepad"}'
+          $resp = Invoke-RestMethod -Method POST -Uri $base -Headers $hdr -Body $body
+          Write-Host "enqueued run_task: id=$($resp.id) status=$($resp.status)"
+          # Wait for the bridge to show in the agent log: WS received it, and the tray picked it up.
+          $deadline = (Get-Date).AddMinutes(3); $sawWs = $false; $sawTray = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $log = Get-Content $alog -Raw
+              if ($log -match "ws: command run_task \($($resp.id)\)") { $sawWs = $true }
+              if ($log -match 'tray: running task') { $sawTray = $true }
+            }
+            if ($sawWs -and $sawTray) { break }
+            Start-Sleep -Seconds 3
+          }
+          if (-not $sawWs)   { Get-Content $alog -Tail 40 | Write-Host; throw 'agent log never showed ws: command run_task' }
+          if (-not $sawTray) { Get-Content $alog -Tail 40 | Write-Host; throw 'tray never picked up the task (tray: running task)' }
+          Write-Host 'remote run_task reached the tray and is running on the desktop'
+          # UFO2 should be running now (a python process). Snapshot the desktop, confirm, then kill
+          # it to bound cost — the dummy LLM key makes a full run pointless.
+          Start-Sleep -Seconds 4
+          Save-Shot '10-remote-run_task'
+          $py = Get-Process python,pythonw -ErrorAction SilentlyContinue
+          if ($py) { Write-Host "UFO2 launched on the desktop (python pid $($py[0].Id))" }
+          else { Write-Host '::warning::no python process observed (UFO2 may have exited fast on the dummy key)' }
+          $py | Stop-Process -Force -ErrorAction SilentlyContinue
+          # The result must round-trip back to the control plane — done OR failed both prove the loop
+          # (a dummy LLM key means UFO2 fails, which is expected; we are testing the bridge).
+          $deadline = (Get-Date).AddMinutes(2); $final = $null
+          while ((Get-Date) -lt $deadline) {
+            $cmd = (Invoke-RestMethod -Uri $base -Headers $hdr).commands | Where-Object { $_.id -eq $resp.id }
+            if ($cmd -and ($cmd.status -eq 'done' -or $cmd.status -eq 'failed')) { $final = $cmd; break }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $final) { throw 'run_task result never came back to the control plane' }
+          Write-Host "run_task result round-tripped: status=$($final.status)"
+          # Confirm the transcript (written once the task finished) shows UFO2 was launched.
+          $tlog = "$env:ProgramData\UFOAgent\tasks\logs\$($resp.id).txt"
+          if ((Test-Path $tlog) -and (Select-String -Path $tlog -Pattern 'running UFO2' -Quiet)) {
+            Write-Host 'transcript confirms: running UFO2'
+          } else {
+            Write-Host '::warning::transcript did not contain `running UFO2`'
+          }
+
+      - name: Local run_task — `ufoagent run` launches UFO2 here (screenshot + log assert)
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          $shots = "$env:RUNNER_TEMP\shots"
+          $out = "$env:RUNNER_TEMP\local-run.txt"
+          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r','ci local smoke' -RedirectStandardOutput $out -RedirectStandardError "$env:RUNNER_TEMP\local-run.err.txt"
+          $deadline = (Get-Date).AddMinutes(2); $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            if ((Test-Path $out) -and (Select-String -Path $out -Pattern 'running UFO2' -Quiet)) { $ok = $true; break }
+            Start-Sleep -Seconds 3
+          }
+          try {
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-run.png')); $g.Dispose(); $bmp.Dispose()
+          } catch {}
+          if (Test-Path $out) { Get-Content $out | Write-Host }
+          Get-Process python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (-not $ok) { throw 'local `ufoagent run` did not reach `running UFO2`' }
+          Write-Host 'local run_task launched UFO2 OK'
+
+      - name: Taskbar — click a tray menu item (FlaUI), assert it lands in the log
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          $before = if (Test-Path $alog) { (Get-Content $alog).Count } else { 0 }
+          # Attach to the already-running executor tray; FlaUI opens its menu and invokes Repair.
+          dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe" "$env:RUNNER_TEMP\shots" --attach
+          # The tray logs every menu action — assert the click reached the log.
+          $deadline = (Get-Date).AddSeconds(30); $logged = $false
+          while ((Get-Date) -lt $deadline) {
+            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'tray: menu action' -Quiet)) { $logged = $true; break }
+            Start-Sleep -Seconds 2
+          }
+          if (-not $logged) { Get-Content $alog -Tail 30 | Write-Host; throw 'tray menu click did not show up in the log' }
+          Write-Host 'taskbar action showed up in the log (tray: menu action)'
 
       - name: Publish rolling beta (main pushes only — runs only if every step above passed)
         if: github.event_name == 'push'
