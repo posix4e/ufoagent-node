@@ -1,0 +1,120 @@
+name: e2e
+
+# Installs the agent on a clean Windows runner via the real Inno installer and exercises the
+# standard commands end-to-end — proves the build runs with no VC++ runtime DLL (the crt-static
+# fix), the service installs + starts, and provisioning works without git.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: install + standard commands
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release (static CRT)
+        run: cargo build --release
+
+      - name: Verify no VC++ runtime DLL dependency (crt-static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+            Select-Object -First 1 -ExpandProperty FullName
+          if (-not $dumpbin) { throw 'dumpbin.exe not found' }
+          $deps = & $dumpbin /dependents 'target\release\ufoagent.exe' | Out-String
+          Write-Host $deps
+          if ($deps -match 'VCRUNTIME140|MSVCP140') {
+            throw 'VC++ runtime is still a dynamic dependency - crt-static not applied'
+          }
+          Write-Host 'OK: ufoagent.exe carries no VC++ runtime DLL dependency'
+
+      - name: Build installer (Inno Setup)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          choco install innosetup --no-progress -y
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          & $iscc /DAppVersion=0.0.0-e2e 'installer\ufoagent.iss'
+          $setup = Get-ChildItem -Recurse -Filter 'ufoagent-setup.exe' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $setup) { throw 'installer not produced' }
+          Write-Host "installer: $setup"
+          "SETUP=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Silent install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Start-Process "$env:SETUP" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          if (-not (Test-Path $exe)) { throw 'ufoagent.exe was not installed' }
+          Write-Host "installed: $exe"
+
+      - name: Service running + standard commands
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          Start-Sleep -Seconds 5
+          $svc = sc.exe query UFOAgent | Out-String
+          Write-Host $svc
+          if ($svc -notmatch 'RUNNING|START_PENDING') { throw 'UFOAgent service is not running' }
+
+          & $exe version
+          & $exe configure --control-plane https://app.ufoagent.xyz
+          $st = & $exe status | Out-String
+          Write-Host $st
+          if ($st -notmatch 'app\.ufoagent\.xyz') { throw 'configure did not persist' }
+
+          & $exe update
+          & $exe link --help | Out-Null
+          $r = Invoke-WebRequest 'https://app.ufoagent.xyz/v1/agent/version' -UseBasicParsing -TimeoutSec 20
+          if ($r.StatusCode -ne 200) { throw 'control plane unreachable from the node' }
+          Write-Host 'standard commands OK'
+
+      - name: Uninstall
+        if: always()
+        shell: pwsh
+        run: |
+          # Stop any lingering agent processes (the installer kicks off a background bootstrap) so
+          # the uninstaller can remove files cleanly.
+          Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
+          if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
+
+  provision:
+    name: auto-provision UFO2 without git
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Bootstrap with git removed from PATH (proves the no-git zip path)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:UFOAGENT_HOME = Join-Path $env:RUNNER_TEMP 'ufoagent-e2e'
+          # Drop any PATH entry that contains git.exe so bootstrap MUST download the UFO2 zip.
+          $env:PATH = (($env:PATH -split ';') |
+            Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
+          if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' }
+          else { Write-Host 'git removed from PATH' }
+
+          & 'target\release\ufoagent.exe' bootstrap
+          $st = & 'target\release\ufoagent.exe' status | Out-String
+          Write-Host $st
+          if ($st -match 'ufo_home:\s+\(unset\)') { throw 'bootstrap did not record a ufo_home' }
+          if ($st -match 'python:\s+\(unset\)') { throw 'bootstrap did not record a python interpreter' }
+          Write-Host 'auto-provision (no git) OK'
