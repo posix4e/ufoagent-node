@@ -1,7 +1,8 @@
 name: ci
 
-# Run once per change: on PRs (any branch) and on pushes to main. This avoids the double-run a
-# bare `push:` + `pull_request:` causes on PR branches. Newer pushes cancel superseded runs.
+# Build once, then test the real artifact. `build` lints/tests/compiles and produces the Inno
+# installer; `test` downloads that installer, runs it (with live logging), waits for UFO2 to
+# auto-provision, then drives the INSTALLED 🛸 tray with FlaUI. One pipeline, no rebuilds.
 on:
   push:
     branches: [main]
@@ -12,8 +13,10 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  build:
+    name: lint + unit + build + installer
     runs-on: windows-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -28,40 +31,144 @@ jobs:
         run: cargo test --all
       - name: Build (release)
         run: cargo build --release
-
-      - name: Integration — exercise the built exe
+      - name: Build installer (Inno Setup)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $env:UFOAGENT_HOME = Join-Path $env:RUNNER_TEMP 'ufoagent-ci'
-          $exe = 'target\release\ufoagent.exe'
+          choco install innosetup --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0-ci 'installer\ufoagent.iss'
+          $setup = Get-ChildItem -Recurse -Filter 'ufoagent-setup.exe' | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $setup) { throw 'installer not produced' }
+          Copy-Item $setup (Join-Path $env:RUNNER_TEMP 'ufoagent-setup.exe')
+          Write-Host "installer: $setup"
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer
+          path: ${{ runner.temp }}/ufoagent-setup.exe
+          if-no-files-found: error
 
-          Write-Host '== version / configure / status =='
-          & $exe version
-          & $exe configure --control-plane https://app.ufoagent.xyz
-          & $exe status
-          if (-not (& $exe status | Select-String 'app.ufoagent.xyz')) { throw 'configure did not persist' }
+  test:
+    name: install + provision + tray GUI (installed app)
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4 # for tests/gui/TrayTest
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.x"
+      - name: Download installer
+        uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: dl
 
-          Write-Host '== run-daemon smoke (no token -> must stay up gracefully) =='
-          $p = Start-Process $exe -ArgumentList 'run-daemon' -PassThru -NoNewWindow
-          Start-Sleep -Seconds 8
-          if ($p.HasExited) { throw "run-daemon exited unexpectedly (code $($p.ExitCode))" }
-          Stop-Process -Id $p.Id -Force
+      - name: Silent install (live Inno log, git stripped, 5-min guard)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $setup = (Get-ChildItem -Recurse dl -Filter ufoagent-setup.exe | Select-Object -First 1).FullName
+          if (-not $setup) { throw 'installer artifact missing' }
+          Add-MpPreference -ExclusionPath "$env:ProgramFiles\UFOAgent", (Join-Path (Get-Location) 'dl') -ErrorAction SilentlyContinue
+          # Strip git so the installer's background bootstrap must use the zip download.
+          $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
+          if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' } else { Write-Host 'git removed from PATH' }
+          $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
+          "INNO_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "installing: $setup"
+          $p = Start-Process "$setup" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCANCEL',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(5); $seen = 0
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            if (Test-Path $log) {
+              $lines = Get-Content $log
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [inno] $_" }; $seen = $lines.Count }
+            }
+          }
+          if (-not $p.HasExited) {
+            Write-Host '::error::installer did not finish within 5 minutes'
+            if (Test-Path $log) { Get-Content $log | Write-Host }
+            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw 'installer hung'
+          }
+          if (-not (Test-Path "$env:ProgramFiles\UFOAgent\ufoagent.exe")) { throw 'ufoagent.exe was not installed' }
+          Write-Host "installer exit code: $($p.ExitCode)"
 
-          Write-Host '== service lifecycle (incl. idempotent reinstall) =='
-          & $exe service install
-          Start-Sleep -Seconds 3
-          sc.exe query UFOAgent | Out-Null
-          & $exe service install   # second time must succeed (idempotent), not error on EXISTS
-          sc.exe query UFOAgent | Out-Null
-          & $exe service uninstall
-
-          Write-Host '== update check (check-only; must not install) + link help =='
-          & $exe update            # hits /v1/agent/version, prints current/min/update_required
-          & $exe link --help | Out-Null
-
-          Write-Host '== link_start reaches the live control plane with agent UA =='
+      - name: Service running + standard commands (installed exe)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          Start-Sleep -Seconds 5
+          $svc = sc.exe query UFOAgent | Out-String; Write-Host $svc
+          if ($svc -notmatch 'RUNNING|START_PENDING') { throw 'UFOAgent service is not running' }
+          Write-Host '--- version ---';     & $exe version
+          Write-Host '--- configure ---';   & $exe configure --control-plane https://app.ufoagent.xyz
+          Write-Host '--- status ---';      $st = & $exe status | Out-String; Write-Host $st
+          if ($st -notmatch 'app\.ufoagent\.xyz') { throw 'configure did not persist' }
+          Write-Host '--- update ---';      & $exe update
+          Write-Host '--- link --help ---'; & $exe link --help | Out-Null
           $r = Invoke-WebRequest 'https://app.ufoagent.xyz/v1/agent/version' -UseBasicParsing -TimeoutSec 20
-          if ($r.StatusCode -ne 200) { throw 'control plane unreachable' }
+          if ($r.StatusCode -ne 200) { throw 'control plane unreachable from the node' }
+          Write-Host 'standard commands OK'
 
-          Write-Host 'integration smoke OK'
+      - name: Wait for the installer to auto-provision UFO2 (no git)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe  = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          $deadline = (Get-Date).AddMinutes(12); $seen = 0; $ok = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+            }
+            $st = & $exe status | Out-String
+            if (($st -notmatch 'ufo_home:\s+\(unset\)') -and ($st -notmatch 'python:\s+\(unset\)')) { Write-Host $st; $ok = $true; break }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) {
+            Write-Host '::error::installer did not auto-provision UFO2 within 12 minutes'
+            if (Test-Path $alog) { Get-Content $alog | Write-Host }
+            throw 'auto-provision timed out'
+          }
+          Write-Host 'installer auto-provisioned UFO2 (no git) OK'
+
+      - name: Headful tray click-through on the installed app (FlaUI)
+        shell: pwsh
+        run: dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+
+      - name: Capture diagnostics (always)
+        if: always()
+        shell: pwsh
+        run: |
+          $diag = Join-Path $env:RUNNER_TEMP 'diag'; New-Item -ItemType Directory -Force -Path $diag | Out-Null
+          $pd = "$env:ProgramData\UFOAgent"
+          Write-Host '===== Inno install log ====='
+          if ($env:INNO_LOG -and (Test-Path $env:INNO_LOG)) { Get-Content $env:INNO_LOG | Write-Host; Copy-Item $env:INNO_LOG $diag -ErrorAction SilentlyContinue }
+          Write-Host '===== agent log (tail) ====='
+          $alog = Join-Path $pd 'logs\ufoagent.log'
+          if (Test-Path $alog) { Get-Content $alog -Tail 200 | Write-Host; Copy-Item $alog $diag -ErrorAction SilentlyContinue }
+          Write-Host '===== config.json ====='
+          $cfg = Join-Path $pd 'config.json'
+          if (Test-Path $cfg) { Get-Content $cfg | Write-Host; Copy-Item $cfg $diag -ErrorAction SilentlyContinue }
+          Write-Host '===== service ====='
+          sc.exe query UFOAgent | Out-String | Write-Host
+
+      - name: Upload diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-diagnostics
+          path: ${{ runner.temp }}/diag
+          if-no-files-found: ignore
+
+      - name: Uninstall (always)
+        if: always()
+        shell: pwsh
+        run: |
+          Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
+          if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
