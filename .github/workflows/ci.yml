@@ -3,8 +3,10 @@ name: ci
 # Build once, then test the real artifact. `build` lints/tests/compiles and produces the Inno
 # installer; `test` downloads that installer, runs it (with live logging), waits for UFO2 to
 # auto-provision, then drives the INSTALLED 🛸 tray with FlaUI. One pipeline, no rebuilds.
-# On main, when EVERY test passes, `publish-beta` ships that exact installer to the rolling
-# `beta` prerelease. Production stays on v* tags -> `latest` (release.yml).
+# On main, when EVERY step passes, the final `test` step ships that exact installer to the
+# rolling `beta` prerelease. Production stays on v* tags -> `latest` (release.yml).
+# Same-repo runs also do a LINKED smoke: the agent gets a pre-provisioned CI node token and the
+# run drives a real command through the control plane (enqueue -> DO -> WS -> execute -> result).
 on:
   push:
     branches: [main]
@@ -55,10 +57,17 @@ jobs:
           if-no-files-found: error
 
   test:
-    name: install + provision + tray GUI (installed app)
+    name: install + provision + link + tray GUI (installed app)
     needs: build
     runs-on: windows-latest
     timeout-minutes: 30
+    permissions:
+      contents: write # the final main-only step re-points the rolling beta release
+    env:
+      # Pre-provisioned CI node credentials (empty on fork PRs -> the linked smoke skips).
+      CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
+      CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
+      CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
     steps:
       - uses: actions/checkout@v4 # for tests/gui/TrayTest
       - uses: actions/setup-dotnet@v4
@@ -133,6 +142,10 @@ jobs:
             }
             $st = & $exe status | Out-String
             if (($st -notmatch 'ufo_home:\s+\(unset\)') -and ($st -notmatch 'python:\s+\(unset\)')) { Write-Host $st; $ok = $true; break }
+            # Fail fast: bootstrap logs its verdict on failure — don't burn the full timeout.
+            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'UFO2 setup failed' -Quiet)) {
+              throw 'bootstrap reported failure (see [agent] log above)'
+            }
             Start-Sleep -Seconds 10
           }
           if (-not $ok) {
@@ -142,9 +155,69 @@ jobs:
           }
           Write-Host 'installer auto-provisioned UFO2 (no git) OK'
 
+      - name: Linked smoke — WS connect + command round-trip through the live control plane
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe  = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          # Hand the pre-provisioned CI node token to the installed agent; the service's WS loop
+          # polls the store every 30s and connects as soon as it appears.
+          & $exe configure --agent-token $env:CI_AGENT_TOKEN
+          $deadline = (Get-Date).AddMinutes(3); $seen = 0; $connected = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+              if (($lines | Select-String 'ws: connected to control plane').Count -gt 0) { $connected = $true; break }
+            }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $connected) { throw 'agent never connected to the control plane over WebSocket' }
+          Write-Host 'WS connected - enqueueing a repair command via the control plane API...'
+          $hdr = @{ authorization = "Bearer $env:CI_ADMIN_TOKEN"; 'content-type' = 'application/json' }
+          $base = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/commands"
+          $resp = Invoke-RestMethod -Method POST -Uri $base -Headers $hdr -Body '{"kind":"repair"}'
+          Write-Host "enqueued: id=$($resp.id) status=$($resp.status)"
+          $deadline = (Get-Date).AddMinutes(2); $done = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+            }
+            $hist = Invoke-RestMethod -Uri $base -Headers $hdr
+            $cmd = $hist.commands | Where-Object { $_.id -eq $resp.id }
+            if ($cmd -and $cmd.status -eq 'done')   { Write-Host "command done: $($cmd.result)"; $done = $true; break }
+            if ($cmd -and $cmd.status -eq 'failed') { throw "command failed: $($cmd.result)" }
+            Start-Sleep -Seconds 5
+          }
+          if (-not $done) { throw 'repair command did not reach done within 2 minutes' }
+          Write-Host 'linked smoke OK: enqueue -> DO push -> agent WS -> execute -> result'
+
       - name: Headful tray click-through on the installed app (FlaUI)
         shell: pwsh
         run: dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe" "$env:RUNNER_TEMP\shots"
+
+      - name: Publish rolling beta (main pushes only — runs only if every step above passed)
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          setup=$(find dl -name ufoagent-setup.exe | head -1)
+          test -f "$setup"
+          # Re-point the beta tag at this commit (the release follows its tag); stable URL:
+          #   https://github.com/ufoagent/ufoagent-node/releases/download/beta/ufoagent-setup.exe
+          git tag -f beta "$GITHUB_SHA"
+          git push -f origin beta
+          if ! gh release view beta >/dev/null 2>&1; then
+            gh release create beta --prerelease --title "UFOAgent beta (rolling)" \
+              --notes "Rolling beta: the newest main build that passed the full install + provision + tray GUI test suite. Want stable? Grab the latest production release instead."
+          fi
+          gh release upload beta "$setup" --clobber
+          echo "beta -> $GITHUB_SHA"
 
       - name: Upload tray screenshots (always)
         if: always()
@@ -186,38 +259,3 @@ jobs:
           Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
           if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
-
-  publish-beta:
-    name: publish rolling beta (main, all tests green)
-    # The beta channel moves ONLY when the full pipeline passed on main — lint/unit/build, real
-    # installer install, no-git auto-provision, and the headful tray GUI click-through. What ships
-    # is the exact artifact those tests ran, at a stable URL:
-    #   https://github.com/ufoagent/ufoagent-node/releases/download/beta/ufoagent-setup.exe
-    needs: [build, test]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download installer
-        uses: actions/download-artifact@v4
-        with:
-          name: installer
-          path: dl
-      - name: Update the rolling beta prerelease
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          test -f dl/ufoagent-setup.exe
-          # Re-point the beta tag at this commit (the release follows its tag).
-          git tag -f beta "$GITHUB_SHA"
-          git push -f origin beta
-          if ! gh release view beta >/dev/null 2>&1; then
-            gh release create beta --prerelease --title "UFOAgent beta (rolling)" \
-              --notes "Rolling beta: the newest main build that passed the full install + provision + tray GUI test suite. Want stable? Grab the latest production release instead."
-          fi
-          gh release upload beta dl/ufoagent-setup.exe --clobber
-          echo "beta -> $GITHUB_SHA"

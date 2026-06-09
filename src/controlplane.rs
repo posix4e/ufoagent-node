@@ -27,19 +27,6 @@ pub struct LinkStart {
     pub verification_uri_complete: Option<String>,
     #[serde(default)]
     pub interval: Option<u64>,
-    #[serde(default)]
-    pub expires_in: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-pub struct Heartbeat {
-    #[serde(default)]
-    pub ok: bool,
-    #[serde(default)]
-    pub min_version: Option<String>,
-    #[serde(default)]
-    pub server_time: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,13 +128,5 @@ impl ControlPlane {
 
     pub fn get_credentials(&self) -> Result<Credential> {
         self.get_json("/v1/credentials", true)
-    }
-
-    pub fn heartbeat(&self, agent_version: &str, platform: &str) -> Result<Heartbeat> {
-        self.post_json(
-            "/v1/heartbeat",
-            serde_json::json!({ "agent_version": agent_version, "platform": platform }),
-            true,
-        )
     }
 }

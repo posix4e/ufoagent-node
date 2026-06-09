@@ -173,8 +173,39 @@ fn base_python(scratch_dir: &Path) -> Result<PathBuf> {
     }
 }
 
+/// Run a child process, streaming every stdout/stderr line through the logger — so progress is
+/// visible everywhere bootstrap runs: the setup console, the tray-spawned window, and the agent
+/// log that CI tails live (every pip package, not just "installing requirements…"). Piping also
+/// makes pip drop its tty progress bars, keeping the output line-oriented.
 fn run(mut cmd: Command, what: &str) -> Result<()> {
-    let st = cmd.status().with_context(|| format!("spawning {what}"))?;
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+
+    let stderr = child.stderr.take();
+    let tag = what.to_string();
+    let err_thread = std::thread::spawn(move || {
+        if let Some(s) = stderr {
+            for line in BufReader::new(s).lines().map_while(|l| l.ok()) {
+                if !line.trim().is_empty() {
+                    info!("{tag}: {line}");
+                }
+            }
+        }
+    });
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines().map_while(|l| l.ok()) {
+            if !line.trim().is_empty() {
+                info!("{what}: {line}");
+            }
+        }
+    }
+    let _ = err_thread.join();
+    let st = child
+        .wait()
+        .with_context(|| format!("waiting for {what}"))?;
     if !st.success() {
         bail!("{what} failed (exit {:?})", st.code());
     }
