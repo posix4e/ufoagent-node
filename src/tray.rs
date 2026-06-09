@@ -22,7 +22,7 @@ mod imp {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
-    use crate::status;
+    use crate::{status, taskqueue};
 
     const DASHBOARD: &str = "https://app.ufoagent.xyz";
 
@@ -68,6 +68,58 @@ mod imp {
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", "", target])
             .spawn();
+    }
+
+    /// Run one queued task in this interactive session: `ufoagent run --task <task> -r <request>`.
+    /// Captures output to tasks\logs\<id>.txt and returns the exit + a tail as the result.
+    fn run_one(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
+        log::info!("tray: running task {} ({})", req.id, req.task);
+        let mut cmd = std::process::Command::new(exe());
+        cmd.args(["run", "--task", &req.task]);
+        if let Some(r) = &req.request {
+            cmd.arg("-r").arg(r);
+        }
+        let out = match cmd.output() {
+            Ok(o) => o,
+            Err(e) => {
+                return taskqueue::TaskResult {
+                    id: req.id.clone(),
+                    status: "failed".into(),
+                    result: format!("could not launch UFO2: {e}"),
+                }
+            }
+        };
+
+        // Persist the full transcript for diagnostics; the result carries a tail.
+        let mut transcript = String::from_utf8_lossy(&out.stdout).into_owned();
+        transcript.push_str(&String::from_utf8_lossy(&out.stderr));
+        let logs = crate::config::config_dir().join("tasks").join("logs");
+        if std::fs::create_dir_all(&logs).is_ok() {
+            let _ = std::fs::write(logs.join(format!("{}.txt", req.id)), &transcript);
+        }
+
+        let tail: String = transcript
+            .lines()
+            .rev()
+            .take(20)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>()
+            .join("\n");
+        taskqueue::TaskResult {
+            id: req.id.clone(),
+            status: if out.status.success() {
+                "done".into()
+            } else {
+                "failed".into()
+            },
+            result: if tail.is_empty() {
+                format!("exit {:?}", out.status.code())
+            } else {
+                format!("exit {:?}\n{tail}", out.status.code())
+            },
+        }
     }
 
     fn status_line() -> String {
@@ -119,11 +171,24 @@ mod imp {
             .with_menu(Box::new(menu))
             .build()?;
 
-        // Refresh status every 5s.
+        // Refresh status every 5s, and touch the liveness marker so the SYSTEM service knows there's
+        // a live interactive desktop here to run GUI tasks on.
         let tick = event_loop.create_proxy();
         std::thread::spawn(move || loop {
+            let _ = taskqueue::touch_alive();
             std::thread::sleep(Duration::from_secs(5));
             let _ = tick.send_event(Ev::Tick);
+        });
+
+        // Task executor: the service (Session 0) drops run_task requests in the file queue; we run
+        // them here in the interactive session (where UFO2 can drive the GUI) and report back. Own
+        // thread so a long task doesn't stall the status/liveness tick above.
+        std::thread::spawn(|| loop {
+            if let Some(req) = taskqueue::next_pending() {
+                let _ = taskqueue::report(&run_one(&req));
+            } else {
+                std::thread::sleep(Duration::from_secs(2));
+            }
         });
 
         let (id_link, id_repair, id_run, id_log, id_dash, id_quit) = (

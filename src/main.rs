@@ -10,6 +10,7 @@ mod repair;
 mod service;
 mod status;
 mod store;
+mod taskqueue;
 mod tray;
 mod ufo_config;
 mod update;

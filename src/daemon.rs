@@ -55,7 +55,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
         let stop = ws_stop.clone();
         let version = version.to_string();
         std::thread::spawn(move || {
-            ws::run(&version, &state, move || {
+            ws::run(&version, state, move || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
             })
         });
