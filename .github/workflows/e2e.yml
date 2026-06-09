@@ -1,17 +1,22 @@
 name: e2e
 
-# Installs the agent on a clean Windows runner via the real Inno installer and exercises the
-# standard commands end-to-end — proves the build runs with no VC++ runtime DLL (the crt-static
-# fix), the service installs + starts, and provisioning works without git.
+# One job: build with the static CRT, prove ufoagent.exe has no VC++ runtime DLL dependency,
+# install via the real Inno installer, exercise standard commands, then provision UFO2 with git
+# stripped from PATH. Captures the Inno install log + agent log + config and uploads them as
+# artifacts (and prints them inline) so a failure is never silent.
 on:
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: e2e-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  install:
-    name: install + standard commands
+  e2e:
+    name: clean install + commands + no-git provision
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -41,18 +46,21 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           choco install innosetup --no-progress -y
-          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
-          & $iscc /DAppVersion=0.0.0-e2e 'installer\ufoagent.iss'
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=0.0.0-e2e 'installer\ufoagent.iss'
           $setup = Get-ChildItem -Recurse -Filter 'ufoagent-setup.exe' | Select-Object -First 1 -ExpandProperty FullName
           if (-not $setup) { throw 'installer not produced' }
           Write-Host "installer: $setup"
           "SETUP=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Silent install
+      - name: Silent install (capture Inno log)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Start-Process "$env:SETUP" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+          $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
+          "INNO_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "installing: $env:SETUP"
+          $p = Start-Process "$env:SETUP" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -Wait -PassThru
+          Write-Host "installer exit code: $($p.ExitCode)"
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
           if (-not (Test-Path $exe)) { throw 'ufoagent.exe was not installed' }
           Write-Host "installed: $exe"
@@ -63,58 +71,86 @@ jobs:
           $ErrorActionPreference = 'Stop'
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
           Start-Sleep -Seconds 5
-          $svc = sc.exe query UFOAgent | Out-String
-          Write-Host $svc
+          Write-Host '--- sc query UFOAgent ---'
+          $svc = sc.exe query UFOAgent | Out-String; Write-Host $svc
           if ($svc -notmatch 'RUNNING|START_PENDING') { throw 'UFOAgent service is not running' }
-
-          & $exe version
-          & $exe configure --control-plane https://app.ufoagent.xyz
-          $st = & $exe status | Out-String
-          Write-Host $st
+          Write-Host '--- version ---';      & $exe version
+          Write-Host '--- configure ---';    & $exe configure --control-plane https://app.ufoagent.xyz
+          Write-Host '--- status ---';       $st = & $exe status | Out-String; Write-Host $st
           if ($st -notmatch 'app\.ufoagent\.xyz') { throw 'configure did not persist' }
-
-          & $exe update
-          & $exe link --help | Out-Null
+          Write-Host '--- update ---';       & $exe update
+          Write-Host '--- link --help ---';  & $exe link --help | Out-Null
           $r = Invoke-WebRequest 'https://app.ufoagent.xyz/v1/agent/version' -UseBasicParsing -TimeoutSec 20
           if ($r.StatusCode -ne 200) { throw 'control plane unreachable from the node' }
           Write-Host 'standard commands OK'
 
-      - name: Uninstall
+      - name: Capture install diagnostics (always)
         if: always()
         shell: pwsh
         run: |
-          # Stop any lingering agent processes (the installer kicks off a background bootstrap) so
-          # the uninstaller can remove files cleanly.
+          $diag = Join-Path $env:RUNNER_TEMP 'diag'
+          New-Item -ItemType Directory -Force -Path $diag | Out-Null
+          $pd = "$env:ProgramData\UFOAgent"
+          Write-Host '===== Inno install log ====='
+          if ($env:INNO_LOG -and (Test-Path $env:INNO_LOG)) {
+            Get-Content $env:INNO_LOG | Write-Host
+            Copy-Item $env:INNO_LOG $diag -ErrorAction SilentlyContinue
+          } else { Write-Host '(no inno log)' }
+          Write-Host '===== agent log (ufoagent.log, tail) ====='
+          $alog = Join-Path $pd 'logs\ufoagent.log'
+          if (Test-Path $alog) {
+            Get-Content $alog -Tail 200 | Write-Host
+            Copy-Item $alog (Join-Path $diag 'ufoagent.log') -ErrorAction SilentlyContinue
+          } else { Write-Host '(no agent log yet)' }
+          Write-Host '===== config.json ====='
+          $cfg = Join-Path $pd 'config.json'
+          if (Test-Path $cfg) { Get-Content $cfg | Write-Host; Copy-Item $cfg $diag -ErrorAction SilentlyContinue }
+          Write-Host '===== ProgramData\UFOAgent tree ====='
+          if (Test-Path $pd) { Get-ChildItem -Recurse $pd | Select-Object FullName, Length | Format-Table -Auto | Out-String | Write-Host }
+          Write-Host '===== service ====='
+          sc.exe query UFOAgent | Out-String | Write-Host
+
+      - name: Uninstall (always)
+        if: always()
+        shell: pwsh
+        run: |
           Get-Process ufoagent -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $u = "$env:ProgramFiles\UFOAgent\unins000.exe"
           if (Test-Path $u) { Start-Process $u -ArgumentList '/VERYSILENT' -Wait; Write-Host 'uninstalled' }
 
-  provision:
-    name: auto-provision UFO2 without git
-    runs-on: windows-latest
-    timeout-minutes: 35
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Build release
-        run: cargo build --release
-
-      - name: Bootstrap with git removed from PATH (proves the no-git zip path)
+      - name: Provision UFO2 with git removed from PATH (no-git zip path)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $env:UFOAGENT_HOME = Join-Path $env:RUNNER_TEMP 'ufoagent-e2e'
-          # Drop any PATH entry that contains git.exe so bootstrap MUST download the UFO2 zip.
           $env:PATH = (($env:PATH -split ';') |
             Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
           if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' }
           else { Write-Host 'git removed from PATH' }
-
           & 'target\release\ufoagent.exe' bootstrap
           $st = & 'target\release\ufoagent.exe' status | Out-String
           Write-Host $st
           if ($st -match 'ufo_home:\s+\(unset\)') { throw 'bootstrap did not record a ufo_home' }
           if ($st -match 'python:\s+\(unset\)') { throw 'bootstrap did not record a python interpreter' }
           Write-Host 'auto-provision (no git) OK'
+
+      - name: Capture provision log (always)
+        if: always()
+        shell: pwsh
+        run: |
+          $diag = Join-Path $env:RUNNER_TEMP 'diag'
+          New-Item -ItemType Directory -Force -Path $diag | Out-Null
+          $plog = Join-Path $env:RUNNER_TEMP 'ufoagent-e2e\logs\ufoagent.log'
+          if (Test-Path $plog) {
+            Write-Host '===== provision log (tail) ====='
+            Get-Content $plog -Tail 200 | Write-Host
+            Copy-Item $plog (Join-Path $diag 'provision-ufoagent.log') -ErrorAction SilentlyContinue
+          } else { Write-Host '(no provision log)' }
+
+      - name: Upload diagnostics (always)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics
+          path: ${{ runner.temp }}/diag
+          if-no-files-found: ignore
