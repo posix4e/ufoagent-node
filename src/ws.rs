@@ -1,10 +1,13 @@
-//! Persistent WebSocket to the control plane's per-node Durable Object: receive pushed commands,
-//! execute them (refresh / repair), and stream results + liveness pings back. Runs on its own
-//! thread with reconnect/backoff. The HTTP heartbeat loop stays as a fallback.
+//! Persistent WebSocket to the control plane's per-node Durable Object — the single
+//! control-plane connection: receives pushed commands, executes them (refresh / repair), streams
+//! results back, carries liveness (app-level pings), and learns the min_version floor from the
+//! hello_ack. Runs on its own thread with reconnect/backoff.
 
 use anyhow::{anyhow, Result};
 use std::io::ErrorKind;
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -21,6 +24,26 @@ type Sock = WebSocket<MaybeTlsStream<TcpStream>>;
 const PING_EVERY: Duration = Duration::from_secs(45);
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Shared with the daemon thread: socket liveness (the tray's online state) and the control
+/// plane's minimum-version floor from the hello_ack (drives forced self-updates).
+#[derive(Default)]
+pub struct WsState {
+    connected: AtomicBool,
+    min_version: Mutex<Option<String>>,
+}
+
+impl WsState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    pub fn connected(&self) -> bool {
+        self.connected.load(Ordering::Relaxed)
+    }
+    pub fn min_version(&self) -> Option<String> {
+        self.min_version.lock().ok().and_then(|g| g.clone())
+    }
+}
+
 /// `https://app… → wss://app…/v1/connect` (and http → ws for local dev).
 fn ws_url(control_plane: &str) -> String {
     let base = control_plane.trim_end_matches('/');
@@ -35,7 +58,7 @@ fn ws_url(control_plane: &str) -> String {
 }
 
 /// Run the WS client until `should_stop`, reconnecting with backoff. Meant to run on its own thread.
-pub fn run(version: &str, should_stop: impl Fn() -> bool) {
+pub fn run(version: &str, state: &WsState, should_stop: impl Fn() -> bool) {
     let mut backoff = 2u64;
     let mut announced_unlinked = false;
     while !should_stop() {
@@ -50,10 +73,11 @@ pub fn run(version: &str, should_stop: impl Fn() -> bool) {
             continue;
         }
         announced_unlinked = false;
-        match connect_and_serve(version, &should_stop) {
+        match connect_and_serve(version, state, &should_stop) {
             Ok(()) => backoff = 2,
             Err(e) => log::warn!("ws: {e}"),
         }
+        state.connected.store(false, Ordering::Relaxed);
         sleep_unless_stopped(backoff, &should_stop);
         backoff = (backoff * 2).min(60);
     }
@@ -67,7 +91,11 @@ fn sleep_unless_stopped(secs: u64, should_stop: &impl Fn() -> bool) {
     }
 }
 
-fn connect_and_serve(version: &str, should_stop: &impl Fn() -> bool) -> Result<()> {
+fn connect_and_serve(
+    version: &str,
+    state: &WsState,
+    should_stop: &impl Fn() -> bool,
+) -> Result<()> {
     let token = store::get_token().ok_or_else(|| anyhow!("not linked; no token"))?;
     let cfg = Config::load();
     let url = ws_url(&cfg.control_plane_url());
@@ -85,12 +113,13 @@ fn connect_and_serve(version: &str, should_stop: &impl Fn() -> bool) -> Result<(
         json!({ "type": "hello", "agent_version": version, "platform": daemon::platform() }),
     )?;
     log::info!("ws: connected to control plane");
+    state.connected.store(true, Ordering::Relaxed);
 
     let mut last_ping = Instant::now();
     while !should_stop() {
         match socket.read() {
             Ok(Message::Text(txt)) => {
-                if let Err(e) = handle_message(&mut socket, &cfg, &txt) {
+                if let Err(e) = handle_message(&mut socket, state, &cfg, &txt) {
                     log::warn!("ws: handling message failed: {e}");
                 }
             }
@@ -109,9 +138,18 @@ fn connect_and_serve(version: &str, should_stop: &impl Fn() -> bool) -> Result<(
     Ok(())
 }
 
-fn handle_message(socket: &mut Sock, cfg: &Config, txt: &str) -> Result<()> {
+fn handle_message(socket: &mut Sock, state: &WsState, cfg: &Config, txt: &str) -> Result<()> {
     let msg: Value = serde_json::from_str(txt)?;
-    if msg.get("type").and_then(Value::as_str) != Some("command") {
+    let kind = msg.get("type").and_then(Value::as_str);
+    if kind == Some("hello_ack") {
+        if let Some(v) = msg.get("min_version").and_then(Value::as_str) {
+            if let Ok(mut g) = state.min_version.lock() {
+                *g = Some(v.to_string());
+            }
+        }
+        return Ok(());
+    }
+    if kind != Some("command") {
         return Ok(());
     }
     let id = msg

@@ -1,4 +1,5 @@
-//! Credential-refresh + heartbeat loop (the service body), and one-shot refresh.
+//! The service body: credential-refresh + self-update loop, with the WebSocket command channel
+//! on its own thread as the single control-plane connection. Also the one-shot refresh.
 
 use anyhow::Result;
 use log::{info, warn};
@@ -36,30 +37,31 @@ fn boot_jitter_secs() -> i64 {
     (h % 1800) as i64
 }
 
-/// Long-running loop (the service body). Heartbeats on a tight fixed cadence so the dashboard
-/// has live liveness; refreshes the credential only near lease expiry; checks for self-updates
-/// on a slow cadence (and right after boot, to catch a forced min_version bump). Writes
-/// status.json each cycle. Runs until `should_stop()` flips.
+/// Long-running loop (the service body). The WebSocket (own thread) is the control-plane
+/// connection: command delivery, liveness, and the min_version floor (hello_ack). This loop
+/// refreshes the credential near lease expiry, checks self-updates on a slow cadence (and right
+/// after boot, to catch a forced min_version bump), and writes status.json each tick. Runs
+/// until `should_stop()` flips.
 pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     let cfg = Config::load();
     let ufo_home = cfg.ufo_home_path();
 
-    // WebSocket command channel — receives dashboard commands the instant they're queued and
-    // doubles as the live liveness signal. The HTTP heartbeat below stays as the fallback path.
-    // Not joined on exit: its read timeout means it can take ~20s to notice the flag, and the
-    // service must stop promptly; the thread dies with the process.
+    // Not joined on exit: the WS read timeout means it can take ~20s to notice the stop flag,
+    // and the service must stop promptly; the thread dies with the process.
+    let ws_state = std::sync::Arc::new(ws::WsState::new());
     let ws_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
+        let state = ws_state.clone();
         let stop = ws_stop.clone();
         let version = version.to_string();
         std::thread::spawn(move || {
-            ws::run(&version, move || {
+            ws::run(&version, &state, move || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
             })
         });
     }
 
-    const HEARTBEAT_SECS: u64 = 60;
+    const TICK_SECS: u64 = 60;
     let update_interval = 21_600 + boot_jitter_secs(); // ~6h + jitter
     let mut next_refresh: i64 = 0; // refresh creds when now >= this (0 = immediately)
     let mut next_update_check: i64 = 0; // 0 = check soon after boot (catches forced updates)
@@ -91,25 +93,14 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
             }
         }
 
-        // 2) Heartbeat — every cycle, so last_seen stays a tight liveness signal.
-        let mut min_version: Option<String> = None;
-        match cp.heartbeat(version, &platform()) {
-            Ok(hb) => {
-                st.online = true;
-                st.last_heartbeat_ok = true;
-                min_version = hb.min_version;
-            }
-            Err(e) => {
-                st.online = false;
-                st.last_heartbeat_ok = false;
-                warn!("heartbeat failed: {}", e);
-                st.last_error = Some(e.to_string());
-            }
-        }
+        // 2) Liveness for the tray = the socket state (the control plane sees the same thing).
+        st.online = ws_state.connected();
 
         // 3) Self-update — slow cadence (first pass right after boot catches forced bumps).
+        //    min_version arrives over the WS (hello_ack).
         if now >= next_update_check {
             next_update_check = status::now() + update_interval;
+            let min_version = ws_state.min_version();
             match update::maybe_self_update(&cfg, version, min_version.as_deref()) {
                 Ok(true) => info!("self-update launched; expecting service restart"),
                 Ok(false) => {}
@@ -119,9 +110,9 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
 
         let _ = status::save(&st);
 
-        // Sleep one heartbeat interval, in short slices so the service can stop promptly.
+        // Sleep one tick, in short slices so the service can stop promptly.
         let mut slept = 0;
-        while slept < HEARTBEAT_SECS && !should_stop() {
+        while slept < TICK_SECS && !should_stop() {
             std::thread::sleep(Duration::from_secs(2));
             slept += 2;
         }

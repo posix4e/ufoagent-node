@@ -23,12 +23,3 @@ pub fn get_token() -> Option<String> {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
-
-#[allow(dead_code)]
-pub fn clear_token() -> Result<()> {
-    let p = token_path();
-    if p.exists() {
-        std::fs::remove_file(p)?;
-    }
-    Ok(())
-}
