@@ -21,6 +21,9 @@ simplelog = "0.12"
 dirs = "5"
 # Pure-Rust QR rendering for the link flow (default features drop image/svg → tiny; unicode render only).
 qrcode = { version = "0.14", default-features = false }
+# Sync WebSocket client (matches the ureq/threaded model) for the control-plane command channel.
+# rustls + bundled webpki roots so wss:// works with no system TLS dependency.
+tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots"] }
 
 # Windows-only (cfg-gated so `cargo check`/`test` run on macOS/Linux; built+verified in Windows CI).
 [target.'cfg(windows)'.dependencies]
