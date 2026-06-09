@@ -1,0 +1,31 @@
+name: gui
+
+# Headful tray test: launch `ufoagent tray` on the runner's desktop and drive the 🛸 tray menu
+# with FlaUI (find the icon, open the context menu, invoke an item). Its own workflow so its
+# inherent flakiness (notification-area automation) doesn't gate the main CI.
+on:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: gui-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tray:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.x"
+
+      - name: Build agent
+        run: cargo build --release
+
+      - name: Headful tray click-through (FlaUI)
+        shell: pwsh
+        run: dotnet run --project tests/gui/TrayTest -- "target\release\ufoagent.exe"
