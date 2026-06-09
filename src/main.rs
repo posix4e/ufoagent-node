@@ -125,8 +125,11 @@ fn main() -> Result<()> {
             match &result {
                 Ok((home, _)) => println!("\n  UFO2 provisioned at {}\n", home.display()),
                 Err(e) => {
-                    // Surface a clear, human-readable failure (the installer launches this in a
-                    // visible console with --pause so the message stays on screen).
+                    // Into the log first — the console (--pause) vanishes when closed, but the
+                    // verdict must survive in ufoagent.log (CI fails fast on this line).
+                    log::error!("UFO2 setup failed: {e:#}");
+                    // And a clear, human-readable failure on screen (the installer launches this
+                    // in a visible console with --pause so the message stays up).
                     eprintln!("\n  UFO2 setup failed: {e:#}\n");
                     eprintln!("  You can retry later from the tray (Repair) or by running");
                     eprintln!("  `ufoagent bootstrap` from an elevated prompt.\n");

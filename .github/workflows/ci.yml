@@ -142,6 +142,10 @@ jobs:
             }
             $st = & $exe status | Out-String
             if (($st -notmatch 'ufo_home:\s+\(unset\)') -and ($st -notmatch 'python:\s+\(unset\)')) { Write-Host $st; $ok = $true; break }
+            # Fail fast: bootstrap logs its verdict on failure — don't burn the full timeout.
+            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'UFO2 setup failed' -Quiet)) {
+              throw 'bootstrap reported failure (see [agent] log above)'
+            }
             Start-Sleep -Seconds 10
           }
           if (-not $ok) {
