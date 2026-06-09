@@ -52,14 +52,37 @@ jobs:
           Write-Host "installer: $setup"
           "SETUP=$setup" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-      - name: Silent install (capture Inno log)
+      - name: Silent install (async + live Inno log, 5-min guard)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          # Stop Defender re-scanning the freshly-built unsigned binaries on every launch.
+          Add-MpPreference -ExclusionPath "$env:ProgramFiles\UFOAgent", (Join-Path (Get-Location) 'target\release') -ErrorAction SilentlyContinue
           $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
           "INNO_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append
           Write-Host "installing: $env:SETUP"
-          $p = Start-Process "$env:SETUP" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$log" -Wait -PassThru
+          # Run async so we can stream the Inno log + enforce a hard timeout — an installer [Run]
+          # item (service start, background bootstrap) can stall on a headless runner.
+          $p = Start-Process "$env:SETUP" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART','/NOCANCEL',"/LOG=$log" -PassThru
+          $deadline = (Get-Date).AddMinutes(5); $seen = 0
+          while (-not $p.HasExited -and (Get-Date) -lt $deadline) {
+            Start-Sleep -Seconds 5
+            if (Test-Path $log) {
+              $lines = Get-Content $log
+              if ($lines.Count -gt $seen) {
+                $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [inno] $_" }
+                $seen = $lines.Count
+              }
+            }
+          }
+          if (-not $p.HasExited) {
+            Write-Host '::error::installer did not finish within 5 minutes (a [Run] item is hanging)'
+            if (Test-Path $log) { Write-Host '--- full inno log ---'; Get-Content $log | Write-Host }
+            Get-CimInstance Win32_Process -Filter "Name='ufoagent.exe'" |
+              ForEach-Object { Write-Host "ufoagent pid=$($_.ProcessId) cmd=$($_.CommandLine)" }
+            $p | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw 'installer hung'
+          }
           Write-Host "installer exit code: $($p.ExitCode)"
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
           if (-not (Test-Path $exe)) { throw 'ufoagent.exe was not installed' }
