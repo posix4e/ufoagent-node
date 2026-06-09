@@ -1,8 +1,15 @@
 name: ci
 
+# Run once per change: on PRs (any branch) and on pushes to main. This avoids the double-run a
+# bare `push:` + `pull_request:` causes on PR branches. Newer pushes cancel superseded runs.
 on:
   push:
+    branches: [main]
   pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:

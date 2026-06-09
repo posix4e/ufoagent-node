@@ -1,0 +1,5 @@
+# Statically link the MSVC C runtime into ufoagent.exe so it runs on a clean Windows box
+# without the Visual C++ Redistributable (no VCRUNTIME140.dll dependency). Scoped to the
+# MSVC target so the cfg(windows)-gated cross-checks on macOS/Linux are unaffected.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
