@@ -23,17 +23,23 @@ use controlplane::ControlPlane;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-fn init_logging() {
+/// Set up logging. Always writes to the rotating log file; additionally mirrors to stderr
+/// unless `quiet` (tray/service run without a console, so a stderr logger would either be lost
+/// or spew into a parent shell — file-only is correct there).
+fn init_logging(quiet: bool) {
     use simplelog::{
         ColorChoice, CombinedLogger, LevelFilter, SharedLogger, TermLogger, TerminalMode,
         WriteLogger,
     };
-    let mut loggers: Vec<Box<dyn SharedLogger>> = vec![TermLogger::new(
-        LevelFilter::Info,
-        simplelog::Config::default(),
-        TerminalMode::Stderr,
-        ColorChoice::Never,
-    )];
+    let mut loggers: Vec<Box<dyn SharedLogger>> = Vec::new();
+    if !quiet {
+        loggers.push(TermLogger::new(
+            LevelFilter::Info,
+            simplelog::Config::default(),
+            TerminalMode::Stderr,
+            ColorChoice::Never,
+        ));
+    }
     let log_dir = config::config_dir().join("logs");
     if std::fs::create_dir_all(&log_dir).is_ok() {
         if let Ok(file) = std::fs::OpenOptions::new()
@@ -65,8 +71,13 @@ fn set_utf8_console() {}
 
 fn main() -> Result<()> {
     set_utf8_console();
-    init_logging();
-    match Cli::parse().cmd {
+    // Bare `ufoagent.exe` (no subcommand) opens the tray manager.
+    let cmd = Cli::parse().cmd.unwrap_or(Cmd::Tray);
+    // The tray and service run without an attached console; keep their logging file-only so
+    // they don't write to a parent shell (or a dead stderr).
+    let quiet = matches!(cmd, Cmd::Tray | Cmd::Service { .. });
+    init_logging(quiet);
+    match cmd {
         Cmd::Version => println!("{VERSION}"),
         Cmd::Status => cmd_status(),
         Cmd::Configure {
@@ -104,9 +115,28 @@ fn main() -> Result<()> {
         }
         Cmd::RunDaemon => daemon::run_daemon(VERSION, || false)?,
         Cmd::Run { task, request } => cmd_run(task, request)?,
-        Cmd::Bootstrap { ufo_home, git_ref } => {
-            let (home, _) = bootstrap::bootstrap(ufo_home, &git_ref)?;
-            println!("UFO2 provisioned at {}", home.display());
+        Cmd::Bootstrap {
+            ufo_home,
+            git_ref,
+            pause,
+        } => {
+            let result = bootstrap::bootstrap(ufo_home, &git_ref);
+            match &result {
+                Ok((home, _)) => println!("\n  UFO2 provisioned at {}\n", home.display()),
+                Err(e) => {
+                    // Surface a clear, human-readable failure (the installer launches this in a
+                    // visible console with --pause so the message stays on screen).
+                    eprintln!("\n  UFO2 setup failed: {e:#}\n");
+                    eprintln!("  You can retry later from the tray (Repair) or by running");
+                    eprintln!("  `ufoagent bootstrap` from an elevated prompt.\n");
+                }
+            }
+            if pause {
+                println!("  Press Enter to close…");
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_line(&mut buf);
+            }
+            result?;
         }
         Cmd::Repair => {
             for line in repair::repair()? {
