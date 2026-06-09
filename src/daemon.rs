@@ -8,7 +8,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, Credential};
 use crate::status::{self, Status};
-use crate::{store, ufo_config, update};
+use crate::{store, ufo_config, update, ws};
 
 pub fn platform() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
@@ -43,6 +43,21 @@ fn boot_jitter_secs() -> i64 {
 pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     let cfg = Config::load();
     let ufo_home = cfg.ufo_home_path();
+
+    // WebSocket command channel — receives dashboard commands the instant they're queued and
+    // doubles as the live liveness signal. The HTTP heartbeat below stays as the fallback path.
+    // Not joined on exit: its read timeout means it can take ~20s to notice the flag, and the
+    // service must stop promptly; the thread dies with the process.
+    let ws_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    {
+        let stop = ws_stop.clone();
+        let version = version.to_string();
+        std::thread::spawn(move || {
+            ws::run(&version, move || {
+                stop.load(std::sync::atomic::Ordering::Relaxed)
+            })
+        });
+    }
 
     const HEARTBEAT_SECS: u64 = 60;
     let update_interval = 21_600 + boot_jitter_secs(); // ~6h + jitter
@@ -111,5 +126,6 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
             slept += 2;
         }
     }
+    ws_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }

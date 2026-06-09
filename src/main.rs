@@ -13,6 +13,7 @@ mod store;
 mod tray;
 mod ufo_config;
 mod update;
+mod ws;
 
 use anyhow::Result;
 use clap::Parser;

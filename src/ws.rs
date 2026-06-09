@@ -98,7 +98,11 @@ fn handle_message(socket: &mut Sock, cfg: &Config, txt: &str) -> Result<()> {
     if msg.get("type").and_then(Value::as_str) != Some("command") {
         return Ok(());
     }
-    let id = msg.get("id").and_then(Value::as_str).unwrap_or("").to_string();
+    let id = msg
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
     let kind = msg.get("kind").and_then(Value::as_str).unwrap_or("");
     log::info!("ws: command {kind} ({id})");
 
@@ -115,7 +119,10 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
         "refresh" => {
             let cp = ControlPlane::new(&cfg.control_plane_url(), store::get_token());
             match daemon::refresh_once(&cp, &cfg.ufo_home_path()) {
-                Ok(c) => ("done", format!("credential refreshed (lease {})", c.lease_id)),
+                Ok(c) => (
+                    "done",
+                    format!("credential refreshed (lease {})", c.lease_id),
+                ),
                 Err(e) => ("failed", e.to_string()),
             }
         }
