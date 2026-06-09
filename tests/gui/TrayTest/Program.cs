@@ -32,23 +32,20 @@ internal static class Program
 
             DumpTaskbar(desktop);
 
-            var icon = FindByNameContains(desktop, "UFOAgent");
-            if (icon == null)
+            // The tray icon usually sits in the overflow ("Show Hidden Icons") on Server 2025 — open it.
+            var chevron = FindButton(desktop, "Show Hidden Icons") ?? FindButton(desktop, "hidden icons");
+            if (chevron != null)
             {
-                Console.WriteLine("[tray-test] not in the visible area; trying the overflow flyout…");
-                var chevron = FindByNameContains(desktop, "hidden icons")
-                              ?? FindByNameContains(desktop, "notification chevron")
-                              ?? FindByNameContains(desktop, "show hidden");
-                if (chevron != null)
-                {
-                    Console.WriteLine($"[tray-test] opening overflow via '{chevron.Name}'");
-                    try { chevron.Click(); } catch { }
-                    Thread.Sleep(1500);
-                    icon = FindByNameContains(desktop, "UFOAgent");
-                }
+                Console.WriteLine($"[tray-test] opening overflow via '{chevron.Name}'");
+                try { chevron.Click(); } catch { }
+                Thread.Sleep(1500);
             }
+            else { Console.WriteLine("[tray-test] no overflow chevron found; trying the visible area"); }
 
-            if (icon == null) { Console.Error.WriteLine("[tray-test] FAIL: UFOAgent tray icon not found"); return 2; }
+            // Match the tray-icon BUTTON named ~UFOAgent — NOT a Window (e.g. the 'UFOAgent setup'
+            // installer/bootstrap console, which would otherwise match and have no Repair menu).
+            var icon = FindButton(desktop, "UFOAgent");
+            if (icon == null) { Console.Error.WriteLine("[tray-test] FAIL: UFOAgent tray icon (button) not found"); return 2; }
             Console.WriteLine($"[tray-test] found tray icon: '{Name(icon)}' [{Type(icon)}]");
 
             try { icon.RightClick(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] right-click failed: {e.Message}"); return 1; }
@@ -83,6 +80,19 @@ internal static class Program
         {
             return root.FindAllDescendants()
                 .FirstOrDefault(e => Name(e).IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0);
+        }
+        catch { return null; }
+    }
+
+    // A Button (e.g. a notification-area tray icon) whose name contains `needle`. Restricting to
+    // Button avoids matching top-level Windows like the 'UFOAgent setup' installer console.
+    private static AutomationElement FindButton(AutomationElement root, string needle)
+    {
+        try
+        {
+            return root.FindAllDescendants()
+                .FirstOrDefault(e => Type(e) == ControlType.Button.ToString()
+                                     && Name(e).IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0);
         }
         catch { return null; }
     }
