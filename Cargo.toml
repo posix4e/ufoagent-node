@@ -1,6 +1,6 @@
 [package]
 name = "ufoagent"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "UFOAgent node agent — links a Windows machine running Microsoft UFO2 to the UFOAgent control plane and keeps short-lived LLM credentials fresh."
 license = "Apache-2.0"
