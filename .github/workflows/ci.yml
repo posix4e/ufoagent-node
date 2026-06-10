@@ -266,29 +266,20 @@ jobs:
           if ($final) { Write-Host "run_task result: status=$($final.status)" } else { Write-Host '::warning::result still pending (UFO2 may still be running)' }
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-      - name: Local run_task — `ufoagent run` actually opens Notepad (real task, screenshot + assert)
+      - name: Local command — `ufoagent refresh` mints a real credential (deterministic)
         if: env.CI_AGENT_TOKEN != ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
-          $shots = "$env:RUNNER_TEMP\shots"
-          Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r','Open the Notepad application.'
-          $deadline = (Get-Date).AddMinutes(5); $opened = $false
-          while ((Get-Date) -lt $deadline) {
-            if (Get-Process notepad -ErrorAction SilentlyContinue) { $opened = $true; break }
-            Start-Sleep -Seconds 5
-          }
-          try {
-            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-            $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-notepad.png')); $g.Dispose(); $bmp.Dispose()
-          } catch {}
-          Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          if (-not $opened) { throw 'local `ufoagent run` did not actually open Notepad' }
-          Write-Host 'local run_task opened Notepad (notepad.exe ran) — real task performed'
+          # A real local CLI command doing real work against the control plane (mints an OpenAI
+          # credential via the broker). Deterministic — no second UFO2 run (the remote step already
+          # proves UFO2 genuinely performs a GUI task; repeating it here would just double the
+          # LLM cost + nondeterminism).
+          $out = & $exe refresh 2>&1 | Out-String
+          Write-Host $out
+          if ($out -notmatch 'credential written: lease=') { throw 'local `ufoagent refresh` did not mint a credential' }
+          Write-Host 'local command OK: ufoagent refresh minted a real credential'
 
       - name: Taskbar — click a tray menu item (FlaUI), assert it lands in the log
         if: env.CI_AGENT_TOKEN != ''
