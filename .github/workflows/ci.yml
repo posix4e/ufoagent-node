@@ -59,7 +59,12 @@ jobs:
   test:
     name: install + provision + link + tray GUI (installed app)
     needs: build
-    runs-on: windows-latest
+    # Pinned to windows-2025 (the migration TARGET image) rather than windows-latest: through
+    # mid-2026 `windows-latest` is being live-redirected to windows-2025-vs2026, and that redirect
+    # was reclaiming this long job ~seconds into the heavy UFO2 step (job cancelled, always-steps
+    # skipped). 2025 matches windows-latest's desktop/tray behaviour (unlike 2022, where FlaUI can't
+    # find the tray icon). Revisit after the migration completes (~June 15, 2026).
+    runs-on: windows-2025
     # Provision (~8m) + linked smoke + TWO genuine UFO2 runs (remote + local, up to ~6m each) +
     # the tray GUI — give it room so a slow UFO2 run doesn't trip the job timeout.
     timeout-minutes: 45
