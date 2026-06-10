@@ -235,23 +235,37 @@ jobs:
               Write-Host "screenshot: $name.png"
             } catch { Write-Host "screenshot $name failed: $($_.Exception.Message)" }
           }
-          # Read Notepad's document text back via UIAutomation, so we can verify UFO2 actually TYPED
-          # the message (not just opened the app). Returns $null if the control can't be read (a
-          # tooling limitation we won't fail the build over), or the document text otherwise.
+          # Read Notepad's text back via UIAutomation to verify UFO2 actually TYPED the message (not
+          # just opened the app). FromHandle(MainWindowHandle) is more reliable than enumerating the
+          # root's children by name (the Win11/2025 Notepad hosts its editor oddly); try TextPattern
+          # then ValuePattern. Returns $null only if the control truly can't be read.
           function Get-NotepadText {
             try {
               Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes -ErrorAction Stop
-              $root = [System.Windows.Automation.AutomationElement]::RootElement
-              $win = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
-                     Where-Object { $_.Current.Name -like '*Notepad*' } | Select-Object -First 1
-              if (-not $win) { return $null }
+              $np = Get-Process notepad -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+              if (-not $np) { return $null }
+              $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
+              if (-not $ae) { return $null }
               foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
-                $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+                $el = $ae.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
-                if ($el) { return ($el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)).DocumentRange.GetText(-1) }
+                if (-not $el) { continue }
+                try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp) { return $tp.DocumentRange.GetText(-1) } } catch {}
+                try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp) { return $vp.Current.Value } } catch {}
               }
               return $null
             } catch { return $null }
+          }
+          # On a failed read, dump Notepad's control tree so we can see what's actually there.
+          function Dump-NotepadTree {
+            try {
+              $np = Get-Process notepad -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+              if (-not $np) { Write-Host 'Notepad tree: no notepad window'; return }
+              $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
+              Write-Host '--- Notepad UIA tree ---'
+              $ae.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+                ForEach-Object { Write-Host ("  [{0}] class='{1}' name='{2}'" -f $_.Current.ControlType.ProgrammaticName, $_.Current.ClassName, $_.Current.Name) }
+            } catch { Write-Host "Dump-NotepadTree error: $($_.Exception.Message)" }
           }
           # Clean slate: close the lingering "UFOAgent setup" bootstrap console (deferred --pause) so
           # screenshots are legible, and ensure no Notepad is open before the test.
@@ -296,17 +310,22 @@ jobs:
           }
           Save-Shot '10-remote-notepad'
           if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
-          elseif (-not $readOk) { Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
+          elseif (-not $readOk) { Dump-NotepadTree; Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
           else { Get-Content $alog -Tail 50 | Write-Host; throw 'Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
-          # The result round-trip is already proven by the linked smoke (repair); here it is just
-          # informational, so don't burn minutes waiting on UFO2's full loop — a short peek is enough.
-          $deadline = (Get-Date).AddSeconds(45); $final = $null
+          # Let UFO2 FINISH the task on its own, so the node records it as DONE (exit 0) rather than
+          # 'failed' from us killing it early. This keeps the on-node history — and the LLM activity
+          # recap built from it — accurate: a verified, completed task. Kill only if it over-runs.
+          $deadline = (Get-Date).AddMinutes(4); $final = $null
           while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+            }
             $cmd = (Invoke-RestMethod -Uri $base -Headers $hdr).commands | Where-Object { $_.id -eq $resp.id }
             if ($cmd -and ($cmd.status -eq 'done' -or $cmd.status -eq 'failed')) { $final = $cmd; break }
             Start-Sleep -Seconds 5
           }
-          if ($final) { Write-Host "run_task result: status=$($final.status)" } else { Write-Host '::warning::result still pending (UFO2 may still be running)' }
+          if ($final) { Write-Host "run_task result: status=$($final.status)" } else { Write-Host '::warning::run_task still pending after 4 min — cleaning up' }
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       - name: Local run_task — `ufoagent run` makes UFO2 actually open Notepad (real, instrumented)
@@ -333,22 +352,35 @@ jobs:
           function Get-NotepadText {
             try {
               Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes -ErrorAction Stop
-              $root = [System.Windows.Automation.AutomationElement]::RootElement
-              $win = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
-                     Where-Object { $_.Current.Name -like '*Notepad*' } | Select-Object -First 1
-              if (-not $win) { return $null }
+              $np = Get-Process notepad -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+              if (-not $np) { return $null }
+              $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
+              if (-not $ae) { return $null }
               foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
-                $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+                $el = $ae.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
-                if ($el) { return ($el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)).DocumentRange.GetText(-1) }
+                if (-not $el) { continue }
+                try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp) { return $tp.DocumentRange.GetText(-1) } } catch {}
+                try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp) { return $vp.Current.Value } } catch {}
               }
               return $null
             } catch { return $null }
           }
+          function Dump-NotepadTree {
+            try {
+              $np = Get-Process notepad -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+              if (-not $np) { Write-Host 'Notepad tree: no notepad window'; return }
+              $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
+              Write-Host '--- Notepad UIA tree ---'
+              $ae.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) |
+                ForEach-Object { Write-Host ("  [{0}] class='{1}' name='{2}'" -f $_.Current.ControlType.ProgrammaticName, $_.Current.ClassName, $_.Current.Name) }
+            } catch { Write-Host "Dump-NotepadTree error: $($_.Exception.Message)" }
+          }
           # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an
           # array does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray
           # positional args and bailed ("try --help"). One string = clap gets the quoted request.
-          Start-Process $exe -ArgumentList 'run --task adhoc -r "Open Notepad and type the message: hello from ufoagent"' -RedirectStandardOutput $rout -RedirectStandardError $rerr
+          # -PassThru so we can wait for UFO2 to finish (exit 0 => recorded DONE), not kill it early.
+          $proc = Start-Process $exe -ArgumentList 'run --task adhoc -r "Open Notepad and type the message: hello from ufoagent"' -RedirectStandardOutput $rout -RedirectStandardError $rerr -PassThru
           $deadline = (Get-Date).AddMinutes(6); $seen = 0; $opened = $false
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $alog) {
@@ -376,10 +408,14 @@ jobs:
             Start-Sleep -Seconds 5
           }
           Save-LocalShot '11-local-notepad'
-          Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
-          elseif (-not $readOk) { Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
-          else { throw 'local run_task: Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
+          elseif (-not $readOk) { Dump-NotepadTree; Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
+          else { Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force; throw 'local run_task: Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
+          # Let `ufoagent run` (UFO2) FINISH so cmd_run records the local task as DONE (exit 0), not
+          # failed from an early kill. Kill only if it over-runs.
+          if (-not $proc.WaitForExit(240000)) { Write-Host '::warning::local UFO2 did not finish in 4 min — killing' }
+          else { Write-Host "local run exit code: $($proc.ExitCode)" }
+          Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       - name: Taskbar — View log + LLM activity summary (tray menu), assert + screenshot both
         if: env.CI_AGENT_TOKEN != ''
