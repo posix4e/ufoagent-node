@@ -278,6 +278,10 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     if let Some(r) = &request {
         cmd.arg("-r").arg(r);
     }
+    // UTF-8 stdio for UFO2: with redirected output Python defaults to the ANSI codepage (cp1252),
+    // and UFO2's post-task markdown log prints emoji (✅) — UnicodeEncodeError → exit 1 even after
+    // the task succeeded (issue #8, second layer).
+    cmd.env("PYTHONUTF8", "1");
     // When the tray drives this off the queue, run UFO2 headless too — no console flashing on the
     // desktop while it works (the tray already runs `ufoagent run` itself with no window).
     #[cfg(windows)]
