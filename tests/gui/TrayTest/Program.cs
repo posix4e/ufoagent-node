@@ -50,41 +50,22 @@ internal static class Program
 
             DumpTaskbar(desktop);
 
-            // The tray icon usually sits in the overflow ("Show Hidden Icons") on Server 2025 — open it.
-            var chevron = FindButton(desktop, "Show Hidden Icons") ?? FindButton(desktop, "hidden icons");
-            if (chevron != null)
-            {
-                Console.WriteLine($"[tray-test] opening overflow via '{chevron.Name}'");
-                try { chevron.Click(); } catch { }
-                Thread.Sleep(1500);
-            }
-            else { Console.WriteLine("[tray-test] no overflow chevron found; trying the visible area"); }
-            Shot("overflow");
-
-            // Match the tray-icon BUTTON named ~UFOAgent — NOT a Window (e.g. the 'UFOAgent setup'
-            // installer/bootstrap console, which would otherwise match and have no Repair menu).
-            var icon = FindButton(desktop, "UFOAgent");
-            if (icon == null) { Console.Error.WriteLine("[tray-test] FAIL: UFOAgent tray icon (button) not found"); Shot("FAIL-no-icon"); return 2; }
-            Console.WriteLine($"[tray-test] found tray icon: '{Name(icon)}' [{Type(icon)}]");
-            Shot("icon-found");
-
-            try { icon.RightClick(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] right-click failed: {e.Message}"); Shot("FAIL-rightclick"); return 1; }
-            Thread.Sleep(1500);
-            Shot("menu-open");
-
-            // Click "View log" — it opens ufoagent.log in Notepad, which is the on-node history of
-            // every command run (local: tray: running task / running UFO2; remote: ws: command …).
-            var viewLog = desktop.FindAllDescendants()
-                .FirstOrDefault(e => Type(e) == ControlType.MenuItem.ToString()
-                                     && Name(e).IndexOf("View log", StringComparison.OrdinalIgnoreCase) >= 0);
-            if (viewLog == null) { Console.Error.WriteLine("[tray-test] FAIL: 'View log' menu item not found after right-click"); Shot("FAIL-no-menu"); return 3; }
-
-            Console.WriteLine($"[tray-test] invoking menu item: '{Name(viewLog)}'");
-            try { viewLog.Click(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke failed: {e.Message}"); Shot("FAIL-invoke"); return 1; }
+            // "View log" — opens ufoagent.log in Notepad, the raw on-node history of every command
+            // run (local: tray: running task / running UFO2; remote: ws: command …).
+            int rc = OpenAndClick(desktop, "View log");
+            if (rc != 0) return rc;
             Thread.Sleep(2500); // let Notepad open the log
             Shot("command-log");
 
-            Console.WriteLine("[tray-test] PASS: opened the tray menu and invoked View log");
+            // "What's this node been doing?" — spawns a console that reads the on-node command log and
+            // asks the model for a friendly operator-facing recap. This is the publishable shot: the
+            // LLM summary of the real commands this build ran. Give the chat round-trip a few seconds.
+            rc = OpenAndClick(desktop, "been doing");
+            if (rc != 0) return rc;
+            Thread.Sleep(15000); // LLM round-trip (mint credential + chat/completions)
+            Shot("activity-summary");
+
+            Console.WriteLine("[tray-test] PASS: invoked View log and the activity summary from the tray");
             return 0;
         }
         catch (Exception e)
@@ -108,6 +89,40 @@ internal static class Program
             Console.WriteLine($"[tray-test] screenshot: {path}");
         }
         catch (Exception e) { Console.WriteLine($"[tray-test] screenshot failed: {e.Message}"); }
+    }
+
+    // Open the tray menu and click the item whose name contains `needle`. Each call re-opens the
+    // "Show Hidden Icons" overflow and re-finds the 🛸 icon fresh — on Server 2025 the icon lives in
+    // that flyout and it closes after each use, so a cached element goes stale between actions.
+    // Returns 0 on success, or the Main exit code for the failure (2 icon, 3 menu item).
+    private static int OpenAndClick(AutomationElement desktop, string needle)
+    {
+        var label = needle.Replace(' ', '-');
+        // Flyout is closed at the start of each call (a prior menu click dismissed it), so clicking
+        // the chevron opens it rather than toggling it shut.
+        var chevron = FindButton(desktop, "Show Hidden Icons") ?? FindButton(desktop, "hidden icons");
+        if (chevron != null) { Console.WriteLine($"[tray-test] opening overflow via '{chevron.Name}'"); try { chevron.Click(); } catch { } Thread.Sleep(1500); }
+        else { Console.WriteLine("[tray-test] no overflow chevron found; trying the visible area"); }
+
+        // Match the tray-icon BUTTON named ~UFOAgent — NOT a Window (e.g. the 'UFOAgent setup'
+        // installer/bootstrap console, which would otherwise match and have no menu).
+        var icon = FindButton(desktop, "UFOAgent");
+        if (icon == null) { Console.Error.WriteLine($"[tray-test] FAIL: UFOAgent tray icon (button) not found before '{needle}'"); Shot($"FAIL-no-icon-{label}"); return 2; }
+        Console.WriteLine($"[tray-test] found tray icon: '{Name(icon)}' [{Type(icon)}]");
+
+        try { icon.RightClick(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] right-click failed: {e.Message}"); Shot($"FAIL-rightclick-{label}"); return 1; }
+        Thread.Sleep(1500);
+        Shot($"menu-{label}");
+
+        var item = desktop.FindAllDescendants()
+            .FirstOrDefault(e => Type(e) == ControlType.MenuItem.ToString()
+                                 && Name(e).IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0);
+        if (item == null) { Console.Error.WriteLine($"[tray-test] FAIL: menu item containing '{needle}' not found"); Shot($"FAIL-no-menu-{label}"); return 3; }
+
+        Console.WriteLine($"[tray-test] invoking menu item: '{Name(item)}'");
+        try { item.Click(); }
+        catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke '{needle}' failed: {e.Message}"); Shot($"FAIL-invoke-{label}"); return 1; }
+        return 0;
     }
 
     private static AutomationElement FindByNameContains(AutomationElement root, string needle)

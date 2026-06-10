@@ -311,23 +311,37 @@ jobs:
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host 'local run_task: UFO2 actually opened Notepad via `ufoagent run` — real task performed'
 
-      - name: Taskbar — click "View log" in the tray, assert it lands in the log
+      - name: Taskbar — View log + LLM activity summary (tray menu), assert + screenshot both
         if: env.CI_AGENT_TOKEN != ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
+          $exe  = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
           $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
-          # Attach to the already-running executor tray; FlaUI opens its menu and clicks "View log",
-          # which opens ufoagent.log in Notepad — the on-node history of the commands run this build
-          # (local + remote). The 'command-log' screenshot captures it.
-          dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe" "$env:RUNNER_TEMP\shots" --attach
-          $deadline = (Get-Date).AddSeconds(30); $logged = $false
-          while ((Get-Date) -lt $deadline) {
-            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'tray: menu action . view log' -Quiet)) { $logged = $true; break }
-            Start-Sleep -Seconds 2
+          # Attach to the already-running executor tray; FlaUI opens its menu and clicks two items:
+          #  - "View log" -> opens ufoagent.log in Notepad (raw on-node history) -> 'command-log' shot
+          #  - "What's this node been doing?" -> spawns the on-device LLM activity summary console,
+          #    a friendly recap of the real commands this build ran -> 'activity-summary' shot.
+          dotnet run --project tests/gui/TrayTest -- "$exe" "$env:RUNNER_TEMP\shots" --attach
+          # Both tray actions must land in the log.
+          foreach ($pat in @('tray: menu action . view log','tray: menu action . activity summary')) {
+            $deadline = (Get-Date).AddSeconds(30); $ok = $false
+            while ((Get-Date) -lt $deadline) {
+              if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern $pat -Quiet)) { $ok = $true; break }
+              Start-Sleep -Seconds 2
+            }
+            if (-not $ok) { Get-Content $alog -Tail 40 | Write-Host; throw "tray action did not show up in the log: $pat" }
+            Write-Host "ok: $pat"
           }
-          if (-not $logged) { Get-Content $alog -Tail 30 | Write-Host; throw 'tray View log click did not show up in the log' }
-          Write-Host 'taskbar action showed up in the log (tray: menu action — view log)'
+          # No faking: run the summary directly and assert it's a GENUINE LLM recap of the real
+          # commands this build ran (the remote + local run_task steps recorded entries to the
+          # on-node command log) — not the no-credential/raw fallback, nor an empty history.
+          $summary = & $exe activity | Out-String
+          Write-Host "=== activity summary ==="; Write-Host $summary
+          if ([string]::IsNullOrWhiteSpace($summary)) { throw 'activity summary was empty' }
+          if ($summary -match 'summary unavailable') { throw 'activity fell back to the raw listing (LLM path did not run)' }
+          if ($summary -match "hasn't run any commands yet") { throw 'activity found no command history (expected remote + local run_task entries)' }
+          Write-Host 'activity summary is a real on-device LLM recap'
 
       - name: Publish real screenshots to the site (main, after a green run)
         if: github.event_name == 'push' && env.CI_AGENT_TOKEN != ''
@@ -339,11 +353,13 @@ jobs:
           shots="$RUNNER_TEMP/shots"
           rm -rf pub && mkdir pub
           # Curate the illustrative shots: the two genuine "UFO2 opened Notepad" captures (the e2e
-          # hard-asserts notepad.exe + cleans the desktop first, so they're guaranteed real).
-          # (The raw-log "command-log" shot is intentionally NOT published — it shows the top of the
-          # log, i.e. pip-install noise; the upcoming on-device "activity summary" replaces it.)
-          cp "$shots/10-remote-notepad.png" pub/remote-task.png   2>/dev/null || true
-          cp "$shots/11-local-notepad.png"  pub/local-task.png    2>/dev/null || true
+          # hard-asserts notepad.exe + cleans the desktop first, so they're guaranteed real), plus
+          # the on-device LLM activity summary — a friendly recap of the real commands this build
+          # ran, generated on the node by the model. (The raw-log "command-log" shot stays
+          # unpublished — it's pip-install noise; the activity summary is the readable version.)
+          cp "$shots/10-remote-notepad.png" pub/remote-task.png        2>/dev/null || true
+          cp "$shots/11-local-notepad.png"  pub/local-task.png         2>/dev/null || true
+          cp "$shots"/*activity-summary.png pub/activity-summary.png   2>/dev/null || true
           ls -la pub
           # Force-push a single fresh commit to an orphan-style `screenshots` branch (no history
           # bloat on main, no PAT — same-repo GITHUB_TOKEN). The site hotlinks these via raw.
