@@ -19,7 +19,7 @@ concurrency:
 jobs:
   build:
     name: lint + unit + build + installer
-    runs-on: windows-2022
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -59,7 +59,7 @@ jobs:
   test:
     name: install + provision + link + tray GUI (installed app)
     needs: build
-    runs-on: windows-2022
+    runs-on: windows-latest
     # Provision (~8m) + linked smoke + TWO genuine UFO2 runs (remote + local, up to ~6m each) +
     # the tray GUI — give it room so a slow UFO2 run doesn't trip the job timeout.
     timeout-minutes: 45
