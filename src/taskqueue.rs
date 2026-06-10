@@ -140,20 +140,12 @@ pub fn report(res: &TaskResult) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::config::with_temp_home;
 
-    // UFOAGENT_HOME is process-global, so the two tests must not race over it.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    // Point config_dir() at a temp dir for the duration of a test.
+    // UFOAGENT_HOME is process-global; all tests that redirect it serialize on one shared lock
+    // (in config) so cmdlog's and taskqueue's tests can't race over the env var.
     fn with_temp<T>(f: impl FnOnce() -> T) -> T {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let dir = std::env::temp_dir().join(format!("ufoq-{}-{}", std::process::id(), now()));
-        std::env::set_var("UFOAGENT_HOME", &dir);
-        let out = f();
-        std::env::remove_var("UFOAGENT_HOME");
-        let _ = std::fs::remove_dir_all(&dir);
-        out
+        with_temp_home("ufoq", f)
     }
 
     #[test]

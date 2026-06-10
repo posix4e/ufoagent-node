@@ -205,6 +205,7 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
     }
 
     let (status, result) = execute(cfg, cmd);
+    crate::cmdlog::record("remote", cmd, None, status, Some(&result));
     send(
         socket,
         json!({ "type": "result", "id": id, "status": status, "result": result }),
@@ -238,9 +239,19 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
 fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option<String>) {
     std::thread::spawn(move || {
         let label = request.clone().unwrap_or_else(|| task.clone());
+        let req_log = request.clone();
         state.queue_send(json!({ "type": "status", "current_task": label }));
 
         let finish = |state: &WsState, status: &str, result: String| {
+            // On-node history (the tray's `ufoagent run` is suppressed via UFOAGENT_FROM_QUEUE so
+            // this remote entry is the single record of the task).
+            crate::cmdlog::record(
+                "remote",
+                "run_task",
+                req_log.as_deref(),
+                status,
+                Some(&result),
+            );
             state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
             // Clear the "running" indicator on the dashboard.
             state.queue_send(json!({ "type": "status", "current_task": Value::Null }));

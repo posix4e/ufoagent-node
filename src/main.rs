@@ -1,6 +1,8 @@
+mod activity;
 mod autologon;
 mod bootstrap;
 mod cli;
+mod cmdlog;
 mod config;
 mod controlplane;
 mod daemon;
@@ -148,6 +150,14 @@ fn main() -> Result<()> {
                 println!("  {line}");
             }
         }
+        Cmd::Activity { pause } => {
+            println!("\n{}\n", activity::summarize());
+            if pause {
+                println!("  Press Enter to close…");
+                let mut buf = String::new();
+                let _ = std::io::stdin().read_line(&mut buf);
+            }
+        }
         Cmd::Update { apply } => {
             let c = Config::load();
             let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
@@ -279,6 +289,12 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
         home.display()
     );
     let st = cmd.status()?;
+    // Record in the on-node command history — unless the tray ran us off the remote queue, in which
+    // case the service already logged it as a remote command (avoid double-counting).
+    if std::env::var("UFOAGENT_FROM_QUEUE").is_err() {
+        let status = if st.success() { "done" } else { "failed" };
+        cmdlog::record("local", "run_task", request.as_deref(), status, None);
+    }
     std::process::exit(st.code().unwrap_or(1));
 }
 

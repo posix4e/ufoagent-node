@@ -84,3 +84,25 @@ impl Config {
             .unwrap_or_else(|| config_dir().join("ufo"))
     }
 }
+
+/// Shared test helpers: `config_dir()` reads the process-global `UFOAGENT_HOME`, so every test that
+/// redirects it must serialize on the SAME lock — separate per-module locks would still race. Run a
+/// closure with `UFOAGENT_HOME` pointed at a unique temp dir, holding this one lock for its duration.
+#[cfg(test)]
+pub(crate) fn with_temp_home<T>(prefix: &str, f: impl FnOnce() -> T) -> T {
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()));
+    std::env::set_var("UFOAGENT_HOME", &dir);
+    let out = f();
+    std::env::remove_var("UFOAGENT_HOME");
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
