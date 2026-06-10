@@ -64,6 +64,19 @@ mod imp {
             .spawn();
     }
 
+    /// A native message dialog (title + body + OK). Used to surface the activity recap as a real
+    /// GUI window rather than a console — callable from any thread (it runs its own modal loop).
+    fn message_box(title: &str, body: &str) {
+        use windows::core::HSTRING;
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONINFORMATION, MB_OK};
+        let title = HSTRING::from(title);
+        let body = HSTRING::from(body);
+        unsafe {
+            MessageBoxW(HWND::default(), &body, &title, MB_OK | MB_ICONINFORMATION);
+        }
+    }
+
     fn shell_open(target: &str) {
         let _ = std::process::Command::new("cmd")
             .args(["/C", "start", "", target])
@@ -74,11 +87,17 @@ mod imp {
     /// Captures output to tasks\logs\<id>.txt and returns the exit + a tail as the result.
     fn run_one(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
         log::info!("tray: running task {} ({})", req.id, req.task);
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let mut cmd = std::process::Command::new(exe());
         cmd.args(["run", "--task", &req.task]);
         if let Some(r) = &req.request {
             cmd.arg("-r").arg(r);
         }
+        // The service already records this as a remote command; tell `run` not to double-log it.
+        cmd.env("UFOAGENT_FROM_QUEUE", "1");
+        // No flashing console on the user's desktop while UFO2 drives the GUI — run it headless.
+        cmd.creation_flags(CREATE_NO_WINDOW);
         let out = match cmd.output() {
             Ok(o) => o,
             Err(e) => {
@@ -149,6 +168,7 @@ mod imp {
         let m_link = MenuItem::new("Link / Re-link…", true, None);
         let m_repair = MenuItem::new("Repair", true, None);
         let m_run = MenuItem::new("Run a task…", true, None);
+        let m_activity = MenuItem::new("What's this node been doing?", true, None);
         let m_log = MenuItem::new("View log", true, None);
         let m_dash = MenuItem::new("Open dashboard", true, None);
         let m_quit = MenuItem::new("Quit", true, None);
@@ -158,6 +178,7 @@ mod imp {
             &m_link,
             &m_repair,
             &m_run,
+            &m_activity,
             &PredefinedMenuItem::separator(),
             &m_log,
             &m_dash,
@@ -191,10 +212,11 @@ mod imp {
             }
         });
 
-        let (id_link, id_repair, id_run, id_log, id_dash, id_quit) = (
+        let (id_link, id_repair, id_run, id_activity, id_log, id_dash, id_quit) = (
             m_link.id().clone(),
             m_repair.id().clone(),
             m_run.id().clone(),
+            m_activity.id().clone(),
             m_log.id().clone(),
             m_dash.id().clone(),
             m_quit.id().clone(),
@@ -223,6 +245,14 @@ mod imp {
                         let _ = std::process::Command::new("powershell")
                             .args(["-NoProfile", "-Command", &ps])
                             .spawn();
+                    } else if e.id == id_activity {
+                        log::info!("tray: menu action — activity summary");
+                        // Build the (LLM) recap off the UI thread — it makes a network call — then
+                        // pop a native dialog with the result. A GUI window, not a console.
+                        std::thread::spawn(|| {
+                            let text = crate::activity::summarize();
+                            message_box("UFOAgent — what this node has been doing", &text);
+                        });
                     } else if e.id == id_log {
                         log::info!("tray: menu action — view log");
                         // Open explicitly in Notepad: `.log` has no default file association on

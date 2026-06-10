@@ -60,6 +60,12 @@ pub enum Cmd {
     },
     /// Idempotently fix config / re-provision / refresh.
     Repair,
+    /// Summarize what this node has been doing (LLM-powered, on-device).
+    Activity {
+        /// Keep the console open until Enter (for the tray-spawned window).
+        #[arg(long)]
+        pause: bool,
+    },
     /// Check for updates.
     Update {
         #[arg(long)]
