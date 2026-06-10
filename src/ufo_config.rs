@@ -19,11 +19,21 @@ fn agent_section(c: &Credential) -> String {
 }
 
 pub fn render(c: &Credential) -> String {
-    format!(
-        "# Managed by ufoagent — do not edit by hand.\n# Short-lived credential, refreshed by the agent.\nHOST_AGENT:\n{}APP_AGENT:\n{}",
-        agent_section(c),
-        agent_section(c),
-    )
+    let section = agent_section(c);
+    // Every UFO2 agent role uses the one vended credential. Roles we leave unconfigured — notably
+    // EVALUATION_AGENT — fall back to UFO2's Azure-AD default and crash *after* the task completes
+    // (see issue #8), which recorded successful run_tasks as "failed". Configure all of them.
+    ["HOST_AGENT", "APP_AGENT", "EVALUATION_AGENT", "BACKUP_AGENT"]
+        .iter()
+        .fold(
+            "# Managed by ufoagent — do not edit by hand.\n# Short-lived credential, refreshed by the agent.\n".to_string(),
+            |mut acc, name| {
+                acc.push_str(name);
+                acc.push_str(":\n");
+                acc.push_str(&section);
+                acc
+            },
+        )
 }
 
 pub fn agents_yaml_path(ufo_home: &Path) -> PathBuf {
@@ -55,10 +65,20 @@ mod tests {
     }
 
     #[test]
-    fn renders_both_sections() {
+    fn renders_all_agent_sections() {
         let y = render(&cred("sk-secret"));
-        assert!(y.contains("HOST_AGENT:") && y.contains("APP_AGENT:"));
-        assert!(y.contains("API_KEY: \"sk-secret\""));
+        // All four roles must be present — a missing EVALUATION_AGENT/BACKUP_AGENT falls back to
+        // UFO2's Azure-AD default and crashes after the task (issue #8).
+        for role in [
+            "HOST_AGENT:",
+            "APP_AGENT:",
+            "EVALUATION_AGENT:",
+            "BACKUP_AGENT:",
+        ] {
+            assert!(y.contains(role), "missing {role}");
+        }
+        // The credential is set on every role (one per section).
+        assert_eq!(y.matches("API_KEY: \"sk-secret\"").count(), 4);
         assert!(y.contains("API_TYPE: \"openai\""));
         assert!(y.contains("VISUAL_MODE: true"));
     }
