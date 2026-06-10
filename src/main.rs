@@ -10,6 +10,7 @@ mod repair;
 mod service;
 mod status;
 mod store;
+mod taskqueue;
 mod tray;
 mod ufo_config;
 mod update;
@@ -264,9 +265,15 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("UFO2 not provisioned; run `ufoagent bootstrap` first"))?;
     let mut cmd = std::process::Command::new(python);
     cmd.args(["-m", "ufo", "--task", &task]).current_dir(&home);
-    if let Some(r) = request {
+    if let Some(r) = &request {
         cmd.arg("-r").arg(r);
     }
+    // Log (flushed per-record to ufoagent.log) as well as print: stdout block-buffers when
+    // redirected to a file, so the log line is the reliable "UFO2 launched" signal.
+    log::info!(
+        "running UFO2: --task {task} request={request:?} (cwd={})",
+        home.display()
+    );
     println!(
         "running UFO2: -m ufo --task {task} (cwd={})",
         home.display()

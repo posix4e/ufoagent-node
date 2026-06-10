@@ -7,7 +7,7 @@ use anyhow::{anyhow, Result};
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -17,19 +17,28 @@ use tungstenite::{Message, WebSocket};
 
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, USER_AGENT};
-use crate::{daemon, repair, store};
+use crate::{daemon, repair, store, taskqueue};
+
+/// Max time we wait for the tray to finish a run_task before reporting a timeout.
+const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Result strings are unbounded TEXT on the control plane; keep WS frames sane.
+const RESULT_MAX: usize = 8192;
 
 type Sock = WebSocket<MaybeTlsStream<TcpStream>>;
 
 const PING_EVERY: Duration = Duration::from_secs(45);
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Shared with the daemon thread: socket liveness (the tray's online state) and the control
-/// plane's minimum-version floor from the hello_ack (drives forced self-updates).
+/// Shared with the daemon thread: socket liveness (the tray's online state), the control plane's
+/// minimum-version floor from the hello_ack (drives forced self-updates), and an outbound queue so
+/// background run_task workers can push results/status without owning the socket (the read loop
+/// drains and sends them — see `connect_and_serve`). The queue survives reconnects, so a result
+/// produced while briefly disconnected is delivered on the next connection.
 #[derive(Default)]
 pub struct WsState {
     connected: AtomicBool,
     min_version: Mutex<Option<String>>,
+    outbound: Mutex<Vec<Value>>,
 }
 
 impl WsState {
@@ -41,6 +50,18 @@ impl WsState {
     }
     pub fn min_version(&self) -> Option<String> {
         self.min_version.lock().ok().and_then(|g| g.clone())
+    }
+    /// Queue a message for the read loop to send on the live socket.
+    pub fn queue_send(&self, v: Value) {
+        if let Ok(mut q) = self.outbound.lock() {
+            q.push(v);
+        }
+    }
+    fn drain_outbound(&self) -> Vec<Value> {
+        self.outbound
+            .lock()
+            .map(|mut q| std::mem::take(&mut *q))
+            .unwrap_or_default()
     }
 }
 
@@ -58,7 +79,7 @@ fn ws_url(control_plane: &str) -> String {
 }
 
 /// Run the WS client until `should_stop`, reconnecting with backoff. Meant to run on its own thread.
-pub fn run(version: &str, state: &WsState, should_stop: impl Fn() -> bool) {
+pub fn run(version: &str, state: Arc<WsState>, should_stop: impl Fn() -> bool) {
     let mut backoff = 2u64;
     let mut announced_unlinked = false;
     while !should_stop() {
@@ -73,7 +94,7 @@ pub fn run(version: &str, state: &WsState, should_stop: impl Fn() -> bool) {
             continue;
         }
         announced_unlinked = false;
-        match connect_and_serve(version, state, &should_stop) {
+        match connect_and_serve(version, &state, &should_stop) {
             Ok(()) => backoff = 2,
             Err(e) => log::warn!("ws: {e}"),
         }
@@ -93,7 +114,7 @@ fn sleep_unless_stopped(secs: u64, should_stop: &impl Fn() -> bool) {
 
 fn connect_and_serve(
     version: &str,
-    state: &WsState,
+    state: &Arc<WsState>,
     should_stop: &impl Fn() -> bool,
 ) -> Result<()> {
     let token = store::get_token().ok_or_else(|| anyhow!("not linked; no token"))?;
@@ -129,6 +150,10 @@ fn connect_and_serve(
                 if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
             Err(e) => return Err(e.into()),
         }
+        // Flush anything background run_task workers queued (results / status updates).
+        for msg in state.drain_outbound() {
+            send(&mut socket, msg)?;
+        }
         if last_ping.elapsed() >= PING_EVERY {
             send(&mut socket, json!({ "type": "ping" }))?;
             last_ping = Instant::now();
@@ -138,7 +163,7 @@ fn connect_and_serve(
     Ok(())
 }
 
-fn handle_message(socket: &mut Sock, state: &WsState, cfg: &Config, txt: &str) -> Result<()> {
+fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &str) -> Result<()> {
     let msg: Value = serde_json::from_str(txt)?;
     let kind = msg.get("type").and_then(Value::as_str);
     if kind == Some("hello_ack") {
@@ -157,10 +182,29 @@ fn handle_message(socket: &mut Sock, state: &WsState, cfg: &Config, txt: &str) -
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let kind = msg.get("kind").and_then(Value::as_str).unwrap_or("");
-    log::info!("ws: command {kind} ({id})");
+    let cmd = msg.get("kind").and_then(Value::as_str).unwrap_or("");
+    log::info!("ws: command {cmd} ({id})");
 
-    let (status, result) = execute(cfg, kind);
+    // run_task drives the GUI, so it runs in the interactive session (the tray), and can take
+    // minutes — hand it to a worker so the read loop keeps pinging. The result/status come back
+    // asynchronously via the outbound queue.
+    if cmd == "run_task" {
+        let task = msg
+            .get("args")
+            .and_then(|a| a.get("task"))
+            .and_then(Value::as_str)
+            .unwrap_or("adhoc")
+            .to_string();
+        let request = msg
+            .get("args")
+            .and_then(|a| a.get("request"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        spawn_run_task(state.clone(), id, task, request);
+        return Ok(());
+    }
+
+    let (status, result) = execute(cfg, cmd);
     send(
         socket,
         json!({ "type": "result", "id": id, "status": status, "result": result }),
@@ -184,12 +228,74 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
             Ok(lines) => ("done", lines.join("; ")),
             Err(e) => ("failed", e.to_string()),
         },
-        "run_task" => (
-            "failed",
-            "run_task not supported yet (needs the interactive-desktop bridge)".to_string(),
-        ),
         other => ("failed", format!("unknown command kind: {other}")),
     }
+}
+
+/// Hand a run_task to the Session-1 tray and report the result asynchronously. The service (this
+/// process) is in Session 0 with no desktop; the tray — already on the logged-in desktop — picks
+/// the task off the file queue, runs UFO2, and writes back the result.
+fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option<String>) {
+    std::thread::spawn(move || {
+        let label = request.clone().unwrap_or_else(|| task.clone());
+        state.queue_send(json!({ "type": "status", "current_task": label }));
+
+        let finish = |state: &WsState, status: &str, result: String| {
+            state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
+            // Clear the "running" indicator on the dashboard.
+            state.queue_send(json!({ "type": "status", "current_task": Value::Null }));
+        };
+
+        // No live desktop session means no tray to run UFO2 — fail fast and actionably.
+        if !taskqueue::tray_alive(20) {
+            finish(
+                &state,
+                "failed",
+                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
+                    .to_string(),
+            );
+            return;
+        }
+
+        let req = taskqueue::TaskRequest {
+            id: id.clone(),
+            task,
+            request,
+        };
+        if let Err(e) = taskqueue::enqueue(&req) {
+            finish(&state, "failed", format!("could not queue task: {e}"));
+            return;
+        }
+
+        let deadline = Instant::now() + RUN_TASK_TIMEOUT;
+        loop {
+            if let Some(res) = taskqueue::take_result(&id) {
+                finish(&state, &res.status, res.result);
+                return;
+            }
+            if Instant::now() >= deadline {
+                finish(
+                    &state,
+                    "failed",
+                    "task timed out after 10 minutes".to_string(),
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
+/// Truncate a result string to `max` bytes on a char boundary, marking it was cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… (truncated)", &s[..end])
 }
 
 fn send(socket: &mut Sock, v: Value) -> Result<()> {
