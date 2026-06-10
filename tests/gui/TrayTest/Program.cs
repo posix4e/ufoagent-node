@@ -9,6 +9,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
 using System.Threading;
 using FlaUI.Core;
 using FlaUI.Core.AutomationElements;
@@ -50,22 +51,22 @@ internal static class Program
 
             DumpTaskbar(desktop);
 
+            // Activity summary FIRST, on a still-clean desktop, so the recap console is what the shot
+            // shows. "What's this node been doing?" spawns a console running `ufoagent activity` — it
+            // mints a credential and asks the model for a friendly recap of the commands this build
+            // ran. The console opens in the background, so we raise it before capturing.
+            int rc = OpenAndClick(desktop, "been doing");
+            if (rc != 0) return rc;
+            ShootActivityConsole();
+
             // "View log" — opens ufoagent.log in Notepad, the raw on-node history of every command
             // run (local: tray: running task / running UFO2; remote: ws: command …).
-            int rc = OpenAndClick(desktop, "View log");
+            rc = OpenAndClick(desktop, "View log");
             if (rc != 0) return rc;
             Thread.Sleep(2500); // let Notepad open the log
             Shot("command-log");
 
-            // "What's this node been doing?" — spawns a console that reads the on-node command log and
-            // asks the model for a friendly operator-facing recap. This is the publishable shot: the
-            // LLM summary of the real commands this build ran. Give the chat round-trip a few seconds.
-            rc = OpenAndClick(desktop, "been doing");
-            if (rc != 0) return rc;
-            Thread.Sleep(15000); // LLM round-trip (mint credential + chat/completions)
-            Shot("activity-summary");
-
-            Console.WriteLine("[tray-test] PASS: invoked View log and the activity summary from the tray");
+            Console.WriteLine("[tray-test] PASS: captured the activity summary and View log from the tray");
             return 0;
         }
         catch (Exception e)
@@ -89,6 +90,40 @@ internal static class Program
             Console.WriteLine($"[tray-test] screenshot: {path}");
         }
         catch (Exception e) { Console.WriteLine($"[tray-test] screenshot failed: {e.Message}"); }
+    }
+
+    [DllImport("user32.dll")] private static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    private const int SW_RESTORE = 9;
+
+    // The "activity" item spawns `ufoagent activity --pause` in its own console (CREATE_NEW_CONSOLE),
+    // which opens in the background — so a plain screen grab shows whatever was already on top. Find
+    // that console (the newest ufoagent.exe process that owns a window — the service and tray have
+    // none), raise it to the foreground, wait for the model's recap to print, then capture it.
+    private static void ShootActivityConsole()
+    {
+        IntPtr h = IntPtr.Zero;
+        for (int i = 0; i < 10 && h == IntPtr.Zero; i++) { Thread.Sleep(1000); h = FindActivityConsole(); }
+        if (h != IntPtr.Zero) { ShowWindow(h, SW_RESTORE); SetForegroundWindow(h); }
+        else Console.WriteLine("[tray-test] WARN: activity console window not found");
+        Thread.Sleep(15000);                       // mint credential + chat/completions + print
+        if (h != IntPtr.Zero) SetForegroundWindow(h); // re-assert focus now the recap has printed
+        Thread.Sleep(800);
+        Shot("activity-summary");
+    }
+
+    private static IntPtr FindActivityConsole()
+    {
+        try
+        {
+            var procs = Process.GetProcessesByName("ufoagent")
+                .Where(p => { try { return p.MainWindowHandle != IntPtr.Zero; } catch { return false; } })
+                .OrderByDescending(p => { try { return p.StartTime; } catch { return DateTime.MinValue; } })
+                .ToList();
+            foreach (var p in procs) { try { Console.WriteLine($"[tray-test] ufoagent window: pid={p.Id} title='{p.MainWindowTitle}'"); } catch { } }
+            return procs.Count > 0 ? procs[0].MainWindowHandle : IntPtr.Zero;
+        }
+        catch (Exception e) { Console.WriteLine($"[tray-test] FindActivityConsole error: {e.Message}"); return IntPtr.Zero; }
     }
 
     // Open the tray menu and click the item whose name contains `needle`. Each call re-opens the

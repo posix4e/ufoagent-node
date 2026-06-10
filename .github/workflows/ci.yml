@@ -276,6 +276,7 @@ jobs:
             throw 'UFO2 did not open Notepad — run_task did not actually perform the task'
           }
           Write-Host 'UFO2 opened Notepad on the desktop (notepad.exe running)'
+          Save-Shot '09-remote-opening'
           # Now the real task: UFO2 must TYPE the message. Wait for it to appear, reading the document
           # back via UIAutomation. The screenshot is taken AFTER, so it shows the typed text.
           $want = 'ufoagent'; $deadline = (Get-Date).AddSeconds(90); $typed = $null; $readOk = $false
@@ -316,12 +317,12 @@ jobs:
           # stream the agent log while we wait. NO faking — UFO2 must genuinely open Notepad.
           Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
-          function Save-LocalShot {
+          function Save-LocalShot($name) {
             try {
               Add-Type -AssemblyName System.Windows.Forms,System.Drawing
               $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
               $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
-              $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-notepad.png')); $g.Dispose(); $bmp.Dispose()
+              $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots "$name.png")); $g.Dispose(); $bmp.Dispose()
             } catch {}
           }
           function Get-NotepadText {
@@ -353,7 +354,7 @@ jobs:
             Start-Sleep -Seconds 5
           }
           if (-not $opened) {
-            Save-LocalShot
+            Save-LocalShot '11-local-notepad'
             Write-Host '--- ufoagent run stdout ---'; if (Test-Path $rout) { Get-Content $rout | Write-Host }
             Write-Host '--- ufoagent run stderr ---'; if (Test-Path $rerr) { Get-Content $rerr | Write-Host }
             Write-Host '--- agent log tail ---'; if (Test-Path $alog) { Get-Content $alog -Tail 40 | Write-Host }
@@ -361,6 +362,7 @@ jobs:
             throw 'local `ufoagent run` did not actually open Notepad (UFO2 did not perform the task)'
           }
           Write-Host 'local run_task: UFO2 opened Notepad via `ufoagent run`'
+          Save-LocalShot '12-local-opening'
           # Wait for UFO2 to TYPE the message; screenshot after so the shot shows the text.
           $want = 'ufoagent'; $deadline = (Get-Date).AddSeconds(90); $typed = $null; $readOk = $false
           while ((Get-Date) -lt $deadline) {
@@ -368,7 +370,7 @@ jobs:
             if ($null -ne $txt) { $readOk = $true; if ($txt -match $want) { $typed = $txt; break } }
             Start-Sleep -Seconds 5
           }
-          Save-LocalShot
+          Save-LocalShot '11-local-notepad'
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
           elseif (-not $readOk) { Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
