@@ -278,6 +278,14 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     if let Some(r) = &request {
         cmd.arg("-r").arg(r);
     }
+    // When the tray drives this off the queue, run UFO2 headless too — no console flashing on the
+    // desktop while it works (the tray already runs `ufoagent run` itself with no window).
+    #[cfg(windows)]
+    if std::env::var("UFOAGENT_FROM_QUEUE").is_ok() {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     // Log (flushed per-record to ufoagent.log) as well as print: stdout block-buffers when
     // redirected to a file, so the log line is the reliable "UFO2 launched" signal.
     log::info!(
