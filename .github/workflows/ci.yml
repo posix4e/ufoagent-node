@@ -266,20 +266,44 @@ jobs:
           if ($final) { Write-Host "run_task result: status=$($final.status)" } else { Write-Host '::warning::result still pending (UFO2 may still be running)' }
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
-      - name: Local command — `ufoagent refresh` mints a real credential (deterministic)
+      - name: Local run_task — `ufoagent run` makes UFO2 actually open Notepad (real, instrumented)
         if: env.CI_AGENT_TOKEN != ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $exe = "$env:ProgramFiles\UFOAgent\ufoagent.exe"
-          # A real local CLI command doing real work against the control plane (mints an OpenAI
-          # credential via the broker). Deterministic — no second UFO2 run (the remote step already
-          # proves UFO2 genuinely performs a GUI task; repeating it here would just double the
-          # LLM cost + nondeterminism).
-          $out = & $exe refresh 2>&1 | Out-String
-          Write-Host $out
-          if ($out -notmatch 'credential written: lease=') { throw 'local `ufoagent refresh` did not mint a credential' }
-          Write-Host 'local command OK: ufoagent refresh minted a real credential'
+          $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
+          $shots = "$env:RUNNER_TEMP\shots"
+          # Real UFO2 task via the local CLI path. Clean slate so we start fresh, capture UFO2's own
+          # stdout/stderr to a file so a failure is diagnosable (the missing piece last time), and
+          # stream the agent log while we wait. NO faking — UFO2 must genuinely open Notepad.
+          Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
+          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r','Open the Notepad application.' -RedirectStandardOutput $rout -RedirectStandardError $rerr
+          $deadline = (Get-Date).AddMinutes(6); $seen = 0; $opened = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+            }
+            if (Get-Process notepad -ErrorAction SilentlyContinue) { $opened = $true; break }
+            Start-Sleep -Seconds 5
+          }
+          try {
+            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+            $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
+            $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-notepad.png')); $g.Dispose(); $bmp.Dispose()
+          } catch {}
+          if (-not $opened) {
+            Write-Host '--- ufoagent run stdout ---'; if (Test-Path $rout) { Get-Content $rout | Write-Host }
+            Write-Host '--- ufoagent run stderr ---'; if (Test-Path $rerr) { Get-Content $rerr | Write-Host }
+            Write-Host '--- agent log tail ---'; if (Test-Path $alog) { Get-Content $alog -Tail 40 | Write-Host }
+            Get-Process python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            throw 'local `ufoagent run` did not actually open Notepad (UFO2 did not perform the task)'
+          }
+          Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          Write-Host 'local run_task: UFO2 actually opened Notepad via `ufoagent run` — real task performed'
 
       - name: Taskbar — click a tray menu item (FlaUI), assert it lands in the log
         if: env.CI_AGENT_TOKEN != ''
