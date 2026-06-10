@@ -230,13 +230,31 @@ jobs:
               Write-Host "screenshot: $name.png"
             } catch { Write-Host "screenshot $name failed: $($_.Exception.Message)" }
           }
+          # Read Notepad's document text back via UIAutomation, so we can verify UFO2 actually TYPED
+          # the message (not just opened the app). Returns $null if the control can't be read (a
+          # tooling limitation we won't fail the build over), or the document text otherwise.
+          function Get-NotepadText {
+            try {
+              Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes -ErrorAction Stop
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $win = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
+                     Where-Object { $_.Current.Name -like '*Notepad*' } | Select-Object -First 1
+              if (-not $win) { return $null }
+              foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
+                $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+                        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
+                if ($el) { return ($el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)).DocumentRange.GetText(-1) }
+              }
+              return $null
+            } catch { return $null }
+          }
           # Clean slate: close the lingering "UFOAgent setup" bootstrap console (deferred --pause) so
           # screenshots are legible, and ensure no Notepad is open before the test.
           Get-Process | Where-Object { $_.MainWindowTitle -like '*UFOAgent setup*' } | Stop-Process -Force -ErrorAction SilentlyContinue
           Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $hdr = @{ authorization = "Bearer $env:CI_ADMIN_TOKEN"; 'content-type' = 'application/json' }
           $base = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/commands"
-          $body = '{"kind":"run_task","request":"Open the Notepad application."}'
+          $body = '{"kind":"run_task","request":"Open Notepad and type the message: hello from ufoagent"}'
           $resp = Invoke-RestMethod -Method POST -Uri $base -Headers $hdr -Body $body
           Write-Host "enqueued run_task: id=$($resp.id) status=$($resp.status)"
           # The REAL assertion: UFO2 (real key) must actually open Notepad. No faking — if notepad.exe
@@ -250,14 +268,30 @@ jobs:
             if (Get-Process notepad -ErrorAction SilentlyContinue) { $opened = $true; break }
             Start-Sleep -Seconds 5
           }
-          Save-Shot '10-remote-notepad'
           if (-not $opened) {
+            Save-Shot '10-remote-notepad'
             Get-Content $alog -Tail 50 | Write-Host
             $tlog = "$env:ProgramData\UFOAgent\tasks\logs\$($resp.id).txt"
             if (Test-Path $tlog) { Write-Host '--- task transcript ---'; Get-Content $tlog -Tail 60 | Write-Host }
             throw 'UFO2 did not open Notepad — run_task did not actually perform the task'
           }
-          Write-Host 'UFO2 opened Notepad on the desktop (notepad.exe running) — real task performed'
+          Write-Host 'UFO2 opened Notepad on the desktop (notepad.exe running)'
+          # Now the real task: UFO2 must TYPE the message. Wait for it to appear, reading the document
+          # back via UIAutomation. The screenshot is taken AFTER, so it shows the typed text.
+          $want = 'ufoagent'; $deadline = (Get-Date).AddSeconds(90); $typed = $null; $readOk = $false
+          while ((Get-Date) -lt $deadline) {
+            if (Test-Path $alog) {
+              $lines = Get-Content $alog
+              if ($lines.Count -gt $seen) { $lines[$seen..($lines.Count - 1)] | ForEach-Object { Write-Host "  [agent] $_" }; $seen = $lines.Count }
+            }
+            $txt = Get-NotepadText
+            if ($null -ne $txt) { $readOk = $true; if ($txt -match $want) { $typed = $txt; break } }
+            Start-Sleep -Seconds 5
+          }
+          Save-Shot '10-remote-notepad'
+          if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
+          elseif (-not $readOk) { Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
+          else { Get-Content $alog -Tail 50 | Write-Host; throw 'Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
           # The result round-trip is already proven by the linked smoke (repair); here it is just
           # informational, so don't burn minutes waiting on UFO2's full loop — a short peek is enough.
           $deadline = (Get-Date).AddSeconds(45); $final = $null
@@ -282,10 +316,33 @@ jobs:
           # stream the agent log while we wait. NO faking — UFO2 must genuinely open Notepad.
           Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
+          function Save-LocalShot {
+            try {
+              Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
+              $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-notepad.png')); $g.Dispose(); $bmp.Dispose()
+            } catch {}
+          }
+          function Get-NotepadText {
+            try {
+              Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes -ErrorAction Stop
+              $root = [System.Windows.Automation.AutomationElement]::RootElement
+              $win = $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) |
+                     Where-Object { $_.Current.Name -like '*Notepad*' } | Select-Object -First 1
+              if (-not $win) { return $null }
+              foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
+                $el = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
+                        (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
+                if ($el) { return ($el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern)).DocumentRange.GetText(-1) }
+              }
+              return $null
+            } catch { return $null }
+          }
           # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an
           # array does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray
           # positional args and bailed ("try --help"). One string = clap gets the quoted request.
-          Start-Process $exe -ArgumentList 'run --task adhoc -r "Open the Notepad application."' -RedirectStandardOutput $rout -RedirectStandardError $rerr
+          Start-Process $exe -ArgumentList 'run --task adhoc -r "Open Notepad and type the message: hello from ufoagent"' -RedirectStandardOutput $rout -RedirectStandardError $rerr
           $deadline = (Get-Date).AddMinutes(6); $seen = 0; $opened = $false
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $alog) {
@@ -295,21 +352,27 @@ jobs:
             if (Get-Process notepad -ErrorAction SilentlyContinue) { $opened = $true; break }
             Start-Sleep -Seconds 5
           }
-          try {
-            Add-Type -AssemblyName System.Windows.Forms,System.Drawing
-            $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-            $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
-            $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save((Join-Path $shots '11-local-notepad.png')); $g.Dispose(); $bmp.Dispose()
-          } catch {}
           if (-not $opened) {
+            Save-LocalShot
             Write-Host '--- ufoagent run stdout ---'; if (Test-Path $rout) { Get-Content $rout | Write-Host }
             Write-Host '--- ufoagent run stderr ---'; if (Test-Path $rerr) { Get-Content $rerr | Write-Host }
             Write-Host '--- agent log tail ---'; if (Test-Path $alog) { Get-Content $alog -Tail 40 | Write-Host }
             Get-Process python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
             throw 'local `ufoagent run` did not actually open Notepad (UFO2 did not perform the task)'
           }
+          Write-Host 'local run_task: UFO2 opened Notepad via `ufoagent run`'
+          # Wait for UFO2 to TYPE the message; screenshot after so the shot shows the text.
+          $want = 'ufoagent'; $deadline = (Get-Date).AddSeconds(90); $typed = $null; $readOk = $false
+          while ((Get-Date) -lt $deadline) {
+            $txt = Get-NotepadText
+            if ($null -ne $txt) { $readOk = $true; if ($txt -match $want) { $typed = $txt; break } }
+            Start-Sleep -Seconds 5
+          }
+          Save-LocalShot
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-          Write-Host 'local run_task: UFO2 actually opened Notepad via `ufoagent run` — real task performed'
+          if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
+          elseif (-not $readOk) { Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
+          else { throw 'local run_task: Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
 
       - name: Taskbar — View log + LLM activity summary (tray menu), assert + screenshot both
         if: env.CI_AGENT_TOKEN != ''
