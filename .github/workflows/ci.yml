@@ -246,12 +246,20 @@ jobs:
               if (-not $np) { return $null }
               $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
               if (-not $ae) { return $null }
+              # Classic Notepad (this image): the editor is ClassName 'Edit' exposed as a Pane, with
+              # the typed text sitting right in its Name (and ValuePattern). Read that first.
+              foreach ($el in $ae.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+                if ($el.Current.ClassName -eq 'Edit') {
+                  try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp -and $vp.Current.Value) { return $vp.Current.Value } } catch {}
+                  if ($el.Current.Name) { return $el.Current.Name }
+                }
+              }
+              # Modern Notepad fallback: a Document/Edit control exposing TextPattern.
               foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
                 $el = $ae.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
                 if (-not $el) { continue }
                 try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp) { return $tp.DocumentRange.GetText(-1) } } catch {}
-                try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp) { return $vp.Current.Value } } catch {}
               }
               return $null
             } catch { return $null }
@@ -326,6 +334,9 @@ jobs:
             Start-Sleep -Seconds 5
           }
           if ($final) { Write-Host "run_task result: status=$($final.status)" } else { Write-Host '::warning::run_task still pending after 4 min — cleaning up' }
+          # Dump UFO2's transcript so a non-'done' result is diagnosable (why it exits the way it does).
+          $tlog = "$env:ProgramData\UFOAgent\tasks\logs\$($resp.id).txt"
+          if (Test-Path $tlog) { Write-Host '--- UFO2 transcript (tail) ---'; Get-Content $tlog -Tail 50 | Write-Host }
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       - name: Local run_task — `ufoagent run` makes UFO2 actually open Notepad (real, instrumented)
@@ -356,12 +367,20 @@ jobs:
               if (-not $np) { return $null }
               $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
               if (-not $ae) { return $null }
+              # Classic Notepad (this image): the editor is ClassName 'Edit' exposed as a Pane, with
+              # the typed text sitting right in its Name (and ValuePattern). Read that first.
+              foreach ($el in $ae.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
+                if ($el.Current.ClassName -eq 'Edit') {
+                  try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp -and $vp.Current.Value) { return $vp.Current.Value } } catch {}
+                  if ($el.Current.Name) { return $el.Current.Name }
+                }
+              }
+              # Modern Notepad fallback: a Document/Edit control exposing TextPattern.
               foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
                 $el = $ae.FindFirst([System.Windows.Automation.TreeScope]::Descendants,
                         (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
                 if (-not $el) { continue }
                 try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp) { return $tp.DocumentRange.GetText(-1) } } catch {}
-                try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp) { return $vp.Current.Value } } catch {}
               }
               return $null
             } catch { return $null }
@@ -415,6 +434,9 @@ jobs:
           # failed from an early kill. Kill only if it over-runs.
           if (-not $proc.WaitForExit(240000)) { Write-Host '::warning::local UFO2 did not finish in 4 min — killing' }
           else { Write-Host "local run exit code: $($proc.ExitCode)" }
+          # Why did UFO2 exit the way it did? Dump its output so a non-zero exit is diagnosable.
+          Write-Host '--- UFO2 stdout (tail) ---'; if (Test-Path $rout) { Get-Content $rout -Tail 50 | Write-Host }
+          Write-Host '--- UFO2 stderr (tail) ---'; if (Test-Path $rerr) { Get-Content $rerr -Tail 50 | Write-Host }
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
       - name: Taskbar — View log + LLM activity summary (tray menu), assert + screenshot both
