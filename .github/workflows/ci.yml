@@ -338,12 +338,12 @@ jobs:
           set -euo pipefail
           shots="$RUNNER_TEMP/shots"
           rm -rf pub && mkdir pub
-          # Curate the illustrative shots; only what exists (steps that ran are guaranteed real
-          # because the e2e hard-asserts notepad.exe opened and cleans the desktop first).
+          # Curate the illustrative shots: the two genuine "UFO2 opened Notepad" captures (the e2e
+          # hard-asserts notepad.exe + cleans the desktop first, so they're guaranteed real).
+          # (The raw-log "command-log" shot is intentionally NOT published — it shows the top of the
+          # log, i.e. pip-install noise; the upcoming on-device "activity summary" replaces it.)
           cp "$shots/10-remote-notepad.png" pub/remote-task.png   2>/dev/null || true
           cp "$shots/11-local-notepad.png"  pub/local-task.png    2>/dev/null || true
-          cp "$shots/command-log.png"       pub/command-log.png   2>/dev/null || true
-          cp "$shots/menu-open.png"         pub/tray-menu.png      2>/dev/null || true
           ls -la pub
           # Force-push a single fresh commit to an orphan-style `screenshots` branch (no history
           # bloat on main, no PAT — same-repo GITHUB_TOKEN). The site hotlinks these via raw.
