@@ -60,7 +60,9 @@ jobs:
     name: install + provision + link + tray GUI (installed app)
     needs: build
     runs-on: windows-latest
-    timeout-minutes: 30
+    # Provision (~8m) + linked smoke + TWO genuine UFO2 runs (remote + local, up to ~6m each) +
+    # the tray GUI — give it room so a slow UFO2 run doesn't trip the job timeout.
+    timeout-minutes: 45
     permissions:
       contents: write # the final main-only step re-points the rolling beta release
     env:
@@ -256,8 +258,9 @@ jobs:
             throw 'UFO2 did not open Notepad — run_task did not actually perform the task'
           }
           Write-Host 'UFO2 opened Notepad on the desktop (notepad.exe running) — real task performed'
-          # Report how the command settled (it should reach done once UFO2 finishes its loop).
-          $deadline = (Get-Date).AddMinutes(3); $final = $null
+          # The result round-trip is already proven by the linked smoke (repair); here it is just
+          # informational, so don't burn minutes waiting on UFO2's full loop — a short peek is enough.
+          $deadline = (Get-Date).AddSeconds(45); $final = $null
           while ((Get-Date) -lt $deadline) {
             $cmd = (Invoke-RestMethod -Uri $base -Headers $hdr).commands | Where-Object { $_.id -eq $resp.id }
             if ($cmd -and ($cmd.status -eq 'done' -or $cmd.status -eq 'failed')) { $final = $cmd; break }
