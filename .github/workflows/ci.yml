@@ -279,7 +279,10 @@ jobs:
           # stream the agent log while we wait. NO faking — UFO2 must genuinely open Notepad.
           Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
-          Start-Process $exe -ArgumentList 'run','--task','adhoc','-r','Open the Notepad application.' -RedirectStandardOutput $rout -RedirectStandardError $rerr
+          # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an
+          # array does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray
+          # positional args and bailed ("try --help"). One string = clap gets the quoted request.
+          Start-Process $exe -ArgumentList 'run --task adhoc -r "Open the Notepad application."' -RedirectStandardOutput $rout -RedirectStandardError $rerr
           $deadline = (Get-Date).AddMinutes(6); $seen = 0; $opened = $false
           while ((Get-Date) -lt $deadline) {
             if (Test-Path $alog) {
@@ -305,23 +308,47 @@ jobs:
           Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
           Write-Host 'local run_task: UFO2 actually opened Notepad via `ufoagent run` — real task performed'
 
-      - name: Taskbar — click a tray menu item (FlaUI), assert it lands in the log
+      - name: Taskbar — click "View log" in the tray, assert it lands in the log
         if: env.CI_AGENT_TOKEN != ''
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           $alog = "$env:ProgramData\UFOAgent\logs\ufoagent.log"
-          $before = if (Test-Path $alog) { (Get-Content $alog).Count } else { 0 }
-          # Attach to the already-running executor tray; FlaUI opens its menu and invokes Repair.
+          # Attach to the already-running executor tray; FlaUI opens its menu and clicks "View log",
+          # which opens ufoagent.log in Notepad — the on-node history of the commands run this build
+          # (local + remote). The 'command-log' screenshot captures it.
           dotnet run --project tests/gui/TrayTest -- "$env:ProgramFiles\UFOAgent\ufoagent.exe" "$env:RUNNER_TEMP\shots" --attach
-          # The tray logs every menu action — assert the click reached the log.
           $deadline = (Get-Date).AddSeconds(30); $logged = $false
           while ((Get-Date) -lt $deadline) {
-            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'tray: menu action' -Quiet)) { $logged = $true; break }
+            if ((Test-Path $alog) -and (Select-String -Path $alog -Pattern 'tray: menu action . view log' -Quiet)) { $logged = $true; break }
             Start-Sleep -Seconds 2
           }
-          if (-not $logged) { Get-Content $alog -Tail 30 | Write-Host; throw 'tray menu click did not show up in the log' }
-          Write-Host 'taskbar action showed up in the log (tray: menu action)'
+          if (-not $logged) { Get-Content $alog -Tail 30 | Write-Host; throw 'tray View log click did not show up in the log' }
+          Write-Host 'taskbar action showed up in the log (tray: menu action — view log)'
+
+      - name: Publish real screenshots to the site (main, after a green run)
+        if: github.event_name == 'push' && env.CI_AGENT_TOKEN != ''
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shots="$RUNNER_TEMP/shots"
+          rm -rf pub && mkdir pub
+          # Curate the illustrative shots; only what exists (steps that ran are guaranteed real
+          # because the e2e hard-asserts notepad.exe opened and cleans the desktop first).
+          cp "$shots/10-remote-notepad.png" pub/remote-task.png   2>/dev/null || true
+          cp "$shots/11-local-notepad.png"  pub/local-task.png    2>/dev/null || true
+          cp "$shots/command-log.png"       pub/command-log.png   2>/dev/null || true
+          cp "$shots/menu-open.png"         pub/tray-menu.png      2>/dev/null || true
+          ls -la pub
+          # Force-push a single fresh commit to an orphan-style `screenshots` branch (no history
+          # bloat on main, no PAT — same-repo GITHUB_TOKEN). The site hotlinks these via raw.
+          cd pub && git init -q && git checkout -q -b screenshots
+          git add .
+          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
+          echo "published screenshots from ${GITHUB_SHA}"
 
       - name: Publish rolling beta (main pushes only — runs only if every step above passed)
         if: github.event_name == 'push'

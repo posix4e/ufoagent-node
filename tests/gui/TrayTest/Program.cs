@@ -72,17 +72,19 @@ internal static class Program
             Thread.Sleep(1500);
             Shot("menu-open");
 
-            var repair = desktop.FindAllDescendants()
+            // Click "View log" — it opens ufoagent.log in Notepad, which is the on-node history of
+            // every command run (local: tray: running task / running UFO2; remote: ws: command …).
+            var viewLog = desktop.FindAllDescendants()
                 .FirstOrDefault(e => Type(e) == ControlType.MenuItem.ToString()
-                                     && Name(e).IndexOf("Repair", StringComparison.OrdinalIgnoreCase) >= 0);
-            if (repair == null) { Console.Error.WriteLine("[tray-test] FAIL: 'Repair' menu item not found after right-click"); Shot("FAIL-no-menu"); return 3; }
+                                     && Name(e).IndexOf("View log", StringComparison.OrdinalIgnoreCase) >= 0);
+            if (viewLog == null) { Console.Error.WriteLine("[tray-test] FAIL: 'View log' menu item not found after right-click"); Shot("FAIL-no-menu"); return 3; }
 
-            Console.WriteLine($"[tray-test] invoking menu item: '{Name(repair)}'");
-            try { repair.Click(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke failed: {e.Message}"); Shot("FAIL-invoke"); return 1; }
-            Thread.Sleep(1500);
-            Shot("after-repair");
+            Console.WriteLine($"[tray-test] invoking menu item: '{Name(viewLog)}'");
+            try { viewLog.Click(); } catch (Exception e) { Console.Error.WriteLine($"[tray-test] invoke failed: {e.Message}"); Shot("FAIL-invoke"); return 1; }
+            Thread.Sleep(2500); // let Notepad open the log
+            Shot("command-log");
 
-            Console.WriteLine("[tray-test] PASS: opened the tray menu and invoked Repair");
+            Console.WriteLine("[tray-test] PASS: opened the tray menu and invoked View log");
             return 0;
         }
         catch (Exception e)

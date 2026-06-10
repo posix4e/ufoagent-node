@@ -224,7 +224,14 @@ mod imp {
                             .args(["-NoProfile", "-Command", &ps])
                             .spawn();
                     } else if e.id == id_log {
-                        shell_open(&log_path.to_string_lossy());
+                        log::info!("tray: menu action — view log");
+                        // Open explicitly in Notepad: `.log` has no default file association on
+                        // Windows Server, so the old shell "start" silently did nothing. The log
+                        // is the on-node history of every command run — local (tray: running task,
+                        // running UFO2) and remote (ws: command …).
+                        let _ = std::process::Command::new("notepad.exe")
+                            .arg(&log_path)
+                            .spawn();
                     } else if e.id == id_dash {
                         shell_open(DASHBOARD);
                     } else if e.id == id_quit {
