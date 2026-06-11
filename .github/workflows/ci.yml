@@ -322,6 +322,11 @@ jobs:
           # screenshots are legible, and ensure no Notepad is open before the test.
           Get-Process | Where-Object { $_.MainWindowTitle -like '*UFOAgent setup*' } | Stop-Process -Force -ErrorAction SilentlyContinue
           Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          # Record the whole run as frames (hidden helper, 1 shot / 2s) — assembled into the site's
+          # remote-task.gif after both tasks pass. Stopping = dropping the sentinel file.
+          $rec = Join-Path $env:RUNNER_TEMP 'stop-remote-rec'
+          Remove-Item $rec -ErrorAction SilentlyContinue
+          Start-Process pwsh -WindowStyle Hidden -ArgumentList '-NoProfile','-File','.github/scripts/record-frames.ps1','-OutDir',(Join-Path $shots 'frames-remote'),'-StopFile',$rec
           $hdr = @{ authorization = "Bearer $env:CI_ADMIN_TOKEN"; 'content-type' = 'application/json' }
           $base = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/commands"
           $body = '{"kind":"run_task","request":"Open Notepad and type the message: hello from ufoagent"}'
@@ -360,6 +365,7 @@ jobs:
             Start-Sleep -Seconds 5
           }
           Save-Shot '10-remote-notepad'
+          New-Item -ItemType File -Path $rec -Force | Out-Null # stop the recorder — the action is over
           if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
           elseif (-not $readOk) { Dump-NotepadTree; Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
           else { Get-Content $alog -Tail 50 | Write-Host; throw 'Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
@@ -438,6 +444,10 @@ jobs:
                 ForEach-Object { Write-Host ("  [{0}] class='{1}' name='{2}'" -f $_.Current.ControlType.ProgrammaticName, $_.Current.ClassName, $_.Current.Name) }
             } catch { Write-Host "Dump-NotepadTree error: $($_.Exception.Message)" }
           }
+          # Record this run too (assembled into the site's local-task.gif).
+          $rec = Join-Path $env:RUNNER_TEMP 'stop-local-rec'
+          Remove-Item $rec -ErrorAction SilentlyContinue
+          Start-Process pwsh -WindowStyle Hidden -ArgumentList '-NoProfile','-File','.github/scripts/record-frames.ps1','-OutDir',(Join-Path $shots 'frames-local'),'-StopFile',$rec
           # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an
           # array does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray
           # positional args and bailed ("try --help"). One string = clap gets the quoted request.
@@ -470,6 +480,7 @@ jobs:
             Start-Sleep -Seconds 5
           }
           Save-LocalShot '11-local-notepad'
+          New-Item -ItemType File -Path $rec -Force | Out-Null # stop the recorder — the action is over
           if ($typed) { Write-Host "real task performed — UFO2 typed into Notepad: $($typed.Trim())" }
           elseif (-not $readOk) { Dump-NotepadTree; Write-Host '::warning::could not read Notepad text via UIAutomation; relying on the screenshot for the typed message' }
           else { Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force; throw 'local run_task: Notepad opened but UFO2 never typed the message (no "ufoagent" in the document)' }
@@ -514,6 +525,28 @@ jobs:
           if ($summary -match "hasn't run any commands yet") { throw 'activity found no command history (expected remote + local run_task entries)' }
           Write-Host 'activity summary is a real on-device LLM recap'
 
+      # Runs on PRs too (publish below stays main-only): the gifs land in the tray-screenshots
+      # artifact, so a PR run shows exactly what would ship.
+      - name: Assemble task recordings into GIFs (for the site)
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $shots = "$env:RUNNER_TEMP\shots"
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { choco install ffmpeg --no-progress -y | Out-Null }
+          foreach ($t in @('remote','local')) {
+            $dir = Join-Path $shots "frames-$t"
+            $n = (Get-ChildItem $dir -Filter *.png -ErrorAction SilentlyContinue | Measure-Object).Count
+            if ($n -lt 6) { Write-Host "::warning::frames-$t has only $n frames - skipping gif"; continue }
+            # mpdecimate drops the long idle stretches (UFO2 planning), so the gif is mostly motion:
+            # console activity, Notepad opening, the message being typed. ~4 fps timelapse, 960px
+            # wide, 128-color palette; -frames:v caps a worst case at ~60s of gif.
+            $gif = Join-Path $shots "$t-task.gif"
+            ffmpeg -y -framerate 4 -i "$dir\%04d.png" -vf "mpdecimate,setpts=N/(4*TB),scale=960:-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=128[p];[b][p]paletteuse=dither=bayer:bayer_scale=3" -frames:v 240 -loop 0 $gif 2>&1 | Select-Object -Last 4
+            if (Test-Path $gif) { Write-Host ("gif: {0}-task.gif ({1:n1} MB from {2} frames)" -f $t, ((Get-Item $gif).Length/1MB), $n) }
+            else { Write-Host "::warning::ffmpeg produced no $t-task.gif" }
+          }
+
       - name: Publish real screenshots to the site (main, after a green run)
         if: github.event_name == 'push' && env.CI_AGENT_TOKEN != ''
         shell: bash
@@ -530,6 +563,9 @@ jobs:
           # unpublished — it's pip-install noise; the activity summary is the readable version.)
           cp "$shots/10-remote-notepad.png" pub/remote-task.png        2>/dev/null || true
           cp "$shots/11-local-notepad.png"  pub/local-task.png         2>/dev/null || true
+          # The moving versions: full-run timelapse recordings of the same two tasks.
+          cp "$shots/remote-task.gif"       pub/remote-task.gif        2>/dev/null || true
+          cp "$shots/local-task.gif"        pub/local-task.gif         2>/dev/null || true
           cp "$shots"/*activity-summary.png pub/activity-summary.png   2>/dev/null || true
           cp "$shots/install-screen.png"    pub/install-screen.png     2>/dev/null || true
           cp "$shots/link-screen.png"       pub/link-screen.png        2>/dev/null || true
@@ -567,7 +603,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tray-screenshots
-          path: ${{ runner.temp }}/shots
+          # Raw recorder frames are huge (hundreds of full-screen PNGs) — the gifs carry the story.
+          path: |
+            ${{ runner.temp }}/shots
+            !${{ runner.temp }}/shots/frames-*
           if-no-files-found: ignore
 
       - name: Capture diagnostics (always)
