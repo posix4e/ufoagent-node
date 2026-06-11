@@ -85,11 +85,7 @@ fn format_entry(e: &Entry) -> String {
 
 /// Coarse "x ago" so the model (and the fallback) can speak to recency without exact timestamps.
 fn rel_time(ts: i64) -> String {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(ts);
-    let d = (now - ts).max(0);
+    let d = (crate::util::now() - ts).max(0);
     if d < 90 {
         "just now".into()
     } else if d < 3600 {

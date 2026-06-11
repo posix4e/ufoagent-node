@@ -19,13 +19,6 @@ pub struct Status {
     pub last_error: Option<String>,
 }
 
-pub fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 #[allow(dead_code)] // only caller is the cfg(windows) tray, so non-Windows builds see it unused
 pub fn load() -> Status {
     std::fs::read_to_string(config_dir().join("status.json"))

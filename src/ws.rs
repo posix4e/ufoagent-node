@@ -299,14 +299,12 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
 
 /// Truncate a result string to `max` bytes on a char boundary, marking it was cut.
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+    let p = crate::util::prefix_on_char_boundary(s, max);
+    if p.len() == s.len() {
+        s.to_string()
+    } else {
+        format!("{p}… (truncated)")
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}… (truncated)", &s[..end])
 }
 
 fn send(socket: &mut Sock, v: Value) -> Result<()> {

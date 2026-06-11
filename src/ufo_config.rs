@@ -55,7 +55,6 @@ mod tests {
 
     fn cred(key: &str) -> Credential {
         Credential {
-            provider: "openai".into(),
             base_url: "https://api.openai.com/v1".into(),
             model: "gpt-4o".into(),
             api_key: key.into(),

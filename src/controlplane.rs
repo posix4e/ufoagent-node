@@ -7,9 +7,7 @@ use serde::Deserialize;
 pub const USER_AGENT: &str = concat!("ufoagent/", env!("CARGO_PKG_VERSION"));
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct Credential {
-    pub provider: String,
     pub base_url: String,
     pub model: String,
     pub api_key: String,
