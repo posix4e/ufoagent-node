@@ -86,6 +86,29 @@ jobs:
           name: installer
           path: dl
 
+      - name: Capture the installer screen (real Inno wizard, for the site)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $setup = (Get-ChildItem -Recurse dl -Filter ufoagent-setup.exe | Select-Object -First 1).FullName
+          if (-not $setup) { throw 'installer artifact missing' }
+          Add-MpPreference -ExclusionPath (Join-Path (Get-Location) 'dl') -ErrorAction SilentlyContinue
+          $shots = "$env:RUNNER_TEMP\shots"; New-Item -ItemType Directory -Force -Path $shots | Out-Null
+          (New-Object -ComObject Shell.Application).MinimizeAll()
+          # Launch the REAL installer UI (no silent flags), let the welcome page paint, screenshot,
+          # then close it before any file copy — the next step does the actual silent install. This
+          # is the genuine first screen a user sees, published to the site like the task shots.
+          $p = Start-Process $setup -PassThru
+          Start-Sleep -Seconds 8
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save("$shots\install-screen.png"); $g.Dispose(); $bmp.Dispose()
+          Write-Host 'screenshot: install-screen.png'
+          # Inno runs as a loader + extracted .tmp child — kill both before they copy anything.
+          Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+          Get-Process | Where-Object { $_.Name -like '*ufoagent-setup*' } | Stop-Process -Force -ErrorAction SilentlyContinue
+
       - name: Silent install (live Inno log, git stripped, 5-min guard)
         shell: pwsh
         run: |
@@ -201,6 +224,26 @@ jobs:
           }
           if (-not $done) { throw 'repair command did not reach done within 2 minutes' }
           Write-Host 'linked smoke OK: enqueue -> DO push -> agent WS -> execute -> result'
+
+      - name: Capture the link screen (real QR pairing console, for the site)
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $shots = "$env:RUNNER_TEMP\shots"; New-Item -ItemType Directory -Force -Path $shots | Out-Null
+          (New-Object -ComObject Shell.Application).MinimizeAll()
+          # The REAL pairing screen: `link --force` mints a fresh code + QR in its own console. The
+          # code is never approved here so it simply expires; the stored node token is untouched
+          # (link only writes the token on approval).
+          Start-Process "$env:ProgramFiles\UFOAgent\ufoagent.exe" -ArgumentList 'link','--force'
+          Start-Sleep -Seconds 10
+          Add-Type -AssemblyName System.Windows.Forms,System.Drawing
+          $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+          $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height); $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.CopyFromScreen($b.X, $b.Y, 0, 0, $bmp.Size); $bmp.Save("$shots\link-screen.png"); $g.Dispose(); $bmp.Dispose()
+          Write-Host 'screenshot: link-screen.png'
+          # Kill ONLY the link invocation, never the service.
+          Get-CimInstance Win32_Process -Filter "Name='ufoagent.exe'" | Where-Object { $_.CommandLine -match '\slink\b' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
       - name: Start the tray (run_task executor, Session 1)
         if: env.CI_AGENT_TOKEN != ''
@@ -488,6 +531,8 @@ jobs:
           cp "$shots/10-remote-notepad.png" pub/remote-task.png        2>/dev/null || true
           cp "$shots/11-local-notepad.png"  pub/local-task.png         2>/dev/null || true
           cp "$shots"/*activity-summary.png pub/activity-summary.png   2>/dev/null || true
+          cp "$shots/install-screen.png"    pub/install-screen.png     2>/dev/null || true
+          cp "$shots/link-screen.png"       pub/link-screen.png        2>/dev/null || true
           ls -la pub
           # Force-push a single fresh commit to an orphan-style `screenshots` branch (no history
           # bloat on main, no PAT — same-repo GITHUB_TOKEN). The site hotlinks these via raw.
