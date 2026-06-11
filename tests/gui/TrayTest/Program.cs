@@ -50,9 +50,19 @@ internal static class Program
 
             DumpTaskbar(desktop);
 
+            // "Run a task" — the regression guard. The tray is console-less (FreeConsole), so a
+            // console child spawned without an explicit visible console gets NO window and the menu
+            // silently does nothing (the real-install bug). Clicking opens a PowerShell prompt
+            // (Read-Host, so it just waits — UFO2 isn't actually run); taskbar.ps1 then asserts a
+            // visible powershell window exists. With the bug, no window → that assertion fails.
+            int rc = OpenAndClick(desktop, "Run a task");
+            if (rc != 0) return rc;
+            Thread.Sleep(3000); // let the prompt console paint
+            Shot("run-task-prompt");
+
             // "View log" — opens ufoagent.log in Notepad, the raw on-node history of every command
             // run (local: tray: running task / running UFO2; remote: ws: command …).
-            int rc = OpenAndClick(desktop, "View log");
+            rc = OpenAndClick(desktop, "View log");
             if (rc != 0) return rc;
             Thread.Sleep(2500); // let Notepad open the log
             Shot("command-log");
@@ -63,7 +73,7 @@ internal static class Program
             if (rc != 0) return rc;
             ShootActivityDialog(desktop);
 
-            Console.WriteLine("[tray-test] PASS: captured View log and the activity-summary dialog from the tray");
+            Console.WriteLine("[tray-test] PASS: invoked Run a task, View log, and the activity-summary dialog");
             return 0;
         }
         catch (Exception e)

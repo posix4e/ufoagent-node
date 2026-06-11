@@ -55,13 +55,47 @@ mod imp {
         std::env::current_exe().unwrap_or_else(|_| "ufoagent.exe".into())
     }
 
+    /// Launch a file/exe via the shell with an explicit visible window. The tray FreeConsole()s at
+    /// startup, so a console child spawned with std::process::Command (no CREATE_NEW_CONSOLE) gets
+    /// NO console and never appears — which made every menu action silently do nothing. ShellExecuteW
+    /// creates a proper visible window/console regardless of the caller's console state, and returns
+    /// a code we log instead of swallowing (HINSTANCE > 32 = success).
+    fn shell_open_show(file: &str, params: Option<&str>) {
+        use windows::core::{HSTRING, PCWSTR};
+        use windows::Win32::Foundation::HWND;
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        let op = HSTRING::from("open");
+        let file_h = HSTRING::from(file);
+        let params_h = params.map(HSTRING::from);
+        let params_pcwstr = params_h
+            .as_ref()
+            .map(|h| PCWSTR(h.as_ptr()))
+            .unwrap_or(PCWSTR::null());
+        let r = unsafe {
+            ShellExecuteW(
+                HWND::default(),
+                &op,
+                &file_h,
+                params_pcwstr,
+                PCWSTR::null(),
+                SW_SHOWNORMAL,
+            )
+        };
+        if r.0 as usize <= 32 {
+            log::warn!(
+                "tray: ShellExecute '{file}' failed (HINSTANCE {})",
+                r.0 as usize
+            );
+        } else {
+            log::info!("tray: launched {file}");
+        }
+    }
+
+    /// Launch `ufoagent <args…>` in its own visible console (Link/Repair). Joins args into a single
+    /// parameter string for ShellExecuteW.
     fn spawn_console(args: &[&str]) {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
-        let _ = std::process::Command::new(exe())
-            .args(args)
-            .creation_flags(CREATE_NEW_CONSOLE)
-            .spawn();
+        shell_open_show(&exe().to_string_lossy(), Some(&args.join(" ")));
     }
 
     /// A native message dialog (title + body + OK). Used to surface the activity recap as a real
@@ -75,12 +109,6 @@ mod imp {
         unsafe {
             MessageBoxW(HWND::default(), &body, &title, MB_OK | MB_ICONINFORMATION);
         }
-    }
-
-    fn shell_open(target: &str) {
-        let _ = std::process::Command::new("cmd")
-            .args(["/C", "start", "", target])
-            .spawn();
     }
 
     /// Run one queued task in this interactive session: `ufoagent run --task <task> -r <request>`.
@@ -239,12 +267,12 @@ mod imp {
                     } else if e.id == id_run {
                         log::info!("tray: menu action — run a task");
                         let exes = exe().to_string_lossy().to_string();
+                        // ShellExecute powershell in its own console (the tray has none) so the
+                        // Read-Host prompt is actually visible.
                         let ps = format!(
-                            "$r = Read-Host 'Task request'; & '{exes}' run --task adhoc -r $r; Read-Host 'done — press Enter'"
+                            "-NoProfile -Command \"$r = Read-Host 'Task request'; & '{exes}' run --task adhoc -r $r; Read-Host 'done — press Enter'\""
                         );
-                        let _ = std::process::Command::new("powershell")
-                            .args(["-NoProfile", "-Command", &ps])
-                            .spawn();
+                        shell_open_show("powershell.exe", Some(&ps));
                     } else if e.id == id_activity {
                         log::info!("tray: menu action — activity summary");
                         // Build the (LLM) recap off the UI thread — it makes a network call — then
@@ -255,15 +283,12 @@ mod imp {
                         });
                     } else if e.id == id_log {
                         log::info!("tray: menu action — view log");
-                        // Open explicitly in Notepad: `.log` has no default file association on
-                        // Windows Server, so the old shell "start" silently did nothing. The log
-                        // is the on-node history of every command run — local (tray: running task,
-                        // running UFO2) and remote (ws: command …).
-                        let _ = std::process::Command::new("notepad.exe")
-                            .arg(&log_path)
-                            .spawn();
+                        // notepad.exe + the log as its parameter (`.log` has no default association
+                        // on Windows Server). Via ShellExecute so it shows from the console-less tray.
+                        shell_open_show("notepad.exe", Some(&log_path.to_string_lossy()));
                     } else if e.id == id_dash {
-                        shell_open(DASHBOARD);
+                        log::info!("tray: menu action — open dashboard");
+                        shell_open_show(DASHBOARD, None);
                     } else if e.id == id_quit {
                         *control_flow = ControlFlow::Exit;
                     }
