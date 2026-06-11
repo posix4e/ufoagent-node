@@ -55,6 +55,18 @@ function Show-FileTail([string]$Label, [string]$Path, [int]$Lines = 50) {
   if (Test-Path $Path) { Get-Content $Path -Tail $Lines | Write-Host }
 }
 
+# Hidden desktop frame recorder (record-frames.ps1): frames land in $Shots/frames-<name>;
+# assemble-gifs.ps1 turns them into <name>-task.gif after the tasks pass. Stop = sentinel file.
+function Start-FrameRecorder([string]$Name, [double]$IntervalSec = 2) {
+  $stop = Join-Path $env:RUNNER_TEMP "stop-$Name-rec"
+  Remove-Item $stop -ErrorAction SilentlyContinue
+  Start-Process pwsh -WindowStyle Hidden -ArgumentList '-NoProfile', '-File', (Join-Path $PSScriptRoot 'record-frames.ps1'),
+    '-OutDir', (Join-Path $script:Shots "frames-$Name"), '-StopFile', $stop, '-IntervalSec', $IntervalSec
+}
+function Stop-FrameRecorder([string]$Name) {
+  New-Item -ItemType File -Path (Join-Path $env:RUNNER_TEMP "stop-$Name-rec") -Force | Out-Null
+}
+
 # Wait for UFO2 to type $Want into Notepad (read back via UIAutomation, no faking).
 # Returns @{ Typed = <full text or $null>; ReadOk = <could the document be read at all> }.
 function Wait-NotepadTyped([string]$Want = 'ufoagent', [int]$TimeoutSec = 90, [switch]$StreamAgentLog) {

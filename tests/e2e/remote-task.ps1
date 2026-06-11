@@ -4,6 +4,9 @@
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/helpers.ps1"
 Stop-UfoWindows # legible screenshots + a fresh notepad.exe assertion
+# Record the whole run as frames (hidden helper, 1 shot / 2s) — assembled into the site's
+# remote-task.gif after both tasks pass.
+Start-FrameRecorder 'remote'
 $resp = Send-NodeCommand 'run_task' 'Open Notepad and type the message: hello from ufoagent'
 Write-Host "enqueued run_task: id=$($resp.id) status=$($resp.status)"
 $tlog = "$env:ProgramData\UFOAgent\tasks\logs\$($resp.id).txt"
@@ -21,6 +24,7 @@ Save-Shot '09-remote-opening'
 # The real task: the message must be TYPED. Screenshot after, so the shot shows the text.
 $typed = Wait-NotepadTyped -StreamAgentLog
 Save-Shot '10-remote-notepad'
+Stop-FrameRecorder 'remote' # the action is over; don't record the wait-for-exit tail
 Assert-TypedVerdict $typed 'remote run_task'
 
 # Let UFO2 FINISH on its own so the node records DONE (exit 0), keeping the on-node history —

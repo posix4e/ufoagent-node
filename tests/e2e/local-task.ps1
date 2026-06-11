@@ -5,6 +5,8 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/helpers.ps1"
 Stop-UfoWindows
 $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
+# Record this run too (assembled into the site's local-task.gif).
+Start-FrameRecorder 'local'
 # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an array
 # does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray positional
 # args and bailed ("try --help"). -PassThru so we can wait for UFO2 to finish, not kill it early.
@@ -23,6 +25,7 @@ Save-Shot '12-local-opening'
 
 $typed = Wait-NotepadTyped
 Save-Shot '11-local-notepad'
+Stop-FrameRecorder 'local' # the action is over; don't record the wait-for-exit tail
 Assert-TypedVerdict $typed 'local run_task'
 
 # Let UFO2 finish so the exit code is its own verdict; dump its output either way.

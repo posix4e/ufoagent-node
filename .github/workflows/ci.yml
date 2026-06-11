@@ -136,6 +136,13 @@ jobs:
         shell: pwsh
         run: ./tests/e2e/taskbar.ps1
 
+      # Runs on PRs too (publish below stays main-only): the gifs land in the tray-screenshots
+      # artifact, so a PR run shows exactly what would ship.
+      - name: Assemble task recordings into GIFs (for the site)
+        if: env.CI_AGENT_TOKEN != ''
+        shell: pwsh
+        run: ./tests/e2e/assemble-gifs.ps1
+
       - name: Publish real screenshots to the site (main, after a green run)
         if: github.event_name == 'push' && env.CI_AGENT_TOKEN != ''
         shell: bash
@@ -150,6 +157,9 @@ jobs:
           # "command-log" shot stays unpublished — the activity summary is the readable version.)
           cp "$shots/10-remote-notepad.png" pub/remote-task.png        2>/dev/null || true
           cp "$shots/11-local-notepad.png"  pub/local-task.png         2>/dev/null || true
+          # The moving versions: full-run timelapse recordings of the same two tasks.
+          cp "$shots/remote-task.gif"       pub/remote-task.gif        2>/dev/null || true
+          cp "$shots/local-task.gif"        pub/local-task.gif         2>/dev/null || true
           cp "$shots"/*activity-summary.png pub/activity-summary.png   2>/dev/null || true
           cp "$shots/install-screen.png"    pub/install-screen.png     2>/dev/null || true
           cp "$shots/link-screen.png"       pub/link-screen.png        2>/dev/null || true
@@ -187,7 +197,10 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: tray-screenshots
-          path: ${{ runner.temp }}/shots
+          # Raw recorder frames are huge (hundreds of full-screen PNGs) — the gifs carry the story.
+          path: |
+            ${{ runner.temp }}/shots
+            !${{ runner.temp }}/shots/frames-*
           if-no-files-found: ignore
 
       - name: Capture diagnostics (always)
