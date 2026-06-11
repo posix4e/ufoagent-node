@@ -1,13 +1,13 @@
 # Drive the tray menu with FlaUI (Run a task -> PowerShell prompt; View log -> Notepad; "What's
-# this node been doing?" -> the native LLM recap dialog), then assert: the actions landed in the
-# log, AND a tray-spawned action ACTUALLY produced a visible window. That window check is the
-# regression guard — the tray is console-less, so before the ShellExecute fix every console child
-# (Run a task / Link / Repair) launched with no window and the menu silently did nothing, yet the
-# log line still appeared. A logged-but-invisible action is the exact bug; assert the window exists.
+# this node been doing?" -> the native LLM recap dialog). The regression guard lives in TrayTest:
+# it asserts 'Run a task' actually produced a VISIBLE PowerShell window (exit 4 if not) — before the
+# ShellExecute fix the console-less tray spawned it with no window and the menu silently did nothing,
+# yet the log line still appeared. Here we also confirm each action reached the log.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/helpers.ps1"
 Get-Process powershell -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue # clean slate
 dotnet run --project tests/gui/TrayTest -- "$Exe" "$env:RUNNER_TEMP\shots" --attach
+if ($LASTEXITCODE -ne 0) { Show-FileTail 'agent log' $AgentLog 40; throw "TrayTest failed (exit $LASTEXITCODE) — a tray action did not produce its window" }
 foreach ($pat in @('tray: menu action . run a task', 'tray: menu action . view log', 'tray: menu action . activity summary')) {
   $ok = Wait-For -TimeoutSec 30 -PollSec 2 -Condition {
     (Test-Path $AgentLog) -and (Select-String -Path $AgentLog -Pattern $pat -Quiet)
@@ -15,16 +15,6 @@ foreach ($pat in @('tray: menu action . run a task', 'tray: menu action . view l
   if (-not $ok) { Show-FileTail 'agent log' $AgentLog 40; throw "tray action did not show up in the log: $pat" }
   Write-Host "ok: $pat"
 }
-# Regression guard: 'Run a task' spawns a PowerShell prompt (Read-Host) from the console-less tray.
-# It must have a VISIBLE window. With the old console-less spawn it had none -> this fails.
-$prompt = Wait-For -TimeoutSec 30 -PollSec 2 -Condition {
-  [bool](Get-Process powershell -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
-}
-if (-not $prompt) {
-  Show-FileTail 'agent log' $AgentLog 40
-  throw "Run a task logged its action but opened NO visible window (the console-less tray-spawn bug)"
-}
-Write-Host 'ok: Run a task opened a visible prompt window (tray child windows are visible)'
 Get-Process powershell -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue # dismiss the prompt
 $summary = & $Exe activity | Out-String
 Write-Host '=== activity summary ==='; Write-Host $summary
