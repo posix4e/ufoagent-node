@@ -50,9 +50,29 @@ internal static class Program
 
             DumpTaskbar(desktop);
 
+            // "Run a task" — the regression guard. The tray is console-less (FreeConsole), so a
+            // console child spawned without an explicit visible console gets NO window and the menu
+            // silently does nothing (the real-install bug). Clicking opens a PowerShell prompt
+            // (Read-Host, so it just waits — UFO2 isn't actually run). Assert that a visible
+            // PowerShell window actually appeared (by title via UIA — MainWindowHandle is unreliable
+            // for console apps since the window is owned by conhost/Windows Terminal). With the old
+            // console-less spawn, no window appears → this fails. Exit 4 distinguishes it.
+            int rc = OpenAndClick(desktop, "Run a task");
+            if (rc != 0) return rc;
+            Thread.Sleep(3000); // let the prompt console paint
+            Shot("run-task-prompt");
+            var prompt = WaitForWindow(desktop, "PowerShell", 15);
+            if (prompt == null)
+            {
+                Console.Error.WriteLine("[tray-test] FAIL: 'Run a task' opened no visible PowerShell window (console-less tray-spawn bug)");
+                Shot("FAIL-no-prompt");
+                return 4;
+            }
+            Console.WriteLine($"[tray-test] 'Run a task' opened a visible window: '{Name(prompt)}'");
+
             // "View log" — opens ufoagent.log in Notepad, the raw on-node history of every command
             // run (local: tray: running task / running UFO2; remote: ws: command …).
-            int rc = OpenAndClick(desktop, "View log");
+            rc = OpenAndClick(desktop, "View log");
             if (rc != 0) return rc;
             Thread.Sleep(2500); // let Notepad open the log
             Shot("command-log");
@@ -63,7 +83,7 @@ internal static class Program
             if (rc != 0) return rc;
             ShootActivityDialog(desktop);
 
-            Console.WriteLine("[tray-test] PASS: captured View log and the activity-summary dialog from the tray");
+            Console.WriteLine("[tray-test] PASS: invoked Run a task, View log, and the activity-summary dialog");
             return 0;
         }
         catch (Exception e)
@@ -87,6 +107,26 @@ internal static class Program
             Console.WriteLine($"[tray-test] screenshot: {path}");
         }
         catch (Exception e) { Console.WriteLine($"[tray-test] screenshot failed: {e.Message}"); }
+    }
+
+    // Poll up to `seconds` for a top-level window whose name contains `needle` (case-insensitive).
+    // Used to assert a tray-spawned window actually appeared (console host varies — conhost vs
+    // Windows Terminal — so we match the title via UIA rather than a process MainWindowHandle).
+    private static AutomationElement WaitForWindow(AutomationElement desktop, string needle, int seconds)
+    {
+        for (int i = 0; i < seconds; i++)
+        {
+            try
+            {
+                var w = desktop.FindAllChildren().FirstOrDefault(e =>
+                    Type(e) == ControlType.Window.ToString()
+                    && Name(e).IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0);
+                if (w != null) return w;
+            }
+            catch { }
+            Thread.Sleep(1000);
+        }
+        return null;
     }
 
     // The "activity" item builds the recap (an LLM call, a few seconds) and pops a native dialog
