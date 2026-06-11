@@ -4,6 +4,7 @@ version = "0.3.2"
 edition = "2021"
 description = "UFOAgent node agent — links a Windows machine running Microsoft UFO2 to the UFOAgent control plane and keeps short-lived LLM credentials fresh."
 license = "Apache-2.0"
+authors = ["UFOAgent, Inc."]
 repository = "https://github.com/ufoagent/ufoagent-node"
 
 [[bin]]

@@ -1,12 +1,11 @@
 UFOAgent node agent (ufoagent-node)
-Copyright 2026 UFOAgent
+Copyright © 2026 UFOAgent, Inc. (a Delaware corporation).
+
+UFOAgent, the UFOAgent name, and the UFOAgent marks are the property of
+UFOAgent, Inc., which owns all copyrights in this software.
 
 Licensed under the Apache License, Version 2.0 (see LICENSE).
 
-This product is designed to install, configure, and run Microsoft UFO2
-("UFO²: The Desktop AgentOS"), which is a separate project licensed under the
-MIT License: https://github.com/microsoft/UFO
-
-UFO2 is not bundled in this repository; it is installed alongside the agent on
-the target Windows machine. All UFO2 trademarks and copyrights belong to their
-respective owners.
+Third-party software that this agent downloads, installs, or invokes at
+runtime is not part of this distribution and remains subject to its own
+licenses and copyrights.
