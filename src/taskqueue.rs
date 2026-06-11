@@ -43,16 +43,6 @@ fn alive_path() -> PathBuf {
     tasks_dir().join("tray-alive")
 }
 
-// Used by the tray-side helpers (Windows) and the tests; absent on a non-test macOS/Linux build.
-#[cfg(any(windows, test))]
-fn now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 // ---- service side (producer) ----
 
 /// Enqueue a task for the tray to run. Writes `inbox/<id>.json`.
@@ -98,7 +88,8 @@ pub fn tray_alive(max_age_secs: u64) -> bool {
 pub fn touch_alive() -> Result<()> {
     let dir = tasks_dir();
     std::fs::create_dir_all(&dir)?;
-    std::fs::write(alive_path(), now().to_string())?;
+    // Only the file's mtime matters to tray_alive(); the content is informational.
+    std::fs::write(alive_path(), crate::util::now().to_string())?;
     Ok(())
 }
 

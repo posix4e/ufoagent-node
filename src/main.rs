@@ -16,6 +16,7 @@ mod taskqueue;
 mod tray;
 mod ufo_config;
 mod update;
+mod util;
 mod ws;
 
 use anyhow::Result;
@@ -139,9 +140,7 @@ fn main() -> Result<()> {
                 }
             }
             if pause {
-                println!("  Press Enter to close…");
-                let mut buf = String::new();
-                let _ = std::io::stdin().read_line(&mut buf);
+                pause_enter();
             }
             result?;
         }
@@ -153,9 +152,7 @@ fn main() -> Result<()> {
         Cmd::Activity { pause } => {
             println!("\n{}\n", activity::summarize());
             if pause {
-                println!("  Press Enter to close…");
-                let mut buf = String::new();
-                let _ = std::io::stdin().read_line(&mut buf);
+                pause_enter();
             }
         }
         Cmd::Update { apply } => {
@@ -188,6 +185,13 @@ fn main() -> Result<()> {
         } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
     }
     Ok(())
+}
+
+/// Hold a tray/installer-spawned console open until Enter (those windows close on process exit).
+fn pause_enter() {
+    println!("  Press Enter to close…");
+    let mut buf = String::new();
+    let _ = std::io::stdin().read_line(&mut buf);
 }
 
 fn cmd_status() {
@@ -231,9 +235,7 @@ fn cmd_link(
         println!("\n  This machine is already linked. Re-run with --force to link again");
         println!("  (that registers a new, separate node).\n");
         if pause {
-            println!("  Press Enter to close…");
-            let mut buf = String::new();
-            let _ = std::io::stdin().read_line(&mut buf);
+            pause_enter();
         }
         return Ok(());
     }
@@ -257,9 +259,7 @@ fn cmd_link(
     store::set_token(&token)?;
     println!("\n  Linked \u{2713}  as {host}  (agent {agent_id})\n");
     if pause {
-        println!("  Press Enter to close…");
-        let mut buf = String::new();
-        let _ = std::io::stdin().read_line(&mut buf);
+        pause_enter();
     }
     Ok(())
 }

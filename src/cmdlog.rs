@@ -10,6 +10,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
+use crate::util::{now, prefix_on_char_boundary};
 
 /// One thing the agent did.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -29,13 +30,6 @@ const MAX_ENTRIES: usize = 200;
 
 fn log_path() -> PathBuf {
     config_dir().join("commands.jsonl")
-}
-
-fn now() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
 }
 
 /// Append a command to the history (stamping `ts`), trimming the file to the last MAX_ENTRIES.
@@ -90,14 +84,12 @@ pub fn recent(n: usize) -> Vec<Entry> {
 }
 
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        return s.to_string();
+    let p = prefix_on_char_boundary(s, max);
+    if p.len() == s.len() {
+        s.to_string()
+    } else {
+        format!("{p}…")
     }
-    let mut end = max;
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}…", &s[..end])
 }
 
 #[cfg(test)]

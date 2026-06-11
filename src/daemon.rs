@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, Credential};
 use crate::status::{self, Status};
-use crate::{store, ufo_config, update, ws};
+use crate::{store, ufo_config, update, util, ws};
 
 pub fn platform() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
@@ -72,7 +72,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     };
 
     while !should_stop() {
-        let now = status::now();
+        let now = util::now();
         st.linked = store::get_token().is_some();
         st.last_error = None;
         let cp = ControlPlane::new(&cfg.control_plane_url(), store::get_token());
@@ -81,14 +81,14 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
         if now >= next_refresh {
             match refresh_once(&cp, &ufo_home) {
                 Ok(c) => {
-                    st.last_refresh = status::now();
+                    st.last_refresh = util::now();
                     st.lease_expires_at = c.expires_at;
                     next_refresh = c.expires_at - 120;
                 }
                 Err(e) => {
                     warn!("credential refresh failed: {}", e);
                     st.last_error = Some(e.to_string());
-                    next_refresh = status::now() + 300; // retry in 5 min
+                    next_refresh = util::now() + 300; // retry in 5 min
                 }
             }
         }
@@ -99,7 +99,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
         // 3) Self-update — slow cadence (first pass right after boot catches forced bumps).
         //    min_version arrives over the WS (hello_ack).
         if now >= next_update_check {
-            next_update_check = status::now() + update_interval;
+            next_update_check = util::now() + update_interval;
             let min_version = ws_state.min_version();
             match update::maybe_self_update(&cfg, version, min_version.as_deref()) {
                 Ok(true) => info!("self-update launched; expecting service restart"),
