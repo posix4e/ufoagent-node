@@ -260,18 +260,21 @@ fn install_vc_redist(scratch_dir: &Path) -> Result<()> {
             .map(|s| s.code())
     };
     let code = run_vc("/install").with_context(|| "running vc_redist /install")?;
-    // If the redist is registered as present but mfc140u.dll is gone (deleted/corrupt), /install
-    // no-ops (1638) and won't restore the file — force a repair so win32ui can actually load.
+    // If the redist is registered but mfc140u.dll is gone (a corrupt/partial runtime), /install
+    // no-ops (1638) and won't restore the file — try a repair. MSI repair is keypath-based, so it's
+    // not guaranteed to restore a single missing file; best-effort.
     if !mfc.exists() {
         info!("mfc140u.dll still missing after /install (code {code:?}); repairing VC++ runtime…");
         let _ = run_vc("/repair").with_context(|| "running vc_redist /repair")?;
     }
     let _ = std::fs::remove_file(&exe);
-    if mfc.exists() {
-        Ok(())
-    } else {
-        bail!("VC++ runtime did not provide mfc140u.dll (install exit {code:?})")
+    // Best-effort — don't fail bootstrap here. On a real fresh VM (the actual scenario) the redist
+    // isn't registered, so /install installs it cleanly; `verify_ufo_imports` is the authoritative
+    // readiness gate that marks the env broken if UFO2 still can't import.
+    if !mfc.exists() {
+        log::warn!("VC++ runtime install did not yield mfc140u.dll (install exit {code:?})");
     }
+    Ok(())
 }
 #[cfg(not(windows))]
 fn install_vc_redist(_scratch_dir: &Path) -> Result<()> {

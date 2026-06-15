@@ -37,13 +37,13 @@ $reported = Wait-For -TimeoutSec 120 -PollSec 5 -StreamAgentLog -Condition {
 if (-not $reported) { throw 'service never logged the ufo2 installing->ready transition' }
 Write-Host 'service observed + reported ufo2 -> ready'
 
-# Cold-box proof: win32ui must import via the provisioned venv — i.e. the agent actually installed
-# the VC++ runtime (mfc140u.dll) we removed before install. bootstrap's verify_ufo_imports already
-# gates this (a failure would have surfaced as 'UFO2 setup failed' above), but assert it explicitly
-# so the cold-box → provisioned → importable chain is unmistakable in the log. This is the check that
-# would have caught the win32ui/MFC crash that "full e2e green" shipped.
+# Sanity check: win32ui + pywinauto must import via the provisioned venv. bootstrap's
+# verify_ufo_imports already gates this (a failure surfaces as 'UFO2 setup failed' above); assert it
+# explicitly so the provisioned → importable chain is unmistakable in the log. NOTE: this runner has
+# the VC++/MFC runtime preinstalled, so this passes regardless of the agent's VC++ provisioning — the
+# faithful cold-start check is the real-VM test (tests/vm/cold-provision.sh), not this.
 $py = (Get-Content "$env:ProgramData\UFOAgent\config.json" -Raw | ConvertFrom-Json).python
 if (-not $py) { throw 'config.python not set after provisioning' }
 & $py -c "import win32ui, pywinauto; print('win32ui + pywinauto import OK via ' + __import__('sys').executable)"
-if ($LASTEXITCODE -ne 0) { throw "win32ui failed to import via the provisioned venv ($py) — the agent did not provision the VC++ runtime" }
-Write-Host 'cold-box OK: win32ui imports via the provisioned venv (agent installed the VC++ runtime)'
+if ($LASTEXITCODE -ne 0) { throw "win32ui/pywinauto failed to import via the provisioned venv ($py)" }
+Write-Host 'imports OK: win32ui + pywinauto load via the provisioned venv'
