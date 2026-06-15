@@ -212,6 +212,32 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
     Ok(())
 }
 
+/// pip installs pywin32 (UFO2 pulls it in via pywinauto) but never runs pywin32's post-install
+/// step — so the loader DLLs it drops in `site-packages\pywin32_system32` (`pywintypes3XX.dll`,
+/// `pythoncom3XX.dll`, and the MFC runtime `mfc140u.dll`) aren't on the DLL search path. `import
+/// win32ui` then dies with "DLL load failed … The specified module could not be found", crashing
+/// every UFO2 task on a box without a Visual Studio install to mask it. Running the post-install
+/// copies those DLLs to where the loader finds them.
+///
+/// Best-effort: the script can exit nonzero or print warnings even when it succeeds, and the env
+/// health-probe (`python -c "import ufo"`) is the real readiness verdict — so a hiccup here is
+/// logged, not fatal. No-op when the script is absent (e.g. a non-Windows venv with no pywin32).
+fn post_install_pywin32(vpy: &Path) {
+    let script = match vpy.parent() {
+        Some(scripts) => scripts.join("pywin32_postinstall.py"),
+        None => return,
+    };
+    if !script.exists() {
+        return;
+    }
+    info!("running pywin32 post-install (fixes win32ui DLL load)…");
+    let mut c = Command::new(vpy);
+    c.arg(&script).arg("-install");
+    if let Err(e) = run(c, "pywin32 post-install") {
+        log::warn!("pywin32 post-install did not complete cleanly: {e}");
+    }
+}
+
 /// Provision UFO2. Idempotent. Returns (ufo_home, venv_python). Records the install lifecycle in the
 /// env marker (`installing` → `ready`/`broken`) so the dashboard chips and the `run_task` gate track
 /// real state — including for a bootstrap launched as its own process (installer `nowait`, the tray's
@@ -294,6 +320,8 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
     let mut pi = Command::new(&vpy);
     pi.args(["-m", "pip", "install", "-r"]).arg(&patched);
     run(pi, "pip install")?;
+
+    post_install_pywin32(&vpy);
 
     let mut cfg = Config::load();
     cfg.ufo_home = Some(home.to_string_lossy().to_string());
