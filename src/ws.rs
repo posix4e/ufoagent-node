@@ -63,6 +63,15 @@ impl WsState {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
+    /// Drop queued `environments` frames. The `hello` sent on (re)connect carries the authoritative
+    /// current env state, so any env deltas queued while disconnected are stale — draining them after
+    /// the hello would clobber the server with an old state (the flaky "ready vs installing" we saw).
+    /// Results/status frames are kept (those must still be delivered). Called right after hello.
+    fn drop_env_frames(&self) {
+        if let Ok(mut q) = self.outbound.lock() {
+            q.retain(|v| v.get("type").and_then(Value::as_str) != Some("environments"));
+        }
+    }
 }
 
 /// `https://app… → wss://app…/v1/connect` (and http → ws for local dev).
@@ -138,6 +147,9 @@ fn connect_and_serve(
         "ws: connected to control plane (ufoagent {version}); environments: {}",
         crate::env::summary()
     );
+    // The hello above carries the current env state; discard any stale env deltas queued while we
+    // were disconnected so they can't drain afterward and overwrite it with an older state.
+    state.drop_env_frames();
     state.connected.store(true, Ordering::Relaxed);
 
     let mut last_ping = Instant::now();
@@ -342,5 +354,25 @@ fn set_read_timeout(socket: &mut Sock, dur: Duration) {
             let _ = s.get_ref().set_read_timeout(Some(dur));
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drop_env_frames_keeps_results_and_status() {
+        let s = WsState::new();
+        s.queue_send(json!({ "type": "environments", "environments": [] }));
+        s.queue_send(json!({ "type": "result", "id": "x", "status": "done" }));
+        s.queue_send(json!({ "type": "status", "current_task": "y" }));
+        s.queue_send(json!({ "type": "environments", "environments": [] }));
+        s.drop_env_frames();
+        let left = s.drain_outbound();
+        assert_eq!(left.len(), 2, "both environments frames should be dropped");
+        assert!(left.iter().all(|v| v["type"] != "environments"));
+        assert_eq!(left[0]["type"], "result");
+        assert_eq!(left[1]["type"], "status");
     }
 }
