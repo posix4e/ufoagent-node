@@ -213,15 +213,13 @@ fn run(mut cmd: Command, what: &str) -> Result<()> {
 }
 
 /// pip installs pywin32 (UFO2 pulls it in via pywinauto) but never runs pywin32's post-install
-/// step — so the loader DLLs it drops in `site-packages\pywin32_system32` (`pywintypes3XX.dll`,
-/// `pythoncom3XX.dll`, and the MFC runtime `mfc140u.dll`) aren't on the DLL search path. `import
-/// win32ui` then dies with "DLL load failed … The specified module could not be found", crashing
-/// every UFO2 task on a box without a Visual Studio install to mask it. Running the post-install
-/// copies those DLLs to where the loader finds them.
+/// step — so its loader DLLs in `site-packages\pywin32_system32` (`pywintypes3XX.dll`,
+/// `pythoncom3XX.dll`) aren't on the DLL search path. Running the post-install copies them to
+/// System32. (Note: pywin32 3.12 does NOT bundle the MFC runtime `mfc140u.dll` that `win32ui` also
+/// needs — that comes from the VC++ redistributable, installed separately in `install_vc_redist`.)
 ///
-/// Best-effort: the script can exit nonzero or print warnings even when it succeeds, and the env
-/// health-probe (`python -c "import ufo"`) is the real readiness verdict — so a hiccup here is
-/// logged, not fatal. No-op when the script is absent (e.g. a non-Windows venv with no pywin32).
+/// Best-effort: the script can exit nonzero or warn even on success, and `verify_ufo_imports` is the
+/// real readiness verdict — so a hiccup here is logged, not fatal. No-op when the script is absent.
 fn post_install_pywin32(vpy: &Path) {
     let script = match vpy.parent() {
         Some(scripts) => scripts.join("pywin32_postinstall.py"),
@@ -236,6 +234,55 @@ fn post_install_pywin32(vpy: &Path) {
     if let Err(e) = run(c, "pywin32 post-install") {
         log::warn!("pywin32 post-install did not complete cleanly: {e}");
     }
+}
+
+/// `win32ui` (pulled in via pywinauto) is linked against the MFC runtime `mfc140u.dll`, which pywin32
+/// 3.12 no longer bundles and a fresh Windows Server lacks (CI runners have it via VS, masking the
+/// bug). Without it `import win32ui` dies with "DLL load failed" and every UFO2 task crashes. Install
+/// the official VC++ redistributable, which drops mfc140u.dll into System32. Idempotent: a newer
+/// redist already present exits 1638, a successful install needing reboot exits 3010 — both fine.
+#[cfg(windows)]
+fn install_vc_redist(scratch_dir: &Path) -> Result<()> {
+    let url = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
+    let exe = scratch_dir.join("vc_redist.x64.exe");
+    info!("installing the Visual C++ runtime (mfc140u.dll, for win32ui)…");
+    download(url, &exe)?;
+    let status = Command::new(&exe)
+        .args(["/install", "/quiet", "/norestart"])
+        .status()
+        .with_context(|| "running vc_redist")?;
+    let _ = std::fs::remove_file(&exe);
+    match status.code() {
+        Some(0) | Some(3010) | Some(1638) => Ok(()),
+        other => bail!("vc_redist exited with {other:?}"),
+    }
+}
+#[cfg(not(windows))]
+fn install_vc_redist(_scratch_dir: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// The real readiness verdict: pip succeeding isn't enough — UFO2's GUI stack must actually import
+/// (this is where the win32ui/MFC failure surfaces). If these imports fail the env is NOT ready, so
+/// bootstrap returns Err and the marker becomes `broken` (with the failing line) rather than a
+/// "ready" chip whose tasks crash. Returns the concise failure line for the marker detail.
+fn verify_ufo_imports(vpy: &Path) -> Result<()> {
+    info!("verifying UFO2 imports (win32ui, pywinauto)…");
+    let out = Command::new(vpy)
+        .args(["-c", "import win32ui, pywinauto"])
+        .output()
+        .with_context(|| "running UFO2 import check")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("import failed")
+        .trim();
+    bail!("UFO2 import check failed: {last}");
 }
 
 /// Provision UFO2. Idempotent. Returns (ufo_home, venv_python). Records the install lifecycle in the
@@ -323,10 +370,25 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
 
     post_install_pywin32(&vpy);
 
+    // MFC runtime for win32ui — a fresh Windows lacks it and pywin32 doesn't ship it. Best-effort:
+    // if it fails, the import check below is the authoritative gate.
+    phase("installing Visual C++ runtime");
+    let scratch = home.parent().unwrap_or_else(|| Path::new("."));
+    if let Err(e) = install_vc_redist(scratch) {
+        log::warn!("VC++ runtime install did not complete cleanly: {e}");
+    }
+
     let mut cfg = Config::load();
     cfg.ufo_home = Some(home.to_string_lossy().to_string());
     cfg.python = Some(vpy.to_string_lossy().to_string());
     cfg.save()?;
+
+    // Authoritative readiness gate: UFO2's GUI imports must actually load. A failure here (e.g. the
+    // win32ui/MFC class of bug) returns Err → the marker becomes `broken`, not a ready chip whose
+    // tasks crash on the first run.
+    phase("verifying UFO2 imports");
+    verify_ufo_imports(&vpy)?;
+
     info!(
         "UFO2 provisioned: ufo_home={} python={}",
         home.display(),
