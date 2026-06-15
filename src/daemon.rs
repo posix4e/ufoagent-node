@@ -53,9 +53,11 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     {
         let state = ws_state.clone();
         let stop = ws_stop.clone();
-        let version = version.to_string();
+        // Report the full build id (version + sha) over the WS so the dashboard names the exact
+        // build. The bare `version` (semver) is kept for the update floor + status.json below.
+        let build = crate::build_string();
         std::thread::spawn(move || {
-            ws::run(&version, state, move || {
+            ws::run(&build, state, move || {
                 stop.load(std::sync::atomic::Ordering::Relaxed)
             })
         });

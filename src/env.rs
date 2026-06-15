@@ -177,6 +177,15 @@ fn venv_python_exists(cfg: &Config) -> bool {
         .unwrap_or(false)
 }
 
+/// True when UFO2 is genuinely provisioned: the recorded venv interpreter exists AND the UFO2 source
+/// (requirements.txt) is present. `requirements.txt` alone is NOT enough — it appears right after the
+/// source-zip download, long before pip finishes — so `repair` uses this (not file existence) before
+/// declaring the env ready.
+pub fn ufo2_provisioned() -> bool {
+    let cfg = Config::load();
+    venv_python_exists(&cfg) && cfg.ufo_home_path().join("requirements.txt").exists()
+}
+
 /// Self-gate a `run_task`: a human-readable reason to refuse, or `None` if the environment is ready.
 /// Mirrors the control plane's `gateRunTask` so the node rejects with the same words even when the
 /// server's last-reported state is stale (the node has ground truth).
@@ -341,6 +350,24 @@ mod tests {
     fn unknown_env_gate_says_not_installed() {
         with_temp_home("env-unknown", || {
             assert!(gate("ufo3").unwrap().contains("not installed"));
+        });
+    }
+
+    #[test]
+    fn ufo2_provisioned_requires_venv_not_just_source() {
+        with_temp_home("env-prov", || {
+            assert!(!ufo2_provisioned()); // nothing on disk
+                                          // Mid-bootstrap: source downloaded (requirements.txt) but no venv yet (config.python unset).
+            let home = config_dir().join("ufo");
+            std::fs::create_dir_all(&home).unwrap();
+            std::fs::write(home.join("requirements.txt"), "ufo\n").unwrap();
+            let mut cfg = Config::load();
+            cfg.ufo_home = Some(home.to_string_lossy().to_string());
+            cfg.save().unwrap();
+            assert!(!ufo2_provisioned()); // requirements.txt alone must NOT read provisioned
+                                          // Bootstrap completes: venv interpreter recorded.
+            provision_ufo2();
+            assert!(ufo2_provisioned());
         });
     }
 }
