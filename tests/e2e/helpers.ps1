@@ -42,8 +42,8 @@ function Stop-UfoWindows {
 # Control-plane command API (CI service token, valid only for the CI tenant's nodes).
 function Get-ApiHeaders { @{ authorization = "Bearer $env:CI_ADMIN_TOKEN"; 'content-type' = 'application/json' } }
 function Get-ApiBase { "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/commands" }
-function Send-NodeCommand([string]$Kind, [string]$Request) {
-  $body = @{ kind = $Kind }; if ($Request) { $body.request = $Request }
+function Send-NodeCommand([string]$Kind, [string]$Request, [string]$Env) {
+  $body = @{ kind = $Kind }; if ($Request) { $body.request = $Request }; if ($Env) { $body.env = $Env }
   Invoke-RestMethod -Method POST -Uri (Get-ApiBase) -Headers (Get-ApiHeaders) -Body ($body | ConvertTo-Json -Compress)
 }
 function Get-NodeCommand([string]$Id) {

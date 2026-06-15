@@ -4,6 +4,7 @@ use anyhow::Result;
 
 use crate::config::{Config, DEFAULT_CONTROL_PLANE};
 use crate::controlplane::ControlPlane;
+use crate::env::{self, EnvState};
 use crate::{bootstrap, daemon, store};
 
 pub fn repair() -> Result<Vec<String>> {
@@ -22,6 +23,9 @@ pub fn repair() -> Result<Vec<String>> {
         bootstrap::bootstrap(None, "main")?;
         log.push("UFO2 provisioned".into());
     } else {
+        // Already installed (possibly before env tracking existed) — record a ready marker so the
+        // dashboard chip and run_task gate are marker-based from here on.
+        env::set_state(env::UFO2, EnvState::Ready, None, None);
         log.push("UFO2 present".into());
     }
 
