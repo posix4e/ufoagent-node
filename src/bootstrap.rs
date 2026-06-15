@@ -243,18 +243,34 @@ fn post_install_pywin32(vpy: &Path) {
 /// redist already present exits 1638, a successful install needing reboot exits 3010 — both fine.
 #[cfg(windows)]
 fn install_vc_redist(scratch_dir: &Path) -> Result<()> {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| r"C:\Windows".to_string());
+    let mfc = Path::new(&windir).join("System32").join("mfc140u.dll");
+    // Already there (the common case on machines with the redist) — nothing to do.
+    if mfc.exists() {
+        return Ok(());
+    }
     let url = "https://aka.ms/vs/17/release/vc_redist.x64.exe";
     let exe = scratch_dir.join("vc_redist.x64.exe");
     info!("installing the Visual C++ runtime (mfc140u.dll, for win32ui)…");
     download(url, &exe)?;
-    let status = Command::new(&exe)
-        .args(["/install", "/quiet", "/norestart"])
-        .status()
-        .with_context(|| "running vc_redist")?;
+    let run_vc = |mode: &str| -> std::io::Result<Option<i32>> {
+        Command::new(&exe)
+            .args([mode, "/quiet", "/norestart"])
+            .status()
+            .map(|s| s.code())
+    };
+    let code = run_vc("/install").with_context(|| "running vc_redist /install")?;
+    // If the redist is registered as present but mfc140u.dll is gone (deleted/corrupt), /install
+    // no-ops (1638) and won't restore the file — force a repair so win32ui can actually load.
+    if !mfc.exists() {
+        info!("mfc140u.dll still missing after /install (code {code:?}); repairing VC++ runtime…");
+        let _ = run_vc("/repair").with_context(|| "running vc_redist /repair")?;
+    }
     let _ = std::fs::remove_file(&exe);
-    match status.code() {
-        Some(0) | Some(3010) | Some(1638) => Ok(()),
-        other => bail!("vc_redist exited with {other:?}"),
+    if mfc.exists() {
+        Ok(())
+    } else {
+        bail!("VC++ runtime did not provide mfc140u.dll (install exit {code:?})")
     }
 }
 #[cfg(not(windows))]
