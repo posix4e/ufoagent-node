@@ -28,6 +28,34 @@ use config::Config;
 use controlplane::ControlPlane;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Short build id embedded at compile time (git sha / CI `$GITHUB_SHA` / "dev") — see build.rs. Lets
+/// the dashboard and logs name the EXACT build, which `VERSION` alone can't (two builds, one version).
+const GIT_SHA: &str = env!("UFOAGENT_GIT_SHA");
+
+/// Human build string used in logs, `version`, `status`, and the reported `agent_version`.
+pub fn build_string() -> String {
+    format!("{VERSION} ({GIT_SHA})")
+}
+
+/// Short label for the running subcommand (for the startup build-stamp log line).
+fn cmd_label(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::Version => "version",
+        Cmd::Status => "status",
+        Cmd::Configure { .. } => "configure",
+        Cmd::Link { .. } => "link",
+        Cmd::Refresh => "refresh",
+        Cmd::RunDaemon => "run-daemon",
+        Cmd::Run { .. } => "run",
+        Cmd::Bootstrap { .. } => "bootstrap",
+        Cmd::Repair => "repair",
+        Cmd::Activity { .. } => "activity",
+        Cmd::Update { .. } => "update",
+        Cmd::Service { .. } => "service",
+        Cmd::Tray => "tray",
+        Cmd::Autologon { .. } => "autologon",
+    }
+}
 
 /// Set up logging. Always writes to the rotating log file; additionally mirrors to stderr
 /// unless `quiet` (tray/service run without a console, so a stderr logger would either be lost
@@ -83,8 +111,16 @@ fn main() -> Result<()> {
     // they don't write to a parent shell (or a dead stderr).
     let quiet = matches!(cmd, Cmd::Tray | Cmd::Service { .. });
     init_logging(quiet);
+    // Stamp the exact build at the top of every run — so `ufoagent.log` always answers "what's
+    // running?" (especially for the long-lived service/tray) without needing the dashboard.
+    log::info!(
+        "ufoagent {} {} starting (cmd={})",
+        build_string(),
+        daemon::platform(),
+        cmd_label(&cmd)
+    );
     match cmd {
-        Cmd::Version => println!("{VERSION}"),
+        Cmd::Version => println!("{}", build_string()),
         Cmd::Status => cmd_status(),
         Cmd::Configure {
             control_plane,
@@ -215,7 +251,7 @@ fn cmd_status() {
             "no"
         }
     );
-    println!("version:       {VERSION}");
+    println!("version:       {}", build_string());
     println!("config_dir:    {}", config::config_dir().display());
 }
 
@@ -266,6 +302,26 @@ fn cmd_link(
 }
 
 fn cmd_run(task: String, request: Option<String>) -> Result<()> {
+    // Gate on the target environment first. This is the shared local launcher — the tray "Run a
+    // task…" menu, the tray's queue consumer, and the CLI all reach UFO2 through here — so without
+    // this gate a run mid-install died with a raw "not provisioned". Now it refuses with the same
+    // friendly message as the dashboard/remote path. ufo2 is the only env today.
+    if let Some(reason) = env::gate(env::UFO2) {
+        // The service already records queue/remote runs; don't double-log when invoked from the queue.
+        if std::env::var("UFOAGENT_FROM_QUEUE").is_err() {
+            cmdlog::record(
+                "local",
+                "run_task",
+                request.as_deref(),
+                "failed",
+                Some(&reason),
+            );
+        }
+        log::warn!("run gated: {reason}");
+        eprintln!("{reason}");
+        std::process::exit(1);
+    }
+
     let c = Config::load();
     let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
     let home = c.ufo_home_path();

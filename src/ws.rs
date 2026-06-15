@@ -135,7 +135,7 @@ fn connect_and_serve(
         json!({ "type": "hello", "agent_version": version, "platform": daemon::platform(), "environments": environments }),
     )?;
     log::info!(
-        "ws: connected to control plane; environments: {}",
+        "ws: connected to control plane (ufoagent {version}); environments: {}",
         crate::env::summary()
     );
     state.connected.store(true, Ordering::Relaxed);

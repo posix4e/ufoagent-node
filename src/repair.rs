@@ -18,12 +18,15 @@ pub fn repair() -> Result<Vec<String>> {
     }
 
     let home = cfg.ufo_home_path();
-    if !home.join("requirements.txt").exists() {
-        log.push("UFO2 not installed -> bootstrapping".into());
+    // "Provisioned" = venv interpreter + source both present — NOT just requirements.txt, which lands
+    // right after the source download (before pip finishes). Re-bootstrap unless genuinely complete,
+    // so repair can't stamp a half-installed env as ready.
+    if !env::ufo2_provisioned() {
+        log.push("UFO2 not provisioned -> bootstrapping".into());
         bootstrap::bootstrap(None, "main")?;
         log.push("UFO2 provisioned".into());
     } else {
-        // Already installed (possibly before env tracking existed) — record a ready marker so the
+        // Genuinely provisioned (possibly before env tracking existed) — record a ready marker so the
         // dashboard chip and run_task gate are marker-based from here on.
         env::set_state(env::UFO2, EnvState::Ready, None, None);
         log.push("UFO2 present".into());
