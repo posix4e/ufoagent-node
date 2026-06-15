@@ -129,11 +129,15 @@ fn connect_and_serve(
     let (mut socket, _resp) = tungstenite::connect(req)?;
     set_read_timeout(&mut socket, READ_TIMEOUT);
 
+    let environments = serde_json::to_value(crate::env::report_all()).unwrap_or(Value::Null);
     send(
         &mut socket,
-        json!({ "type": "hello", "agent_version": version, "platform": daemon::platform() }),
+        json!({ "type": "hello", "agent_version": version, "platform": daemon::platform(), "environments": environments }),
     )?;
-    log::info!("ws: connected to control plane");
+    log::info!(
+        "ws: connected to control plane; environments: {}",
+        crate::env::summary()
+    );
     state.connected.store(true, Ordering::Relaxed);
 
     let mut last_ping = Instant::now();
@@ -189,6 +193,22 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
     // minutes — hand it to a worker so the read loop keeps pinging. The result/status come back
     // asynchronously via the outbound queue.
     if cmd == "run_task" {
+        // Self-gate before queuing: the control plane already gated on its last-reported state, but
+        // the node has ground truth (the env may have broken since). Same words as the server.
+        let env_name = msg
+            .get("args")
+            .and_then(|a| a.get("env"))
+            .and_then(Value::as_str)
+            .unwrap_or(crate::env::UFO2)
+            .to_string();
+        if let Some(reason) = crate::env::gate(&env_name) {
+            crate::cmdlog::record("remote", "run_task", None, "failed", Some(&reason));
+            send(
+                socket,
+                json!({ "type": "result", "id": id, "status": "failed", "result": reason }),
+            )?;
+            return Ok(());
+        }
         let task = msg
             .get("args")
             .and_then(|a| a.get("task"))
