@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, Credential};
 use crate::status::{self, Status};
-use crate::{store, ufo_config, update, util, ws};
+use crate::{env, store, ufo_config, update, util, ws};
 
 pub fn platform() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
@@ -70,6 +70,8 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
         agent_version: version.to_string(),
         ..Default::default()
     };
+    // Last environment report we pushed — resend only on change (the hello carries the initial one).
+    let mut last_envs: Option<Vec<env::EnvReport>> = None;
 
     while !should_stop() {
         let now = util::now();
@@ -95,6 +97,20 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
 
         // 2) Liveness for the tray = the socket state (the control plane sees the same thing).
         st.online = ws_state.connected();
+
+        // 2b) Environment health — push a delta when install state changes (e.g. bootstrap, running
+        //     in a separate process, flips ufo2 installing -> ready). The WS read loop drains the
+        //     queue onto the live socket; if disconnected it waits, and the next hello carries the
+        //     current state anyway.
+        let envs = env::report_all();
+        if last_envs.as_deref() != Some(envs.as_slice()) {
+            if let Ok(v) = serde_json::to_value(&envs) {
+                ws_state
+                    .queue_send(serde_json::json!({ "type": "environments", "environments": v }));
+                info!("environments changed -> {}", env::summary());
+            }
+            last_envs = Some(envs);
+        }
 
         // 3) Self-update — slow cadence (first pass right after boot catches forced bumps).
         //    min_version arrives over the WS (hello_ack).

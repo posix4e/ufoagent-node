@@ -238,8 +238,40 @@ fn post_install_pywin32(vpy: &Path) {
     }
 }
 
-/// Provision UFO2. Idempotent. Returns (ufo_home, venv_python).
+/// Provision UFO2. Idempotent. Returns (ufo_home, venv_python). Records the install lifecycle in the
+/// env marker (`installing` → `ready`/`broken`) so the dashboard chips and the `run_task` gate track
+/// real state — including for a bootstrap launched as its own process (installer `nowait`, the tray's
+/// Repair), which the daemon picks up by re-reading the marker each tick.
 pub fn bootstrap(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, PathBuf)> {
+    use crate::env::{self, EnvState};
+    env::set_state(
+        env::UFO2,
+        EnvState::Installing,
+        Some("starting"),
+        Some(git_ref),
+    );
+    match bootstrap_inner(ufo_home, git_ref) {
+        Ok(paths) => {
+            env::set_state(env::UFO2, EnvState::Ready, None, Some(git_ref));
+            Ok(paths)
+        }
+        Err(e) => {
+            env::set_state(
+                env::UFO2,
+                EnvState::Broken,
+                Some(&format!("{e:#}")),
+                Some(git_ref),
+            );
+            Err(e)
+        }
+    }
+}
+
+fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, PathBuf)> {
+    use crate::env::{self, EnvState};
+    let phase =
+        |detail: &str| env::set_state(env::UFO2, EnvState::Installing, Some(detail), Some(git_ref));
+
     let cfg = Config::load();
     let home = ufo_home
         .map(PathBuf::from)
@@ -250,11 +282,13 @@ pub fn bootstrap(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, Pa
     }
 
     if !home.join("requirements.txt").exists() {
+        phase("downloading UFO2 source");
         fetch_ufo(&home, git_ref)?;
     }
 
     let vpy = venv_python(&home);
     if !vpy.exists() {
+        phase("creating virtualenv");
         let scratch = home.parent().unwrap_or_else(|| Path::new("."));
         let base = base_python(scratch)?;
         info!("creating venv (base: {})", base.display());
@@ -263,6 +297,7 @@ pub fn bootstrap(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, Pa
         run(c, "venv create")?;
     }
 
+    phase("installing requirements (torch, etc.)");
     let mut req = std::fs::read_to_string(home.join("requirements.txt"))?;
     for (bad, good) in PIN_OVERRIDES {
         req = req.replace(bad, good);

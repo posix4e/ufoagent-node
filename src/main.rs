@@ -6,6 +6,7 @@ mod cmdlog;
 mod config;
 mod controlplane;
 mod daemon;
+mod env;
 mod linker;
 mod qr;
 mod repair;

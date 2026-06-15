@@ -16,3 +16,23 @@ if (-not $ok) {
   throw 'auto-provision timed out'
 }
 Write-Host 'installer auto-provisioned UFO2 (no git) OK'
+
+# Environments-v1 (agent half): bootstrap records ufo2 installing -> ready in a marker file, and the
+# running service re-probes each tick and reports the change. Assert both on this real install — the
+# marker is ground truth; the log line proves the service's reporting path (this is what fills the
+# dashboard chip and feeds the run_task gate). Both lag the config write by a tick, so poll briefly.
+$EnvMarker = "$env:ProgramData\UFOAgent\envs\ufo2.json"
+$ready = Wait-For -TimeoutSec 120 -PollSec 5 -Condition {
+  (Test-Path $EnvMarker) -and (((Get-Content $EnvMarker -Raw | ConvertFrom-Json).state) -eq 'ready')
+}
+if (-not $ready) {
+  if (Test-Path $EnvMarker) { Write-Host "env marker: $(Get-Content $EnvMarker -Raw)" }
+  throw 'ufo2 env marker never reached state=ready after provisioning'
+}
+Write-Host "ufo2 env marker = ready: $(Get-Content $EnvMarker -Raw)"
+
+$reported = Wait-For -TimeoutSec 120 -PollSec 5 -StreamAgentLog -Condition {
+  (Test-Path $AgentLog) -and (Select-String -Path $AgentLog -Pattern 'environments changed -> ufo2=ready' -Quiet)
+}
+if (-not $reported) { throw 'service never logged the ufo2 installing->ready transition' }
+Write-Host 'service observed + reported ufo2 -> ready'

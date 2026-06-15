@@ -10,7 +10,10 @@
 AppId={{B1F4B6E2-UFO2-AGENT-CTRL-PLANE-0001}}
 AppName=UFOAgent
 AppVersion={#AppVersion}
-AppPublisher=UFOAgent
+AppPublisher=UFOAgent, Inc.
+AppCopyright=Copyright (C) 2026 UFOAgent, Inc.
+VersionInfoCompany=UFOAgent, Inc.
+VersionInfoCopyright=Copyright (C) 2026 UFOAgent, Inc.
 DefaultDirName={autopf}\UFOAgent
 DisableProgramGroupPage=yes
 OutputBaseFilename=ufoagent-setup

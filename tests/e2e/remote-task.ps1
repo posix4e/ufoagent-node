@@ -7,6 +7,8 @@ Stop-UfoWindows # legible screenshots + a fresh notepad.exe assertion
 # Record the whole run as frames (hidden helper, 1 shot / 2s) — assembled into the site's
 # remote-task.gif after both tasks pass.
 Start-FrameRecorder 'remote'
+# Defaults to env=ufo2 server-side; this enqueue would 400 (env gate) unless the agent reported
+# ufo2=ready — so reaching the task at all is the positive half of the environments-v1 gate.
 $resp = Send-NodeCommand 'run_task' 'Open Notepad and type the message: hello from ufoagent'
 Write-Host "enqueued run_task: id=$($resp.id) status=$($resp.status)"
 $tlog = "$env:ProgramData\UFOAgent\tasks\logs\$($resp.id).txt"
