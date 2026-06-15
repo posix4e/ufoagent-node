@@ -48,4 +48,4 @@ Download `ufoagent-setup.exe` from [Releases](https://github.com/ufoagent/ufoage
 - Installer is unsigned until Azure Trusted Signing identity validation is approved.
 
 ## License
-Apache-2.0 (see [LICENSE](LICENSE), [NOTICE](NOTICE)). Microsoft UFO2 is a separate MIT project.
+Apache-2.0, © 2026 UFOAgent, Inc. (see [LICENSE](LICENSE), [NOTICE](NOTICE)).
