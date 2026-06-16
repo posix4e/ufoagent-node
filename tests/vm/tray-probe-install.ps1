@@ -36,6 +36,7 @@ Write-Output ("startup shortcut present: " + (Test-Path $startup) + "  ($startup
 1..6 | ForEach-Object { Get-Process ufoagent, ufoagent-setup -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 1 }
 
 # enable auto-logon (HKLM; run-command is SYSTEM). Takes effect on the driver's next reboot.
+# (autologon also suppresses the first-logon privacy OOBE page that would otherwise steal foreground.)
 if (-not $pass) { throw 'GUI_PASS not provided' }
 & $exe autologon --user $user --password $pass
 Write-Output "TRAY-PROBE-INSTALL OK (user=$user)"

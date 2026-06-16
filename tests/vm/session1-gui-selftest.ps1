@@ -10,37 +10,38 @@ $user = if ($env:GUI_USER) { $env:GUI_USER } else { 'ufoadmin' }
 $verdict = 'C:\gui-verdict.txt'
 Remove-Item $verdict -ErrorAction SilentlyContinue
 
-# The Session-1 worker: open Notepad, type the marker (SendKeys), then UIAutomation-read it back.
+# The Session-1 worker: open Notepad, focus it, type the marker, then read it back via the CLIPBOARD
+# (Select-All + Copy). Clipboard read-back is version-independent — unlike UIAutomation it doesn't
+# depend on Notepad's control tree (Windows Server 2025 ships the modern Notepad, whose UIA tree
+# differs from the classic Edit control), and it proves the keystrokes actually reached the app.
 $worker = @'
 $ErrorActionPreference = "SilentlyContinue"
-Add-Type -AssemblyName System.Windows.Forms, UIAutomationClient, UIAutomationTypes
+Add-Type -AssemblyName System.Windows.Forms
+$marker = "hello from ufoagent"
 Get-Process notepad -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
-Start-Process notepad.exe
-Start-Sleep -Seconds 4
-[System.Windows.Forms.SendKeys]::SendWait("hello from ufoagent")
-Start-Sleep -Seconds 2
-function Read-Notepad {
-  $np = Get-Process notepad -EA SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-  if (-not $np) { return $null }
-  $ae = [System.Windows.Automation.AutomationElement]::FromHandle($np.MainWindowHandle)
-  if (-not $ae) { return $null }
-  foreach ($el in $ae.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition)) {
-    if ($el.Current.ClassName -eq "Edit") {
-      try { $vp = $el.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern); if ($vp.Current.Value) { return $vp.Current.Value } } catch {}
-      if ($el.Current.Name) { return $el.Current.Name }
-    }
-  }
-  foreach ($ct in @([System.Windows.Automation.ControlType]::Document, [System.Windows.Automation.ControlType]::Edit)) {
-    $el = $ae.FindFirst([System.Windows.Automation.TreeScope]::Descendants, (New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ControlTypeProperty, $ct)))
-    if ($el) { try { $tp = $el.GetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern); if ($tp) { return $tp.DocumentRange.GetText(-1) } } catch {} }
-  }
-  return $null
+Start-Sleep -Seconds 1
+$proc = Start-Process notepad.exe -PassThru
+# Wait for the editor window to exist (modern Notepad's first cold launch can take several seconds).
+$np = $null
+for ($i = 0; $i -lt 30; $i++) {
+  $np = Get-Process -Id $proc.Id -EA SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  if ($np) { break }
+  Start-Sleep -Milliseconds 500
 }
-$t = Read-Notepad
-$sid = (Get-Process notepad -EA SilentlyContinue | Select-Object -First 1).SessionId
-if ($t -and ($t -match "ufoagent")) { "PASS session=$sid text=" + $t.Trim() | Set-Content C:\gui-verdict.txt }
-elseif ($null -ne $t) { "FAIL session=$sid text=" + $t.Trim() | Set-Content C:\gui-verdict.txt }
-else { "FAIL session=$sid could not read Notepad via UIAutomation" | Set-Content C:\gui-verdict.txt }
+$sid = $proc.SessionId
+# Focus the window so SendKeys lands in the editor, then type + select-all + copy.
+$wsh = New-Object -ComObject WScript.Shell
+$wsh.AppActivate($proc.Id) | Out-Null
+Start-Sleep -Seconds 1
+Set-Clipboard -Value ""
+[System.Windows.Forms.SendKeys]::SendWait($marker)
+Start-Sleep -Seconds 1
+[System.Windows.Forms.SendKeys]::SendWait("^a^c")
+Start-Sleep -Seconds 1
+$got = (Get-Clipboard -Raw)
+if ($got -and ($got -match "ufoagent")) { "PASS session=$sid text=" + $got.Trim() | Set-Content C:\gui-verdict.txt }
+elseif (-not $np) { "FAIL session=$sid Notepad window never appeared" | Set-Content C:\gui-verdict.txt }
+else { "FAIL session=$sid clipboard=[" + ("$got").Trim() + "]" | Set-Content C:\gui-verdict.txt }
 Get-Process notepad -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
 '@
 Set-Content -Path 'C:\gui-worker.ps1' -Value $worker -Encoding UTF8

@@ -55,8 +55,14 @@ echo "VM up."
 # 1) install + cold-provision via the MANAGED run-command (polled) — same as cold-provision.sh.
 RC="guiprovision"
 echo "=== install + cold-provision (managed run-command, polled) ==="
+# The MANAGED run-command doesn't inherit our shell env, so forward UFOAGENT_BETA_URL (if set) by
+# prepending it to the script content — otherwise provision-and-probe.ps1 falls back to the public
+# beta. Pass the combined script inline (not @file).
+provscript="$(cat "$HERE/provision-and-probe.ps1")"
+[ -n "${UFOAGENT_BETA_URL:-}" ] && provscript="\$env:UFOAGENT_BETA_URL='$UFOAGENT_BETA_URL';
+$provscript"
 az vm run-command create -g "$RG" --vm-name "$VM" --name "$RC" \
-  --script @"$HERE/provision-and-probe.ps1" --timeout-in-seconds 3600 --no-wait -o none
+  --script "$provscript" --timeout-in-seconds 3600 --no-wait -o none
 
 deadline=$(( $(date +%s) + 65 * 60 ))
 state="Running"
@@ -112,8 +118,9 @@ tdeadline=$(( $(date +%s) + 10 * 60 ))
 while [ "$(date +%s)" -lt "$tdeadline" ]; do
   out="$(rc "$alive_ps")"
   echo "  $out"
-  # Strip Windows CRLF / any non-digits so the numeric compare doesn't choke on a trailing \r.
-  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p' | tr -dc '0-9')"
+  # Extract the digits between "age=" and "s", portably: BSD sed (macOS, where this driver runs)
+  # doesn't support \+, and the run-command output carries CRLF — so do it with bash + tr.
+  age="${out##*age=}"; age="${age%%s*}"; age="$(printf '%s' "$age" | tr -dc '0-9')"
   if [ -n "$age" ] && [ "$age" -le 90 ]; then tray_ok=1; break; fi
   sleep 20
 done

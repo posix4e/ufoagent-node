@@ -54,8 +54,9 @@ tray_ok=0
 tdeadline=$(( $(date +%s) + 6 * 60 ))
 while [ "$(date +%s)" -lt "$tdeadline" ]; do
   out="$(rc "$alive_ps")"; echo "  $out"
-  # Strip Windows CRLF / any non-digits so the numeric compare doesn't choke on a trailing \r.
-  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p' | tr -dc '0-9')"
+  # Extract the digits between "age=" and "s", portably: BSD sed (macOS, where this driver runs)
+  # doesn't support \+, and the run-command output carries CRLF — so do it with bash + tr.
+  age="${out##*age=}"; age="${age%%s*}"; age="$(printf '%s' "$age" | tr -dc '0-9')"
   if [ -n "$age" ] && [ "$age" -le 90 ]; then tray_ok=1; break; fi
   sleep 20
 done
@@ -78,25 +79,13 @@ $m="C:\ProgramData\UFOAgent\tasks\tray-alive"; if(Test-Path $m){"present, age="+
 Get-Content "C:\ProgramData\UFOAgent\logs\ufoagent.log" -Tail 50 -ErrorAction SilentlyContinue | Out-String
 '
 
-# DECISIVE: does the tray binary come alive when launched IN Session 1 via an interactive task? If yes,
-# the binary is fine and the bug is purely the autostart MECHANISM (Startup folder not processed under
-# auto-logon) → fix = logon scheduled task or service-spawns-tray. If still absent, the tray itself
-# fails to build its icon in this session → different fix.
-echo "=== DECISIVE: launch tray via interactive scheduled task in Session 1 ==="
-rc '
-$u="ufoadmin"
-schtasks /Create /TN TrayLaunch /TR "\"C:\Program Files\UFOAgent\ufoagent.exe\" tray" /SC ONCE /ST 23:58 /RU $u /IT /RL HIGHEST /F | Out-Null
-schtasks /Run /TN TrayLaunch | Out-Null
-Start-Sleep -Seconds 25
-$m="C:\ProgramData\UFOAgent\tasks\tray-alive"
-if(Test-Path $m){"AFTER-TASK: tray-alive PRESENT, age="+[int]((Get-Date)-(Get-Item $m).LastWriteTime).TotalSeconds+"s  => tray binary works in-session; autostart MECHANISM is the bug"}
-else{"AFTER-TASK: tray-alive still ABSENT => the tray binary itself failed to come up in Session 1"}
-"--- ufoagent procs now ---"
-Get-Process ufoagent -EA SilentlyContinue | Select-Object Id,SessionId | Format-Table -Auto | Out-String
-"--- log tail ---"
-Get-Content "C:\ProgramData\UFOAgent\logs\ufoagent.log" -Tail 18 -EA SilentlyContinue | Out-String
-schtasks /Delete /TN TrayLaunch /F 2>$null | Out-Null
-'
+# De-risk the gui-e2e Session-1 GUI self-test cheaply (no provisioning): does the schtasks /IT bridge
+# actually drive a GUI in Session 1 post-reboot and let us verify it via UIAutomation? This is exactly
+# gui-e2e step 6 — prove it here in ~12 min before paying for the full 45-min run.
+echo "=== Session-1 GUI self-test (gui-e2e step 6 mechanism) ==="
+gui_out="$(rc "$(cat "$HERE/session1-gui-selftest.ps1")")"
+echo "$gui_out"
+if printf '%s\n' "$gui_out" | grep -q 'SESSION1-GUI OK'; then echo "SELF-TEST: OK"; else echo "SELF-TEST: NOT OK"; fi
 echo "================================================================"
 
 if [ "$tray_ok" -eq 1 ]; then echo "=== TRAY-PROBE: tray came alive (age<=90s) ==="; exit 0
