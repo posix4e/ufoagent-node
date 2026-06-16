@@ -11,6 +11,7 @@ mod linker;
 mod qr;
 mod repair;
 mod service;
+mod session;
 mod status;
 mod store;
 mod taskqueue;

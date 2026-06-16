@@ -178,7 +178,37 @@ mod imp {
         )
     }
 
+    /// Per-session single-instance guard. The service (re)spawns the tray into the console session
+    /// while the installer's Startup-folder shortcut may also launch one — without this they'd both
+    /// appear. Holds a session-named mutex for the process lifetime; returns true if another tray
+    /// already owns it. On any failure to create the guard, returns false (better to run than not).
+    fn another_tray_running() -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, TRUE};
+        use windows::Win32::System::Threading::CreateMutexW;
+        let name: Vec<u16> = "UFOAgentTraySingleton\0".encode_utf16().collect();
+        unsafe {
+            match CreateMutexW(None, TRUE, PCWSTR(name.as_ptr())) {
+                Ok(h) => {
+                    if GetLastError() == ERROR_ALREADY_EXISTS {
+                        let _ = CloseHandle(h);
+                        true
+                    } else {
+                        // Deliberately don't CloseHandle(h): HANDLE has no Drop, so leaving it open
+                        // holds the mutex for the whole process lifetime (we own the single slot).
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
     pub fn run(_version: &str) -> Result<()> {
+        if another_tray_running() {
+            log::info!("tray: another instance is already running in this session; exiting");
+            return Ok(());
+        }
         // Drop the console window Windows allocates for this console-subsystem exe when the tray
         // is launched by the installer or the logon task — leave just the 🛸 tray icon.
         unsafe {
