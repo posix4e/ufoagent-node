@@ -44,9 +44,16 @@ jobs:
        (github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
-    timeout-minutes: 60   # VM create (~6m) + cold provision (~30m) + reboot + Session-1 GUI + teardown
+    timeout-minutes: 75   # VM create + cold provision + reboot + linked smoke + run_task + tray + shots
     env:
       LOCATION: westus2
+      # Pre-provisioned CI node creds (empty on fork PRs -> the credentialed steps skip). Passed to the
+      # scratch VM (own subscription, torn down each run) to drive the live control-plane parity tests.
+      CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
+      CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
+      CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
+      # Which repo branch's tests/e2e + tests/gui the VM downloads to run the re-hosted assertions.
+      E2E_REF: ${{ github.event.workflow_run.head_branch || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
       - name: Azure login (OIDC, no secret)
@@ -55,12 +62,12 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Headful e2e on a bare Windows VM (cold-provision + auto-logon + Session-1 GUI)
-        run: bash tests/vm/gui-e2e.sh
+      - name: Headful parity e2e on a bare Windows VM (provision + linked smoke + run_task + tray + shots)
+        run: bash tests/vm/parity-e2e.sh
       - name: Teardown backstop — delete any leftover scratch RGs
         if: always()
         run: |
-          for rg in $(az group list --query "[?starts_with(name,'ufo-coldtest') || starts_with(name,'ufo-guitest')].name" -o tsv 2>/dev/null); do
+          for rg in $(az group list --query "[?starts_with(name,'ufo-coldtest') || starts_with(name,'ufo-guitest') || starts_with(name,'ufo-parity')].name" -o tsv 2>/dev/null); do
             echo "deleting leftover $rg"
             az group delete -n "$rg" --yes --no-wait || true
           done
