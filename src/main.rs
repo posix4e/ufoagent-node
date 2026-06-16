@@ -11,6 +11,7 @@ mod linker;
 mod qr;
 mod repair;
 mod service;
+mod session;
 mod status;
 mod store;
 mod taskqueue;
@@ -111,97 +112,103 @@ fn main() -> Result<()> {
     // they don't write to a parent shell (or a dead stderr).
     let quiet = matches!(cmd, Cmd::Tray | Cmd::Service { .. });
     init_logging(quiet);
+    let label = cmd_label(&cmd);
+    // The tray/service run without a console, so a panic (or a returned Err, below) would otherwise
+    // vanish — printed to a dead stderr and never logged. Route panics to the file log so we can see
+    // why a long-lived process died (e.g. the tray failing to build its icon on a bare VM).
+    std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     // Stamp the exact build at the top of every run — so `ufoagent.log` always answers "what's
     // running?" (especially for the long-lived service/tray) without needing the dashboard.
     log::info!(
         "ufoagent {} {} starting (cmd={})",
         build_string(),
         daemon::platform(),
-        cmd_label(&cmd)
+        label
     );
-    match cmd {
-        Cmd::Version => println!("{}", build_string()),
-        Cmd::Status => cmd_status(),
-        Cmd::Configure {
-            control_plane,
-            agent_token,
-            ufo_home,
-        } => {
-            let mut c = Config::load();
-            if control_plane.is_some() {
-                c.control_plane = control_plane;
+    let result: Result<()> = (|| {
+        match cmd {
+            Cmd::Version => println!("{}", build_string()),
+            Cmd::Status => cmd_status(),
+            Cmd::Configure {
+                control_plane,
+                agent_token,
+                ufo_home,
+            } => {
+                let mut c = Config::load();
+                if control_plane.is_some() {
+                    c.control_plane = control_plane;
+                }
+                if ufo_home.is_some() {
+                    c.ufo_home = ufo_home;
+                }
+                c.save()?;
+                if let Some(t) = agent_token {
+                    store::set_token(&t)?;
+                }
+                println!("configured");
             }
-            if ufo_home.is_some() {
-                c.ufo_home = ufo_home;
+            Cmd::Link {
+                control_plane,
+                name,
+                pause,
+                force,
+            } => cmd_link(control_plane, name, pause, force)?,
+            Cmd::Refresh => {
+                let c = Config::load();
+                let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
+                let cred = daemon::refresh_once(&cp, &c.ufo_home_path())?;
+                println!(
+                    "credential written: lease={} model={} expires_at={}",
+                    cred.lease_id, cred.model, cred.expires_at
+                );
             }
-            c.save()?;
-            if let Some(t) = agent_token {
-                store::set_token(&t)?;
+            Cmd::RunDaemon => daemon::run_daemon(VERSION, || false)?,
+            Cmd::Run { task, request } => cmd_run(task, request)?,
+            Cmd::Bootstrap {
+                ufo_home,
+                git_ref,
+                pause,
+            } => {
+                let result = bootstrap::bootstrap(ufo_home, &git_ref);
+                match &result {
+                    Ok((home, _)) => println!("\n  UFO2 provisioned at {}\n", home.display()),
+                    Err(e) => {
+                        // Into the log first — the console (--pause) vanishes when closed, but the
+                        // verdict must survive in ufoagent.log (CI fails fast on this line).
+                        log::error!("UFO2 setup failed: {e:#}");
+                        // And a clear, human-readable failure on screen (the installer launches this
+                        // in a visible console with --pause so the message stays up).
+                        eprintln!("\n  UFO2 setup failed: {e:#}\n");
+                        eprintln!("  You can retry later from the tray (Repair) or by running");
+                        eprintln!("  `ufoagent bootstrap` from an elevated prompt.\n");
+                    }
+                }
+                if pause {
+                    pause_enter();
+                }
+                result?;
             }
-            println!("configured");
-        }
-        Cmd::Link {
-            control_plane,
-            name,
-            pause,
-            force,
-        } => cmd_link(control_plane, name, pause, force)?,
-        Cmd::Refresh => {
-            let c = Config::load();
-            let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
-            let cred = daemon::refresh_once(&cp, &c.ufo_home_path())?;
-            println!(
-                "credential written: lease={} model={} expires_at={}",
-                cred.lease_id, cred.model, cred.expires_at
-            );
-        }
-        Cmd::RunDaemon => daemon::run_daemon(VERSION, || false)?,
-        Cmd::Run { task, request } => cmd_run(task, request)?,
-        Cmd::Bootstrap {
-            ufo_home,
-            git_ref,
-            pause,
-        } => {
-            let result = bootstrap::bootstrap(ufo_home, &git_ref);
-            match &result {
-                Ok((home, _)) => println!("\n  UFO2 provisioned at {}\n", home.display()),
-                Err(e) => {
-                    // Into the log first — the console (--pause) vanishes when closed, but the
-                    // verdict must survive in ufoagent.log (CI fails fast on this line).
-                    log::error!("UFO2 setup failed: {e:#}");
-                    // And a clear, human-readable failure on screen (the installer launches this
-                    // in a visible console with --pause so the message stays up).
-                    eprintln!("\n  UFO2 setup failed: {e:#}\n");
-                    eprintln!("  You can retry later from the tray (Repair) or by running");
-                    eprintln!("  `ufoagent bootstrap` from an elevated prompt.\n");
+            Cmd::Repair => {
+                for line in repair::repair()? {
+                    println!("  {line}");
                 }
             }
-            if pause {
-                pause_enter();
+            Cmd::Activity { pause } => {
+                println!("\n{}\n", activity::summarize());
+                if pause {
+                    pause_enter();
+                }
             }
-            result?;
-        }
-        Cmd::Repair => {
-            for line in repair::repair()? {
-                println!("  {line}");
-            }
-        }
-        Cmd::Activity { pause } => {
-            println!("\n{}\n", activity::summarize());
-            if pause {
-                pause_enter();
-            }
-        }
-        Cmd::Update { apply } => {
-            let c = Config::load();
-            let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
-            let s = update::check(&cp, VERSION)?;
-            println!(
-                "current={} min_version={} update_required={}",
-                s.current, s.min_version, s.update_required
-            );
-            if apply {
-                match update::maybe_self_update(&c, VERSION, Some(&s.min_version)) {
+            Cmd::Update { apply } => {
+                let c = Config::load();
+                let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
+                let s = update::check(&cp, VERSION)?;
+                println!(
+                    "current={} min_version={} update_required={}",
+                    s.current, s.min_version, s.update_required
+                );
+                if apply {
+                    match update::maybe_self_update(&c, VERSION, Some(&s.min_version)) {
                     Ok(true) => {
                         println!("update downloaded + verified; installer launched (service will restart)")
                     }
@@ -210,18 +217,23 @@ fn main() -> Result<()> {
                     ),
                     Err(e) => println!("update failed: {e}"),
                 }
+                }
             }
+            Cmd::Service { action } => service::run_action(&action)?,
+            Cmd::Tray => tray::run(VERSION)?,
+            Cmd::Autologon {
+                user,
+                password,
+                domain,
+                disable,
+            } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
         }
-        Cmd::Service { action } => service::run_action(&action)?,
-        Cmd::Tray => tray::run(VERSION)?,
-        Cmd::Autologon {
-            user,
-            password,
-            domain,
-            disable,
-        } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
+        Ok(())
+    })();
+    if let Err(e) = &result {
+        log::error!("`{label}` exited with error: {e:#}");
     }
-    Ok(())
+    result
 }
 
 /// Hold a tray/installer-spawned console open until Enter (those windows close on process exit).

@@ -178,12 +178,76 @@ mod imp {
         )
     }
 
+    /// Per-session single-instance guard. The service (re)spawns the tray into the console session
+    /// while the installer's Startup-folder shortcut may also launch one — without this they'd both
+    /// appear. Holds a session-named mutex for the process lifetime; returns true if another tray
+    /// already owns it. On any failure to create the guard, returns false (better to run than not).
+    fn another_tray_running() -> bool {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, TRUE};
+        use windows::Win32::System::Threading::CreateMutexW;
+        let name: Vec<u16> = "UFOAgentTraySingleton\0".encode_utf16().collect();
+        unsafe {
+            match CreateMutexW(None, TRUE, PCWSTR(name.as_ptr())) {
+                Ok(h) => {
+                    if GetLastError() == ERROR_ALREADY_EXISTS {
+                        let _ = CloseHandle(h);
+                        true
+                    } else {
+                        // Deliberately don't CloseHandle(h): HANDLE has no Drop, so leaving it open
+                        // holds the mutex for the whole process lifetime (we own the single slot).
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
+        }
+    }
+
     pub fn run(_version: &str) -> Result<()> {
+        if another_tray_running() {
+            log::info!("tray: another instance is already running in this session; exiting");
+            return Ok(());
+        }
         // Drop the console window Windows allocates for this console-subsystem exe when the tray
         // is launched by the installer or the logon task — leave just the 🛸 tray icon.
         unsafe {
             let _ = windows::Win32::System::Console::FreeConsole();
         }
+
+        // Start the FUNCTIONAL Session-1 worker first and UNCONDITIONALLY — it must not hinge on the
+        // system-tray icon. The liveness marker tells the SYSTEM service there's a live interactive
+        // session to run GUI tasks on; the executor pulls run_task requests from the file queue and
+        // runs them here (where UFO2 can drive the GUI). On some boxes Shell_NotifyIcon fails (E_FAIL)
+        // so the icon can't be built — but the node must still run tasks, so these come first.
+        std::thread::spawn(|| loop {
+            let _ = taskqueue::touch_alive();
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        std::thread::spawn(|| loop {
+            if let Some(req) = taskqueue::next_pending() {
+                let _ = taskqueue::report(&run_one(&req));
+            } else {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+        });
+
+        // Best-effort system-tray icon + menu. If it can't be built, don't take the worker down with
+        // it — log and park so the threads above keep the node usable as a headless Session-1 worker.
+        if let Err(e) = run_tray_ui() {
+            log::warn!(
+                "tray: system-tray UI unavailable ({e}); running as a headless Session-1 worker"
+            );
+            loop {
+                std::thread::sleep(Duration::from_secs(3600));
+            }
+        }
+        Ok(())
+    }
+
+    /// Build the system-tray icon + menu and run the event loop. Returns Err if the icon/menu can't
+    /// be created (e.g. Shell_NotifyIcon E_FAIL); otherwise runs until Quit (never returns normally).
+    fn run_tray_ui() -> Result<()> {
         let event_loop = EventLoopBuilder::<Ev>::with_user_event().build();
 
         let proxy = event_loop.create_proxy();
@@ -220,24 +284,12 @@ mod imp {
             .with_menu(Box::new(menu))
             .build()?;
 
-        // Refresh status every 5s, and touch the liveness marker so the SYSTEM service knows there's
-        // a live interactive desktop here to run GUI tasks on.
+        // Refresh the status menu text every 5s. The liveness marker + task executor already run
+        // unconditionally in run(); this is cosmetic, so it lives with the UI.
         let tick = event_loop.create_proxy();
         std::thread::spawn(move || loop {
-            let _ = taskqueue::touch_alive();
             std::thread::sleep(Duration::from_secs(5));
             let _ = tick.send_event(Ev::Tick);
-        });
-
-        // Task executor: the service (Session 0) drops run_task requests in the file queue; we run
-        // them here in the interactive session (where UFO2 can drive the GUI) and report back. Own
-        // thread so a long task doesn't stall the status/liveness tick above.
-        std::thread::spawn(|| loop {
-            if let Some(req) = taskqueue::next_pending() {
-                let _ = taskqueue::report(&run_one(&req));
-            } else {
-                std::thread::sleep(Duration::from_secs(2));
-            }
         });
 
         let (id_link, id_repair, id_run, id_activity, id_log, id_dash, id_quit) = (

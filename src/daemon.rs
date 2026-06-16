@@ -75,6 +75,9 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     // Last environment report we pushed — resend only on change (the hello carries the initial one).
     let mut last_envs: Option<Vec<env::EnvReport>> = None;
 
+    // Path to our own exe, to (re)launch the tray into the interactive session below.
+    let self_exe = std::env::current_exe().ok();
+
     while !should_stop() {
         let now = util::now();
         st.linked = store::get_token().is_some();
@@ -99,6 +102,13 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
 
         // 2) Liveness for the tray = the socket state (the control plane sees the same thing).
         st.online = ws_state.connected();
+
+        // 2a) Keep a tray alive in the active console session. The installer's Startup-folder shortcut
+        //     doesn't reliably fire on unattended auto-logon, so the service guarantees it (self-heals
+        //     if the tray dies). No-op when nobody's logged on or a tray is already alive.
+        if let Some(exe) = self_exe.as_deref() {
+            crate::session::ensure_tray_in_active_session(exe);
+        }
 
         // 2b) Environment health — push a delta when install state changes (e.g. bootstrap, running
         //     in a separate process, flips ufo2 installing -> ready). The WS read loop drains the
