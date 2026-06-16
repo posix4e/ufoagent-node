@@ -97,8 +97,8 @@ if printf '%s\n' "$neg_out" | grep -q 'SESSION1-GUI OK'; then
 fi
 echo "negative control failed as expected (no interactive session before auto-logon): good"
 
-# 4) reboot → boot auto-logs $ADMIN_USER into Session 1; the installer's {commonstartup} shortcut
-#    starts the tray there.
+# 4) reboot → boot auto-logs $ADMIN_USER into Session 1; the SYSTEM service then spawns the tray into
+#    that session (the {commonstartup} shortcut doesn't fire on auto-logon — see src/session.rs).
 echo "=== rebooting to trigger auto-logon + tray autostart ==="
 az vm restart -g "$RG" -n "$VM" -o none
 
@@ -112,7 +112,8 @@ tdeadline=$(( $(date +%s) + 10 * 60 ))
 while [ "$(date +%s)" -lt "$tdeadline" ]; do
   out="$(rc "$alive_ps")"
   echo "  $out"
-  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p')"
+  # Strip Windows CRLF / any non-digits so the numeric compare doesn't choke on a trailing \r.
+  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p' | tr -dc '0-9')"
   if [ -n "$age" ] && [ "$age" -le 90 ]; then tray_ok=1; break; fi
   sleep 20
 done

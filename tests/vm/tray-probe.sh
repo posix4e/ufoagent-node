@@ -38,6 +38,7 @@ echo "VM up."
 # script (run-command doesn't inherit our shell env). Password has no single quotes → safe to quote.
 echo "=== install (skip provisioning) + enable auto-logon ==="
 prelude="\$env:GUI_USER='$ADMIN_USER'; \$env:GUI_PASS='$ADMIN_PASS';"
+[ -n "${UFOAGENT_BETA_URL:-}" ] && prelude="$prelude \$env:UFOAGENT_BETA_URL='$UFOAGENT_BETA_URL';"
 install_out="$(rc "$prelude
 $(cat "$HERE/tray-probe-install.ps1")")"
 echo "$install_out"
@@ -53,7 +54,8 @@ tray_ok=0
 tdeadline=$(( $(date +%s) + 6 * 60 ))
 while [ "$(date +%s)" -lt "$tdeadline" ]; do
   out="$(rc "$alive_ps")"; echo "  $out"
-  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p')"
+  # Strip Windows CRLF / any non-digits so the numeric compare doesn't choke on a trailing \r.
+  age="$(printf '%s' "$out" | sed -n 's/.*TRAY age=\([0-9]\+\)s.*/\1/p' | tr -dc '0-9')"
   if [ -n "$age" ] && [ "$age" -le 90 ]; then tray_ok=1; break; fi
   sleep 20
 done
