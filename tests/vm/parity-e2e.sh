@@ -85,6 +85,10 @@ New-Item -ItemType Directory -Force -Path C:\\rt\\shots | Out-Null
 [Environment]::SetEnvironmentVariable('CI_AGENT_ID','${CI_AGENT_ID:-}','Machine')
 [Environment]::SetEnvironmentVariable('CI_ADMIN_TOKEN','${CI_ADMIN_TOKEN:-}','Machine')
 [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+# PowerShell 7 (pwsh): the e2e frame recorder launches 'pwsh', and it's the shell the runner uses.
+if (-not (Get-Command pwsh -EA SilentlyContinue)) {
+  try { & ([scriptblock]::Create((Invoke-RestMethod https://aka.ms/install-powershell.ps1))) -UseMSI -Quiet } catch { 'pwsh install failed: ' + \$_.Exception.Message }
+}
 Invoke-WebRequest -UseBasicParsing 'https://github.com/$REPO/archive/refs/heads/$E2E_REF.tar.gz' -OutFile C:\\repo.tgz
 tar -xf C:\\repo.tgz -C C:\\
 \$d=(Get-ChildItem C:\\ -Directory -Filter 'ufoagent-node-*' | Select-Object -First 1).FullName
@@ -95,7 +99,7 @@ tar -xf C:\\repo.tgz -C C:\\
 \$bom = New-Object System.Text.UTF8Encoding \$true
 Get-ChildItem \$e\\*.ps1 | ForEach-Object { [System.IO.File]::WriteAllText(\$_.FullName, [System.IO.File]::ReadAllText(\$_.FullName), \$bom) }
 [Environment]::SetEnvironmentVariable('E2E_DIR', \$e, 'Machine')
-'e2e dir: ' + \$e + ' ; scripts: ' + ((Get-ChildItem \$e\\*.ps1 -EA SilentlyContinue).Count)
+'e2e dir: ' + \$e + ' ; scripts: ' + ((Get-ChildItem \$e\\*.ps1 -EA SilentlyContinue).Count) + ' ; pwsh: ' + (Test-Path 'C:\\Program Files\\PowerShell\\7\\pwsh.exe')
 " | tail -2
 
 # Resolve the on-VM e2e dir once (for building absolute script paths).
