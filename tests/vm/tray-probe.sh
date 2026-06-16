@@ -88,5 +88,34 @@ echo "$gui_out"
 if printf '%s\n' "$gui_out" | grep -q 'SESSION1-GUI OK'; then echo "SELF-TEST: OK"; else echo "SELF-TEST: NOT OK"; fi
 echo "================================================================"
 
+# ICON EXPERIMENT: the service spawns the tray via CreateProcessAsUser and its Shell_NotifyIcon
+# (the visible icon) fails with E_FAIL → it runs headless. The GitHub runner launches the tray as a
+# NORMAL in-session process (Start-Process) and the icon works. So: does launching the tray IN-SESSION
+# (schtasks /IT, like the runner) build the icon here? If yes, the fix is the launch mechanism.
+echo "=== ICON EXPERIMENT: in-session (schtasks) launch vs service CreateProcessAsUser ==="
+rc '
+$log = "C:\ProgramData\UFOAgent\logs\ufoagent.log"
+"service-spawn (CreateProcessAsUser) icon-unavailable so far: " + ([bool](Select-String -Path $log -Pattern "system-tray UI unavailable" -Quiet))
+# Stop the service so it stops re-spawning, and kill existing trays, so only OUR launch is in play.
+Stop-Service UFOAgent -Force -EA SilentlyContinue; Start-Sleep 3
+Get-Process ufoagent -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue; Start-Sleep 2
+$before = (Get-Content $log -EA SilentlyContinue).Count
+# Launch the tray IN-SESSION via an interactive scheduled task (the proven Session-0->1 bridge).
+# Use a no-spaces launcher .cmd so the spaced exe path needs no nested-quote escaping in /TR.
+Set-Content -Path C:\tray-launch.cmd -Value "start """" ""C:\Program Files\UFOAgent\ufoagent.exe"" tray" -Encoding Ascii
+schtasks /Create /TN TrayIcon /TR "C:\tray-launch.cmd" /SC ONCE /ST 23:57 /RU ufoadmin /IT /RL HIGHEST /F | Out-Null
+schtasks /Run /TN TrayIcon | Out-Null
+Start-Sleep 25
+$after = Get-Content $log -EA SilentlyContinue | Select-Object -Skip $before
+$newFail = [bool]($after | Select-String "system-tray UI unavailable" -Quiet)
+$trayProcs = (Get-Process ufoagent -EA SilentlyContinue | Where-Object { $_.SessionId -eq 1 }).Count
+"in-session launch: new icon-unavailable warning=$newFail ; session-1 tray procs=$trayProcs"
+if (-not $newFail -and $trayProcs -ge 1) { "ICON-RESULT: IN-SESSION LAUNCH BUILT THE ICON => fix = launch in-session (logon task), not CreateProcessAsUser" }
+elseif ($newFail) { "ICON-RESULT: in-session launch ALSO E_FAILed Shell_NotifyIcon => environmental, not the launch mechanism" }
+else { "ICON-RESULT: inconclusive (no session-1 tray running)" }
+schtasks /Delete /TN TrayIcon /F 2>$null | Out-Null
+'
+echo "================================================================"
+
 if [ "$tray_ok" -eq 1 ]; then echo "=== TRAY-PROBE: tray came alive (age<=90s) ==="; exit 0
 else echo "=== TRAY-PROBE: tray did NOT come alive (see diagnostic above) ==="; exit 1; fi
