@@ -57,6 +57,14 @@ mod imp {
             .0;
         perso.set_value("NoLockScreen", &1u32)?;
 
+        // Suppress the first-logon "privacy settings" OOBE page. On a fresh auto-logon session it
+        // pops up modally and STEALS FOREGROUND — blocking UFO2 (or any GUI automation) from driving
+        // the desktop until a human clicks Accept. An unattended node must never wait on that.
+        let oobe = hklm
+            .create_subkey(r"SOFTWARE\Policies\Microsoft\Windows\OOBE")?
+            .0;
+        oobe.set_value("DisablePrivacyExperience", &1u32)?;
+
         println!(
             "autologon enabled for {user} — NOTE: password is stored in the registry; \
              use only on dedicated, isolated agent machines."
