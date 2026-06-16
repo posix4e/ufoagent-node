@@ -7,14 +7,11 @@ if (-not $setup) { throw 'installer artifact missing' }
 Add-MpPreference -ExclusionPath "$env:ProgramFiles\UFOAgent", (Join-Path (Get-Location) 'dl') -ErrorAction SilentlyContinue
 $env:PATH = (($env:PATH -split ';') | Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'git.exe')) }) -join ';'
 if (Get-Command git -ErrorAction SilentlyContinue) { Write-Host 'note: git still resolvable' } else { Write-Host 'git removed from PATH' }
-# Cold-box: drop the MFC runtime (mfc140u.dll) so the agent's bootstrap MUST install the VC++
-# redistributable for win32ui to load — the real fresh-VM scenario the GitHub runner otherwise masks
-# (it ships VC++ via Visual Studio). Runner is ephemeral, so renaming a System32 DLL is safe; the
-# agent's install_vc_redist restores it, and verify_ufo_imports fails the build if it doesn't.
-foreach ($d in @("$env:WINDIR\System32\mfc140u.dll", "$env:WINDIR\SysWOW64\mfc140u.dll")) {
-  if (Test-Path $d) { try { Rename-Item $d "$d.coldbox.bak" -Force -ErrorAction Stop; Write-Host "cold-box: removed $d" } catch { Write-Host "::warning::could not remove $d ($($_.Exception.Message)) — MFC test less faithful this run" } }
-  else { Write-Host "cold-box: already absent $d" }
-}
+# NOTE: we do NOT cold-box the MFC runtime here. Deleting mfc140u.dll on the runner creates a
+# "redist registered but file missing" state that vc_redist /repair can't reliably restore (MSI
+# repair is keypath-based) — so it falsely failed. On a real fresh VM the redist isn't registered
+# and the agent's /install works. The VC++ provisioning is validated on real VMs + by
+# verify_ufo_imports in bootstrap; a faithful cold-VM e2e is tracked as a follow-up.
 $log = Join-Path $env:RUNNER_TEMP 'inno-install.log'
 "INNO_LOG=$log" | Out-File -FilePath $env:GITHUB_ENV -Append # the diagnostics step reads it
 Write-Host "installing: $setup"
