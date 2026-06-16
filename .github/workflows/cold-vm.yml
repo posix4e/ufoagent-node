@@ -1,0 +1,62 @@
+name: cold-vm
+
+# Faithful cold-start test: provision the agent on a REAL bare Windows Server VM (no Visual Studio,
+# no Python, no VC++/MFC) — the customer environment the main `ci` runner can't represent because it
+# preinstalls all of that (which is how the win32ui/MFC crash shipped "green"). Drives the VM with
+# tests/vm/cold-provision.sh. Runs after every main build republishes the rolling beta, and on demand.
+#
+# Auth is GitHub OIDC (no stored secret). The job SKIPS cleanly until the AZURE_* repo variables are
+# set, so it's a no-op (not a red run) before the one-time setup below.
+#
+# One-time setup (repo owner):
+#   1. A service principal (distinct from the Trusted-Signing SP) with:
+#      - a FEDERATED credential for subject `repo:ufoagent/ufoagent-node:ref:refs/heads/main`
+#      - a Contributor role assignment on a scratch subscription/RG
+#   2. Repo VARIABLES (Settings → Secrets and variables → Actions → Variables):
+#      AZURE_CLIENT_ID, AZURE_TENANT_ID, AZURE_SUBSCRIPTION_ID  (identifiers, not secrets)
+# NOTE: workflow_run triggers only fire once this file is on the default branch (main).
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write   # OIDC token for azure/login
+  contents: read
+
+concurrency:
+  group: cold-vm
+  cancel-in-progress: false   # let an in-flight VM test finish + tear down rather than orphan it
+
+jobs:
+  cold-vm:
+    # Manual dispatch, or after a SUCCESSFUL ci run on main (which republished beta). Skip entirely
+    # until OIDC is configured (vars unset) so there are no red runs before setup.
+    if: >-
+      vars.AZURE_CLIENT_ID != '' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.head_branch == 'main'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LOCATION: westus2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure login (OIDC, no secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Cold-provision a bare Windows VM and probe the rolling beta
+        run: bash tests/vm/cold-provision.sh
+      - name: Teardown backstop — delete any leftover scratch RGs
+        if: always()
+        run: |
+          for rg in $(az group list --query "[?starts_with(name,'ufo-coldtest')].name" -o tsv 2>/dev/null); do
+            echo "deleting leftover $rg"
+            az group delete -n "$rg" --yes --no-wait || true
+          done
