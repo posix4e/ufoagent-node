@@ -1,16 +1,15 @@
 name: ci
 
-# Build once, then test the real artifact. `build` lints/tests/compiles and produces the Inno
-# installer; `test` downloads that installer, runs it (with live logging), waits for UFO2 to
-# auto-provision, then drives the INSTALLED 🛸 tray with FlaUI. One pipeline, no rebuilds.
-# On main, when EVERY step passes, the final `test` step ships that exact installer to the
-# rolling `beta` prerelease. Production stays on v* tags -> `latest` (release.yml).
-# Same-repo runs also do a LINKED smoke: the agent gets a pre-provisioned CI node token and the
-# run drives a real command through the control plane (enqueue -> DO -> WS -> execute -> result).
+# Fast per-PR gate: lint, unit tests, compile, and build the Inno installer. On main, when that passes,
+# publish the exact installer to the rolling `beta` prerelease. Production stays on v* tags -> `latest`
+# (release.yml).
 #
-# Step logic lives in tests/e2e/*.ps1 (shared bits in tests/e2e/helpers.ps1) — lintable, hand-
-# runnable on a Windows box for debugging, and a single copy of every helper. This file is
-# orchestration: order, conditions, timeouts, artifacts.
+# The full end-to-end — install + cold-provision on a BARE Windows VM + auto-logon + run_task GUI + tray
+# menu + linked smoke + the marketing screenshots — is NOT here: it runs on a real headful VM in
+# cold-vm.yml (workflow_run, right after this `ci` publishes beta), reusing the same tests/e2e +
+# tests/gui scripts. A GitHub runner can't represent a bare customer box (it preinstalls VC++/MFC,
+# Python, .NET) nor reboot into an auto-logon session — which is how the win32ui/MFC + tray-autostart
+# bugs shipped "green" here before. So beta is gated by build, then verified on the VM after publish.
 on:
   push:
     branches: [main]
@@ -25,6 +24,8 @@ jobs:
     name: lint + unit + build + installer
     runs-on: windows-latest
     timeout-minutes: 20
+    permissions:
+      contents: write # main-only: re-point the rolling beta tag/release (publish step below)
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -60,126 +61,16 @@ jobs:
           path: ${{ runner.temp }}/ufoagent-setup.exe
           if-no-files-found: error
 
-  test:
-    name: install + provision + link + tray GUI (installed app)
-    needs: build
-    # Pinned to windows-2025 (the migration TARGET image) rather than windows-latest: through
-    # mid-2026 `windows-latest` is being live-redirected to windows-2025-vs2026, and that redirect
-    # was reclaiming this long job ~seconds into the heavy UFO2 step (job cancelled, always-steps
-    # skipped). 2025 matches windows-latest's desktop/tray behaviour (unlike 2022, where FlaUI can't
-    # find the tray icon). Revisit after the migration completes (~June 15, 2026).
-    runs-on: windows-2025
-    # Provision (~8m) + linked smoke + TWO genuine UFO2 runs (remote + local, up to ~6m each) +
-    # the tray GUI — give it room so a slow UFO2 run doesn't trip the job timeout.
-    timeout-minutes: 45
-    permissions:
-      contents: write # the final main-only step re-points the rolling beta release
-    env:
-      # Pre-provisioned CI node credentials (empty on fork PRs -> the linked smoke skips).
-      CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
-      CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
-      CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4 # for tests/e2e + tests/gui/TrayTest
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: "8.x"
-      - name: Download installer
-        uses: actions/download-artifact@v4
-        with:
-          name: installer
-          path: dl
-
-      - name: Capture the installer screen (real Inno wizard, for the site)
-        shell: pwsh
-        run: ./tests/e2e/capture-install-screen.ps1
-
-      - name: Silent install (live Inno log, git stripped, 5-min guard)
-        shell: pwsh
-        run: ./tests/e2e/install.ps1
-
-      - name: Service running + standard commands (installed exe)
-        shell: pwsh
-        run: ./tests/e2e/verify-install.ps1
-
-      - name: Wait for the installer to auto-provision UFO2 (no git)
-        shell: pwsh
-        run: ./tests/e2e/wait-provision.ps1
-
-      - name: Linked smoke — WS connect + command round-trip through the live control plane
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/linked-smoke.ps1
-
-      - name: Capture the link screen (real QR pairing console, for the site)
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/capture-link-screen.ps1
-
-      - name: Start the tray (run_task executor, Session 1)
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/start-tray.ps1
-
-      - name: Remote run_task — UFO2 actually opens Notepad (real task, screenshot + assert)
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/remote-task.ps1
-
-      - name: Local run_task — `ufoagent run` makes UFO2 actually open Notepad (real, instrumented)
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/local-task.ps1
-
-      - name: Taskbar — View log + LLM activity summary (tray menu), assert + screenshot both
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/taskbar.ps1
-
-      # Runs on PRs too (publish below stays main-only): the gifs land in the tray-screenshots
-      # artifact, so a PR run shows exactly what would ship.
-      - name: Assemble task recordings into GIFs (for the site)
-        if: env.CI_AGENT_TOKEN != ''
-        shell: pwsh
-        run: ./tests/e2e/assemble-gifs.ps1
-
-      - name: Publish real screenshots to the site (main, after a green run)
-        if: github.event_name == 'push' && env.CI_AGENT_TOKEN != ''
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          shots="$RUNNER_TEMP/shots"
-          rm -rf pub && mkdir pub
-          # Curate the illustrative shots: the genuine "UFO2 opened Notepad and typed" captures,
-          # the on-device LLM activity recap, and the install/link onboarding screens. (The raw-log
-          # "command-log" shot stays unpublished — the activity summary is the readable version.)
-          cp "$shots/10-remote-notepad.png" pub/remote-task.png        2>/dev/null || true
-          cp "$shots/11-local-notepad.png"  pub/local-task.png         2>/dev/null || true
-          # The moving versions: full-run timelapse recordings of the same two tasks.
-          cp "$shots/remote-task.gif"       pub/remote-task.gif        2>/dev/null || true
-          cp "$shots/local-task.gif"        pub/local-task.gif         2>/dev/null || true
-          cp "$shots"/*activity-summary.png pub/activity-summary.png   2>/dev/null || true
-          cp "$shots/install-screen.png"    pub/install-screen.png     2>/dev/null || true
-          cp "$shots/link-screen.png"       pub/link-screen.png        2>/dev/null || true
-          ls -la pub
-          # Force-push a single fresh commit to an orphan-style `screenshots` branch (no history
-          # bloat on main, no PAT — same-repo GITHUB_TOKEN). The site hotlinks these via raw.
-          cd pub && git init -q && git checkout -q -b screenshots
-          git add .
-          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from ${GITHUB_SHA}"
-          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
-          echo "published screenshots from ${GITHUB_SHA}"
-
-      - name: Publish rolling beta (main pushes only — runs only if every step above passed)
+      # Publish the rolling beta on main once build/unit/compile pass. cold-vm.yml then verifies THIS
+      # exact beta on a real bare VM right after (verify-after-publish for a rolling prerelease).
+      - name: Publish rolling beta (main only)
         if: github.event_name == 'push'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          setup=$(find dl -name ufoagent-setup.exe | head -1)
+          setup="$RUNNER_TEMP/ufoagent-setup.exe"
           test -f "$setup"
           # Re-point the beta tag at this commit (the release follows its tag); stable URL:
           #   https://github.com/ufoagent/ufoagent-node/releases/download/beta/ufoagent-setup.exe
@@ -187,36 +78,7 @@ jobs:
           git push -f origin beta
           if ! gh release view beta >/dev/null 2>&1; then
             gh release create beta --prerelease --title "UFOAgent beta (rolling)" \
-              --notes "Rolling beta: the newest main build that passed the full install + provision + tray GUI test suite. Want stable? Grab the latest production release instead."
+              --notes "Rolling beta: the newest main build that passed lint/unit/compile. The full headful e2e (cold-vm) then verifies this exact build on a real bare Windows VM. Want stable? Grab the latest production release instead."
           fi
           gh release upload beta "$setup" --clobber
           echo "beta -> $GITHUB_SHA"
-
-      - name: Upload tray screenshots (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: tray-screenshots
-          # Raw recorder frames are huge (hundreds of full-screen PNGs) — the gifs carry the story.
-          path: |
-            ${{ runner.temp }}/shots
-            !${{ runner.temp }}/shots/frames-*
-          if-no-files-found: ignore
-
-      - name: Capture diagnostics (always)
-        if: always()
-        shell: pwsh
-        run: ./tests/e2e/capture-diagnostics.ps1
-
-      - name: Upload diagnostics (always)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-diagnostics
-          path: ${{ runner.temp }}/diag
-          if-no-files-found: ignore
-
-      - name: Uninstall (always)
-        if: always()
-        shell: pwsh
-        run: ./tests/e2e/uninstall.ps1
