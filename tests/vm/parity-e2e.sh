@@ -185,6 +185,18 @@ ls_png="$(rc 'if(Test-Path C:\rt\shots\link-screen.png){"YES "+(Get-Item C:\rt\s
 echo "  link-screen.png: $ls_png (rc=$RC1)"
 printf '%s' "$ls_png" | grep -q YES || fails+=("link-screen-png")
 
+# install-screen: capture-install-screen.ps1 screenshots the Inno wizard's first screen; it looks for
+# ./dl/ufoagent-setup.exe, so stage the installer there and run from C:\rt.
+echo "=== [s1] capture install-screen ==="
+rc "New-Item -ItemType Directory -Force C:\\rt\\dl | Out-Null
+[Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+\$u = if('${UFOAGENT_BETA_URL:-}'){'${UFOAGENT_BETA_URL:-}'}else{'https://github.com/$REPO/releases/download/beta/ufoagent-setup.exe'}
+try{ Invoke-WebRequest -UseBasicParsing \$u -OutFile C:\\rt\\dl\\ufoagent-setup.exe; 'installer staged' }catch{'stage fail: '+\$_.Exception.Message}" | tail -1
+run_session1 installscreen "$E2EDIR\\capture-install-screen.ps1" "cd /d C:\\rt"
+is_png="$(rc 'if(Test-Path C:\rt\shots\install-screen.png){"YES "+(Get-Item C:\rt\shots\install-screen.png).Length}else{"NO"}')"
+echo "  install-screen.png: $is_png (rc=$RC1)"
+printf '%s' "$is_png" | grep -q YES || fails+=("install-screen-png")
+
 # 5) Session 1 credentialed run_task (needs a linked node for the LLM credential): the service routes
 #    the enqueued task to the tray executor (same Session 1), which runs UFO2 -> Notepad; the script
 #    (also Session 1) records frames + screenshots it.

@@ -33,7 +33,7 @@ on:
 
 permissions:
   id-token: write   # OIDC token for azure/login
-  contents: read
+  contents: write   # publish the marketing screenshots to the orphan `screenshots` branch (main only)
 
 concurrency:
   group: cold-vm
@@ -71,6 +71,29 @@ jobs:
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
       - name: Headful parity e2e on a bare Windows VM (provision + linked smoke + run_task + tray + shots)
         run: bash tests/vm/parity-e2e.sh
+      - name: Publish the marketing screenshots (main, after a green run)
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          s=parity-shots
+          rm -rf pub && mkdir pub
+          # Curate the published set: the genuine run_task Notepad captures + timelapses, the on-device
+          # LLM activity recap, and the install/link onboarding screens (mirrors the old runner publish).
+          cp "$s/10-remote-notepad.png" pub/remote-task.png      2>/dev/null || true
+          cp "$s/11-local-notepad.png"  pub/local-task.png       2>/dev/null || true
+          cp "$s/remote-task.gif"       pub/remote-task.gif      2>/dev/null || true
+          cp "$s/local-task.gif"        pub/local-task.gif       2>/dev/null || true
+          cp "$s"/*activity-summary.png pub/activity-summary.png 2>/dev/null || true
+          cp "$s/install-screen.png"    pub/install-screen.png   2>/dev/null || true
+          cp "$s/link-screen.png"       pub/link-screen.png      2>/dev/null || true
+          ls -la pub
+          cd pub && git init -q && git checkout -q -b screenshots
+          git add .
+          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from VM e2e ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
+          echo "published screenshots from ${GITHUB_SHA}"
       - name: Teardown backstop — delete any leftover scratch RGs
         if: always()
         run: |
