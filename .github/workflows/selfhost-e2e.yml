@@ -10,10 +10,11 @@ on:
         description: "Override the beta installer URL (optional)"
         required: false
         default: ""
-  # TEMP (validation): own-branch push is trusted (not a fork PR), secrets available. Replaced by
-  # `workflow_run` after `ci` on main at cut-over.
-  push:
-    branches: [test/selfhost-e2e]
+  # Verify the published beta after a green `ci` on main (same model the old cold-vm used). Trusted
+  # events only — never pull_request — so a fork can't run on the self-hosted box.
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
 
 permissions:
   contents: write
@@ -24,6 +25,8 @@ concurrency:
 
 jobs:
   e2e:
+    # manual dispatch, or after a successful `ci` on main. Never fork PRs.
+    if: github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
     runs-on: [self-hosted, kvm-winvm]
     timeout-minutes: 45
     steps:
