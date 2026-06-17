@@ -1,0 +1,55 @@
+# First-principles e2e on the self-hosted KVM box: one bare Windows VM, one journey, recorded end to end,
+# sliced into the marketing gifs. Replaces the Azure cold-vm harness. SECURITY: this repo is public and
+# this job runs on a self-hosted runner, so it triggers ONLY on trusted events — manual dispatch and (added
+# at cut-over) workflow_run after a green `ci` on main. NEVER on pull_request (a fork must not run on the box).
+name: selfhost-e2e
+on:
+  workflow_dispatch:
+    inputs:
+      beta_url:
+        description: "Override the beta installer URL (optional)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+concurrency:
+  group: selfhost-e2e
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    runs-on: [self-hosted, kvm-winvm]
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run the journey (revert cold -> record -> install/tray/link/local/remote/activity -> slice)
+        env:
+          CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
+          CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
+          CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
+          UFOAGENT_BETA_URL: ${{ github.event.inputs.beta_url }}
+        run: bash tests/selfhost/run-e2e.sh
+
+      - name: Publish the marketing gifs to the screenshots branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          g=/mnt/ram/e2e/gifs
+          rm -rf pub && mkdir pub
+          # The site uses install-screen.gif, remote-task.gif, local-task.gif, activity-summary.gif (link is
+          # the robot SVG). Publish gif + a still fallback for each; missing ones are skipped.
+          for f in install-screen link-screen local-task remote-task activity-summary; do
+            cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
+            cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
+          done
+          ls -la pub
+          cd pub && git init -q && git checkout -q -b screenshots
+          git add .
+          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from self-hosted e2e ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
+          echo "published from ${GITHUB_SHA}"
