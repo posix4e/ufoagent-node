@@ -55,8 +55,11 @@ rm -rf "$REC" "$WORK/gifs" "$WORK/stop"; mkdir -p "$REC"   # clear stale frames+
 RECPID=$!
 
 echo "=== launch journey (one interactive task) ==="
-launch='powershell -NoProfile -ExecutionPolicy Bypass -File C:\e2e\journey.ps1'
-SSH "schtasks /Create /TN UFOJourney /TR '$launch' /SC ONCE /ST 23:30 /RU $GUSER /IT /RL HIGHEST /F | Out-Null; schtasks /Run /TN UFOJourney | Out-Null; 'launched'"
+# schtasks /TR with spaces is fragile, and a direct /TR gives no output if journey.ps1 dies. Use a
+# no-spaces launcher .cmd that redirects the journey's output to journey.log (same idea as the old
+# run_session1), so a crash is visible.
+SSH 'Set-Content C:\e2e\run-journey.cmd -Encoding Ascii -Value @("@echo off","powershell -NoProfile -ExecutionPolicy Bypass -File C:\e2e\journey.ps1 > C:\e2e\out\journey.log 2>&1","echo LAUNCHER-EXIT %ERRORLEVEL% >> C:\e2e\out\journey.log"); "launcher written"'
+SSH "schtasks /Create /TN UFOJourney /TR C:\\e2e\\run-journey.cmd /SC ONCE /ST 23:30 /RU $GUSER /IT /RL HIGHEST /F | Out-Null; schtasks /Run /TN UFOJourney | Out-Null; 'launched'"
 
 echo "=== poll result (<=15m) ==="
 status="PENDING"; d=$(( $(date +%s) + 15*60 ))
@@ -74,7 +77,9 @@ echo "frames=$(ls "$REC" 2>/dev/null | wc -l)"
 echo "=== collect ==="
 SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
+SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
 SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/dev/null 2>&1 || true
+echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
 
 # Clock skew computed NOW (post-journey): the guest RTC can be hours off at boot but Windows time-sync
