@@ -18,9 +18,10 @@ gifname(){ case "$1" in
   *)        echo "$1";; esac; }
 
 # PowerShell ConvertTo-Json unwraps a single-element array to a bare object; normalize to an array.
+[ -s "$PHASES" ] || { echo "no phases.json (journey produced none)"; exit 0; }
 PH=$(jq -c 'if type=="array" then . else [.] end' "$PHASES" 2>/dev/null || echo '[]')
-n=$(echo "$PH" | jq 'length')
-[ "$n" -gt 0 ] || { echo "no phases"; exit 0; }
+n=$(echo "$PH" | jq 'length' 2>/dev/null || echo 0); n=${n:-0}
+[ "$n" -gt 0 ] 2>/dev/null || { echo "no phases"; exit 0; }
 for i in $(seq 0 $((n-1))); do
   label=$(echo "$PH" | jq -r ".[$i].label")
   gs=$(echo "$PH" | jq -r ".[$i].start"); ge=$(echo "$PH" | jq -r ".[$i].end")

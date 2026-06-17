@@ -24,6 +24,14 @@ done
 [ -n "$IP" ] || { echo "VM never came up"; exit 1; }
 echo "guest ip=$IP"
 
+# sshd comes up BEFORE the autologon desktop session is ready; the interactive (/IT) journey task can't
+# run until the console is logged in. Wait for explorer.exe (the shell) so the launch isn't a race.
+echo "=== wait for interactive desktop (autologon) ==="
+for i in $(seq 1 40); do
+  if SSH '[bool](Get-Process explorer -ErrorAction SilentlyContinue)' 2>/dev/null | grep -qi true; then echo "desktop ready"; break; fi
+  echo "  waiting for desktop (explorer)"; sleep 5
+done
+
 # the e2e assertion library the journey composes (repo layout: ../e2e; dev layout: ./e2e)
 E2EDIR="$HERE/e2e"; [ -d "$E2EDIR" ] || E2EDIR="$HERE/../e2e"
 echo "=== stage journey + e2e lib ($E2EDIR) ==="
@@ -39,7 +47,7 @@ fi
 SSH 'Get-ChildItem C:\e2e -Recurse -Filter *.ps1 | ForEach-Object { $c=[IO.File]::ReadAllText($_.FullName); [IO.File]::WriteAllText($_.FullName, $c, (New-Object System.Text.UTF8Encoding $true)) }; "reencoded utf8-bom"'
 
 echo "=== start recorder (virsh screenshot loop) ==="
-rm -rf "$REC" "$WORK/stop"; mkdir -p "$REC"
+rm -rf "$REC" "$WORK/gifs" "$WORK/stop"; mkdir -p "$REC"   # clear stale frames+gifs so a failed run can't publish old ones
 ( while [ ! -f "$WORK/stop" ]; do
     sudo virsh screenshot "$VM" "$REC/frame-$(( $(date +%s%N) / 1000000 )).png" >/dev/null 2>&1 || true
     sleep "$FPS_SLEEP"
