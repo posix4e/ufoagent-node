@@ -88,5 +88,27 @@ echo "$gui_out"
 if printf '%s\n' "$gui_out" | grep -q 'SESSION1-GUI OK'; then echo "SELF-TEST: OK"; else echo "SELF-TEST: NOT OK"; fi
 echo "================================================================"
 
+# ICON CHECK: the service now launches the tray IN-SESSION (interactive scheduled task), where
+# Shell_NotifyIcon succeeds — unlike a cross-session CreateProcessAsUser launch (E_FAIL). Confirm the
+# SERVICE's launch built its icon: no "system-tray UI unavailable" warning AFTER its "launched
+# in-session tray" line. (Any such warning BEFORE that is the install-time Session-0 tray, expected.)
+echo "=== ICON CHECK: did the service's in-session tray build its icon? ==="
+rc '
+$log = "C:\ProgramData\UFOAgent\logs\ufoagent.log"
+$lines = Get-Content $log -EA SilentlyContinue
+$launch = ($lines | Select-String "launched in-session tray" | Select-Object -Last 1)
+if (-not $launch) {
+  "ICON-RESULT: service never logged an in-session tray launch (unexpected)"
+} else {
+  $after = $lines | Select-Object -Skip $launch.LineNumber
+  $failedAfter = [bool]($after | Select-String "system-tray UI unavailable" -Quiet)
+  $trayProcs = (Get-Process ufoagent -EA SilentlyContinue | Where-Object { $_.SessionId -eq 1 }).Count
+  "after service in-session launch: icon-unavailable=$failedAfter ; session-1 tray procs=$trayProcs"
+  if (-not $failedAfter -and $trayProcs -ge 1) { "ICON-RESULT: SERVICE in-session launch BUILT THE ICON (Shell_NotifyIcon OK)" }
+  else { "ICON-RESULT: icon still failing (unavailable=$failedAfter procs=$trayProcs)" }
+}
+'
+echo "================================================================"
+
 if [ "$tray_ok" -eq 1 ]; then echo "=== TRAY-PROBE: tray came alive (age<=90s) ==="; exit 0
 else echo "=== TRAY-PROBE: tray did NOT come alive (see diagnostic above) ==="; exit 1; fi

@@ -24,11 +24,16 @@ on:
   workflow_run:
     workflows: ["ci"]
     types: [completed]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      beta_url:
+        description: "Installer URL override (blank = the published rolling beta)"
+        required: false
+        default: ""
 
 permissions:
   id-token: write   # OIDC token for azure/login
-  contents: read
+  contents: write   # publish the marketing screenshots to the orphan `screenshots` branch (main only)
 
 concurrency:
   group: cold-vm
@@ -44,9 +49,18 @@ jobs:
        (github.event.workflow_run.conclusion == 'success' &&
         github.event.workflow_run.head_branch == 'main'))
     runs-on: ubuntu-latest
-    timeout-minutes: 60   # VM create (~6m) + cold provision (~30m) + reboot + Session-1 GUI + teardown
+    timeout-minutes: 75   # VM create + cold provision + reboot + linked smoke + run_task + tray + shots
     env:
       LOCATION: westus2
+      # Pre-provisioned CI node creds (empty on fork PRs -> the credentialed steps skip). Passed to the
+      # scratch VM (own subscription, torn down each run) to drive the live control-plane parity tests.
+      CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
+      CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
+      CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
+      # Which repo branch's tests/e2e + tests/gui the VM downloads to run the re-hosted assertions.
+      E2E_REF: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+      # Optional installer override (testing a branch build); blank -> provision-and-probe's published beta.
+      UFOAGENT_BETA_URL: ${{ github.event.inputs.beta_url }}
     steps:
       - uses: actions/checkout@v4
       - name: Azure login (OIDC, no secret)
@@ -55,12 +69,35 @@ jobs:
           client-id: ${{ vars.AZURE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
-      - name: Headful e2e on a bare Windows VM (cold-provision + auto-logon + Session-1 GUI)
-        run: bash tests/vm/gui-e2e.sh
+      - name: Headful parity e2e on a bare Windows VM (provision + linked smoke + run_task + tray + shots)
+        run: bash tests/vm/parity-e2e.sh
+      - name: Publish the marketing screenshots (main, after a green run)
+        if: github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          s=parity-shots
+          rm -rf pub && mkdir pub
+          # Curate the published set: the genuine run_task Notepad captures + timelapses, the on-device
+          # LLM activity recap, and the install/link onboarding screens (mirrors the old runner publish).
+          cp "$s/10-remote-notepad.png" pub/remote-task.png      2>/dev/null || true
+          cp "$s/11-local-notepad.png"  pub/local-task.png       2>/dev/null || true
+          cp "$s/remote-task.gif"       pub/remote-task.gif      2>/dev/null || true
+          cp "$s/local-task.gif"        pub/local-task.gif       2>/dev/null || true
+          cp "$s"/*activity-summary.png pub/activity-summary.png 2>/dev/null || true
+          cp "$s/install-screen.png"    pub/install-screen.png   2>/dev/null || true
+          cp "$s/link-screen.png"       pub/link-screen.png      2>/dev/null || true
+          ls -la pub
+          cd pub && git init -q && git checkout -q -b screenshots
+          git add .
+          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from VM e2e ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
+          echo "published screenshots from ${GITHUB_SHA}"
       - name: Teardown backstop — delete any leftover scratch RGs
         if: always()
         run: |
-          for rg in $(az group list --query "[?starts_with(name,'ufo-coldtest') || starts_with(name,'ufo-guitest')].name" -o tsv 2>/dev/null); do
+          for rg in $(az group list --query "[?starts_with(name,'ufo-coldtest') || starts_with(name,'ufo-guitest') || starts_with(name,'ufo-parity')].name" -o tsv 2>/dev/null); do
             echo "deleting leftover $rg"
             az group delete -n "$rg" --yes --no-wait || true
           done
