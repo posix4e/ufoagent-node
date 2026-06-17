@@ -46,12 +46,17 @@ run_session1() {
   rc "
 \$ErrorActionPreference='SilentlyContinue'
 Remove-Item C:\\rt\\$name.rc,C:\\rt\\$name.log -ErrorAction SilentlyContinue
-# No-spaces launcher: set RUNNER_TEMP (the e2e scripts' shots dir), run the script, capture exit + log.
-# (Task Scheduler gives the task a fresh env block, so machine-env tokens are also visible here.)
-Set-Content C:\\rt\\$name-launch.cmd -Value 'set RUNNER_TEMP=C:\\rt
+# No-spaces self-logging launcher: step markers + cwd so an empty transcript still localizes the
+# failure. RUNNER_TEMP is the e2e scripts' shots dir; %RC% captures the script's exit immediately.
+Set-Content C:\\rt\\$name-launch.cmd -Value '@echo off
+echo [launcher] start cwd=%CD% > C:\\rt\\$name.log 2>&1
+set RUNNER_TEMP=C:\\rt
 $pre
-powershell -NoProfile -ExecutionPolicy Bypass -File \"$script\" > C:\\rt\\$name.log 2>&1
-echo %ERRORLEVEL% > C:\\rt\\$name.rc' -Encoding Ascii
+echo [launcher] after-prelude cwd=%CD% >> C:\\rt\\$name.log 2>&1
+pwsh -NoProfile -ExecutionPolicy Bypass -File \"$script\" >> C:\\rt\\$name.log 2>&1
+set RC=%ERRORLEVEL%
+echo [launcher] ps-exit=%RC% >> C:\\rt\\$name.log 2>&1
+echo %RC% > C:\\rt\\$name.rc' -Encoding Ascii
 schtasks /Create /TN P_$name /TR C:\\rt\\$name-launch.cmd /SC ONCE /ST 23:30 /RU $ADMIN_USER /IT /RL HIGHEST /F | Out-Null
 schtasks /Run /TN P_$name | Out-Null
 " >/dev/null
@@ -62,7 +67,10 @@ schtasks /Run /TN P_$name | Out-Null
     got="$(printf '%s' "$got" | tr -dc '0-9PENDIG')"
     case "$got" in PENDING|'') sleep 15;; *) break;; esac
   done
-  rc "schtasks /Delete /TN P_$name /F 2>\$null | Out-Null; if(Test-Path C:\\rt\\$name.log){Get-Content C:\\rt\\$name.log -Tail 40}"
+  rc "schtasks /Query /TN P_$name /FO LIST /V 2>\$null | Select-String 'Last Run Time','Last Result'
+schtasks /Delete /TN P_$name /F 2>\$null | Out-Null
+if((Test-Path C:\\rt\\$name.log) -and (Get-Item C:\\rt\\$name.log).Length -gt 0){ '--- $name.log ---'; Get-Content C:\\rt\\$name.log -Tail 60 }
+else { '--- $name.log EMPTY (rc=' + (Get-Content C:\\rt\\$name.rc -Raw -EA SilentlyContinue) + ') ---' }"
   RC1="${got:-X}"
 }
 
@@ -185,9 +193,14 @@ if [ "$HAVE_TOKEN" = "1" ]; then
   run_session1 localtask "$E2EDIR\\local-task.ps1"; echo "  local-task rc=$RC1"; [ "$RC1" = "0" ] || fails+=("local-task(rc=$RC1)")
   echo "=== [s1] remote-task ==="
   run_session1 remotetask "$E2EDIR\\remote-task.ps1"; echo "  remote-task rc=$RC1"; [ "$RC1" = "0" ] || fails+=("remote-task(rc=$RC1)")
+else
+  echo "=== [s1] run_task (local + remote) SKIPPED (no CI_AGENT_TOKEN / no LLM credential) ==="
+fi
 
-  # taskbar: FlaUI drives the tray menu (Run a task -> visible window, View log, activity LLM dialog).
-  # Needs the VISIBLE tray icon (icon-fix build) + .NET 8 for `dotnet run` of tests/gui/TrayTest.
+# taskbar: FlaUI drives the tray menu (Run a task -> visible window, View log, activity LLM dialog).
+# Needs the VISIBLE tray icon (icon-fix build) + .NET 8. The activity assertion needs a linked node;
+# TASKBAR_FORCE=1 runs it without a token (the menu/window parts) for fast local iteration.
+if [ "$HAVE_TOKEN" = "1" ] || [ "${TASKBAR_FORCE:-0}" = "1" ]; then
   echo "=== [s1] taskbar (FlaUI tray menu + activity) — installing .NET 8 ==="
   rc "if(-not (Test-Path C:\\dotnet\\dotnet.exe)){ try{ & ([scriptblock]::Create((Invoke-RestMethod https://dot.net/v1/dotnet-install.ps1))) -Channel 8.0 -InstallDir C:\\dotnet -NoPath }catch{'dotnet install: '+\$_.Exception.Message} }; 'dotnet: '+(Test-Path C:\\dotnet\\dotnet.exe)" | tail -1
   REPO_ROOT="$(rc '([Environment]::GetEnvironmentVariable("E2E_DIR","Machine") | Split-Path | Split-Path)' | tr -d '\r')"
@@ -195,7 +208,7 @@ if [ "$HAVE_TOKEN" = "1" ]; then
 set PATH=C:\\dotnet;%PATH%"
   echo "  taskbar rc=$RC1"; [ "$RC1" = "0" ] || fails+=("taskbar(rc=$RC1)")
 else
-  echo "=== [s1] run_task (local + remote) + taskbar SKIPPED (no CI_AGENT_TOKEN / no LLM credential) ==="
+  echo "=== [s1] taskbar SKIPPED (no token; set TASKBAR_FORCE=1 to run the menu parts) ==="
 fi
 
 # 5) assemble GIFs (Session 0; needs the frames local-task recorded).
