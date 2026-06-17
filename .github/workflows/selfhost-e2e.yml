@@ -10,6 +10,10 @@ on:
         description: "Override the beta installer URL (optional)"
         required: false
         default: ""
+  # TEMP (validation): own-branch push is trusted (not a fork PR), secrets available. Replaced by
+  # `workflow_run` after `ci` on main at cut-over.
+  push:
+    branches: [test/selfhost-e2e]
 
 permissions:
   contents: write
