@@ -38,10 +38,18 @@ echo "=== stage journey + e2e lib ($E2EDIR) ==="
 SSH 'New-Item -ItemType Directory -Force C:\e2e,C:\e2e\out | Out-Null; Remove-Item C:\e2e\out\*,C:\e2e\e2e,C:\e2e\journey.ps1 -Recurse -Force -EA SilentlyContinue; "staged"'
 SCP "$HERE/journey.ps1" "$GUSER@$IP:C:/e2e/journey.ps1"
 SCP -r "$E2EDIR" "$GUSER@$IP:C:/e2e/e2e"
-if [ -n "${CI_AGENT_TOKEN:-}" ]; then
-  SSH "Set-Content C:\\e2e\\env.ps1 -Encoding Ascii -Value (\"\\\$env:CI_AGENT_TOKEN='${CI_AGENT_TOKEN}'\",\"\\\$env:CI_AGENT_ID='${CI_AGENT_ID:-}'\",\"\\\$env:CI_ADMIN_TOKEN='${CI_ADMIN_TOKEN:-}'\")"
+# Stage tokens via base64: token values can contain chars that break naive quoting through
+# ssh -> powershell -> Set-Content (the first CI run crashed with a token parsed as a command). Each
+# value is base64 so env.ps1 holds no raw token chars, and the whole file is base64 for safe transport.
+if [ -n "${CI_AGENT_TOKEN:-}" ] || [ -n "${UFOAGENT_BETA_URL:-}" ]; then
+  b64() { printf '%s' "${1:-}" | base64 -w0; }
+  ENV_PS1="\$env:CI_AGENT_TOKEN=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${CI_AGENT_TOKEN:-}")'))
+\$env:CI_AGENT_ID=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${CI_AGENT_ID:-}")'))
+\$env:CI_ADMIN_TOKEN=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${CI_ADMIN_TOKEN:-}")'))
+\$env:UFOAGENT_BETA_URL=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${UFOAGENT_BETA_URL:-}")'))"
+  ENV_B64=$(printf '%s' "$ENV_PS1" | base64 -w0)
+  SSH "[IO.File]::WriteAllText('C:\\e2e\\env.ps1',[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ENV_B64')))"
 fi
-[ -n "${UFOAGENT_BETA_URL:-}" ] && SSH "Add-Content C:\\e2e\\env.ps1 -Encoding Ascii -Value \"\\\$env:UFOAGENT_BETA_URL='${UFOAGENT_BETA_URL}'\""
 # Windows PowerShell 5.1 reads BOM-less UTF-8 as ANSI (mangles em-dashes in helpers.ps1 -> parse errors).
 # Re-encode every staged .ps1 as UTF-8 WITH BOM, reading bytes as UTF-8 explicitly via .NET.
 SSH 'Get-ChildItem C:\e2e -Recurse -Filter *.ps1 | ForEach-Object { $c=[IO.File]::ReadAllText($_.FullName); [IO.File]::WriteAllText($_.FullName, $c, (New-Object System.Text.UTF8Encoding $true)) }; "reencoded utf8-bom"'
