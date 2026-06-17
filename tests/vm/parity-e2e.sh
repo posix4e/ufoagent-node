@@ -38,16 +38,18 @@ trap cleanup EXIT
 rc() { az vm run-command invoke -g "$RG" -n "$VM" --command-id RunPowerShellScript --scripts "$1" --query "value[0].message" -o tsv 2>/dev/null || true; }
 
 # Run an e2e script in the interactive Session 1 via a scheduled task, capture its exit code + log.
-# $1 = short name, $2 = absolute .ps1 path on the VM. Echoes the captured log; sets global RC1.
+# $1 = short name, $2 = absolute .ps1 path on the VM, $3 = optional extra launcher lines (cd / set PATH)
+# prepended before the powershell call. Echoes the captured log; sets global RC1.
 RC1=0
 run_session1() {
-  local name="$1" script="$2"
+  local name="$1" script="$2" pre="${3:-}"
   rc "
 \$ErrorActionPreference='SilentlyContinue'
 Remove-Item C:\\rt\\$name.rc,C:\\rt\\$name.log -ErrorAction SilentlyContinue
 # No-spaces launcher: set RUNNER_TEMP (the e2e scripts' shots dir), run the script, capture exit + log.
 # (Task Scheduler gives the task a fresh env block, so machine-env tokens are also visible here.)
 Set-Content C:\\rt\\$name-launch.cmd -Value 'set RUNNER_TEMP=C:\\rt
+$pre
 powershell -NoProfile -ExecutionPolicy Bypass -File \"$script\" > C:\\rt\\$name.log 2>&1
 echo %ERRORLEVEL% > C:\\rt\\$name.rc' -Encoding Ascii
 schtasks /Create /TN P_$name /TR C:\\rt\\$name-launch.cmd /SC ONCE /ST 23:30 /RU $ADMIN_USER /IT /RL HIGHEST /F | Out-Null
@@ -183,8 +185,17 @@ if [ "$HAVE_TOKEN" = "1" ]; then
   run_session1 localtask "$E2EDIR\\local-task.ps1"; echo "  local-task rc=$RC1"; [ "$RC1" = "0" ] || fails+=("local-task(rc=$RC1)")
   echo "=== [s1] remote-task ==="
   run_session1 remotetask "$E2EDIR\\remote-task.ps1"; echo "  remote-task rc=$RC1"; [ "$RC1" = "0" ] || fails+=("remote-task(rc=$RC1)")
+
+  # taskbar: FlaUI drives the tray menu (Run a task -> visible window, View log, activity LLM dialog).
+  # Needs the VISIBLE tray icon (icon-fix build) + .NET 8 for `dotnet run` of tests/gui/TrayTest.
+  echo "=== [s1] taskbar (FlaUI tray menu + activity) — installing .NET 8 ==="
+  rc "if(-not (Test-Path C:\\dotnet\\dotnet.exe)){ try{ & ([scriptblock]::Create((Invoke-RestMethod https://dot.net/v1/dotnet-install.ps1))) -Channel 8.0 -InstallDir C:\\dotnet -NoPath }catch{'dotnet install: '+\$_.Exception.Message} }; 'dotnet: '+(Test-Path C:\\dotnet\\dotnet.exe)" | tail -1
+  REPO_ROOT="$(rc '([Environment]::GetEnvironmentVariable("E2E_DIR","Machine") | Split-Path | Split-Path)' | tr -d '\r')"
+  run_session1 taskbar "$E2EDIR\\taskbar.ps1" "cd /d $REPO_ROOT
+set PATH=C:\\dotnet;%PATH%"
+  echo "  taskbar rc=$RC1"; [ "$RC1" = "0" ] || fails+=("taskbar(rc=$RC1)")
 else
-  echo "=== [s1] run_task (local + remote) SKIPPED (no CI_AGENT_TOKEN / no LLM credential) ==="
+  echo "=== [s1] run_task (local + remote) + taskbar SKIPPED (no CI_AGENT_TOKEN / no LLM credential) ==="
 fi
 
 # 5) assemble GIFs (Session 0; needs the frames local-task recorded).
