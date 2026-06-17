@@ -225,7 +225,17 @@ fi
 
 # 5) assemble GIFs (Session 0; needs the frames local-task recorded).
 echo "=== [s0] assemble-gifs ==="
-rc "\$env:RUNNER_TEMP='C:\\rt'; & '$E2EDIR\\assemble-gifs.ps1'" | tail -6 || true
+# assemble-gifs.ps1 falls back to `choco install ffmpeg`, but a bare VM has no choco → no gifs. Fetch a
+# static ffmpeg (BtbN's stable 'latest' build) and put it on PATH so assemble-gifs finds it + skips choco.
+rc "\$env:RUNNER_TEMP='C:\\rt'
+if(-not (Get-Command ffmpeg -EA SilentlyContinue)){
+  [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12
+  try{ Invoke-WebRequest -UseBasicParsing 'https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/ffmpeg-master-latest-win64-gpl.zip' -OutFile C:\\rt\\ff.zip
+       Expand-Archive -Force C:\\rt\\ff.zip C:\\rt\\ffx
+       \$ffdir=(Get-ChildItem C:\\rt\\ffx -Recurse -Filter ffmpeg.exe | Select-Object -First 1).DirectoryName
+       if(\$ffdir){ \$env:Path = \$ffdir + ';' + \$env:Path; 'ffmpeg staged: '+\$ffdir } }catch{ 'ffmpeg fetch failed: '+\$_.Exception.Message }
+}
+& '$E2EDIR\\assemble-gifs.ps1'" | tail -8 || true
 
 # 6) pull all shots off the VM.
 echo "=== uploading shots from VM ==="
