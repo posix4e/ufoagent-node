@@ -65,13 +65,18 @@ impl WsState {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
-    /// Drop queued `environments` frames. The `hello` sent on (re)connect carries the authoritative
-    /// current env state, so any env deltas queued while disconnected are stale — draining them after
-    /// the hello would clobber the server with an old state (the flaky "ready vs installing" we saw).
-    /// Results/status frames are kept (those must still be delivered). Called right after hello.
-    fn drop_env_frames(&self) {
+    /// Drop queued transient state frames. The `hello` sent on (re)connect carries the authoritative
+    /// current env + desktop state, so deltas queued while disconnected are stale — draining them
+    /// after the hello could clobber the server with an old state. Results/status frames are kept
+    /// (those must still be delivered). Called right after hello.
+    fn drop_transient_state_frames(&self) {
         if let Ok(mut q) = self.outbound.lock() {
-            q.retain(|v| v.get("type").and_then(Value::as_str) != Some("environments"));
+            q.retain(|v| {
+                !matches!(
+                    v.get("type").and_then(Value::as_str),
+                    Some("environments" | "desktop")
+                )
+            });
         }
     }
 }
@@ -141,9 +146,10 @@ fn connect_and_serve(
     set_read_timeout(&mut socket, READ_TIMEOUT);
 
     let environments = serde_json::to_value(crate::env::report_all()).unwrap_or(Value::Null);
+    let desktop = serde_json::to_value(taskqueue::desktop_report(20)).unwrap_or(Value::Null);
     send(
         &mut socket,
-        json!({ "type": "hello", "agent_version": version, "platform": daemon::platform(), "environments": environments }),
+        json!({ "type": "hello", "agent_version": version, "platform": daemon::platform(), "environments": environments, "desktop": desktop }),
     )?;
     log::info!(
         "ws: connected to control plane (ufoagent {version}); environments: {}",
@@ -151,7 +157,7 @@ fn connect_and_serve(
     );
     // The hello above carries the current env state; discard any stale env deltas queued while we
     // were disconnected so they can't drain afterward and overwrite it with an older state.
-    state.drop_env_frames();
+    state.drop_transient_state_frames();
     state.connected.store(true, Ordering::Relaxed);
 
     let mut last_ping = Instant::now();
@@ -298,14 +304,9 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             state.queue_send(json!({ "type": "status", "current_task": Value::Null }));
         };
 
-        // No live desktop session means no tray to run UFO2 — fail fast and actionably.
-        if !taskqueue::tray_alive(20) {
-            finish(
-                &state,
-                "failed",
-                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
-                    .to_string(),
-            );
+        // No live, usable desktop means no tray worker can drive UFO2 — fail fast and actionably.
+        if let Some(reason) = taskqueue::gate_desktop(20) {
+            finish(&state, "failed", reason);
             return;
         }
 
@@ -350,14 +351,9 @@ fn spawn_screenshot(state: Arc<WsState>, id: String, control_plane: String) {
             state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
         };
 
-        // No live desktop session means no tray to capture the screen — fail fast and actionably.
-        if !taskqueue::tray_alive(20) {
-            finish(
-                &state,
-                "failed",
-                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
-                    .to_string(),
-            );
+        // No live, usable desktop means no tray worker can capture the screen — fail fast and actionably.
+        if let Some(reason) = taskqueue::gate_desktop(20) {
+            finish(&state, "failed", reason);
             return;
         }
 
@@ -464,16 +460,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_env_frames_keeps_results_and_status() {
+    fn drop_transient_state_frames_keeps_results_and_status() {
         let s = WsState::new();
         s.queue_send(json!({ "type": "environments", "environments": [] }));
+        s.queue_send(
+            json!({ "type": "desktop", "desktop": { "state": "ready", "updated_at": 1 } }),
+        );
         s.queue_send(json!({ "type": "result", "id": "x", "status": "done" }));
         s.queue_send(json!({ "type": "status", "current_task": "y" }));
         s.queue_send(json!({ "type": "environments", "environments": [] }));
-        s.drop_env_frames();
+        s.drop_transient_state_frames();
         let left = s.drain_outbound();
-        assert_eq!(left.len(), 2, "both environments frames should be dropped");
+        assert_eq!(
+            left.len(),
+            2,
+            "environment and desktop frames should be dropped"
+        );
         assert!(left.iter().all(|v| v["type"] != "environments"));
+        assert!(left.iter().all(|v| v["type"] != "desktop"));
         assert_eq!(left[0]["type"], "result");
         assert_eq!(left[1]["type"], "status");
     }

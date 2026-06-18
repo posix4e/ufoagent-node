@@ -38,6 +38,25 @@ pub struct TaskResult {
     pub result: String,
 }
 
+/// Whether the in-session worker has a desktop UFO2 can drive. This is intentionally separate from
+/// WebSocket/node liveness: a service can be online while Windows has no usable GUI session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DesktopState {
+    Ready,
+    Unavailable,
+}
+
+/// Structured content of `tasks/tray-alive`. Older agents wrote only a timestamp; readers tolerate
+/// that as a legacy "ready" marker when it is fresh, so rolling updates do not strand a live tray.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DesktopReport {
+    pub state: DesktopState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    pub updated_at: i64,
+}
+
 fn tasks_dir() -> PathBuf {
     config_dir().join("tasks")
 }
@@ -83,19 +102,69 @@ pub fn take_screenshot(id: &str) -> Option<Vec<u8>> {
 }
 
 /// True if the tray touched its liveness marker within `max_age_secs` — i.e. there's a live
-/// interactive session that can actually run the task. Lets the service fail fast instead of
-/// queuing into the void when nobody is logged in.
+/// interactive worker process. This says the worker is alive, not that the desktop is usable; call
+/// `gate_desktop` before queuing GUI work.
+#[allow(dead_code)] // Windows service watchdog uses this; non-Windows clippy sees it as unused.
 pub fn tray_alive(max_age_secs: u64) -> bool {
-    let Ok(meta) = std::fs::metadata(alive_path()) else {
-        return false;
+    marker_fresh(max_age_secs).is_some()
+}
+
+/// Current usable-desktop verdict from the tray marker. A missing/stale marker means the service may
+/// be online but there is no confirmed interactive worker, so GUI commands should not be accepted.
+pub fn desktop_report(max_age_secs: u64) -> DesktopReport {
+    let stale = |detail: &str| DesktopReport {
+        state: DesktopState::Unavailable,
+        detail: Some(detail.to_string()),
+        updated_at: 0,
     };
-    let Ok(modified) = meta.modified() else {
-        return false;
+    let Some(path) = marker_fresh(max_age_secs) else {
+        return stale("no fresh interactive desktop worker");
     };
+
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return stale("desktop worker marker is unreadable");
+    };
+    if let Ok(mut report) = serde_json::from_str::<DesktopReport>(&raw) {
+        if report.updated_at <= 0 {
+            report.updated_at = crate::util::now();
+        }
+        return report;
+    }
+
+    // Legacy marker was just the timestamp as text. Treat a fresh legacy marker as ready because a
+    // live older tray can still run tasks; the next tray restart will upgrade the marker format.
+    DesktopReport {
+        state: DesktopState::Ready,
+        detail: Some("desktop worker alive (legacy marker)".to_string()),
+        updated_at: raw.trim().parse().unwrap_or_else(|_| crate::util::now()),
+    }
+}
+
+fn marker_fresh(max_age_secs: u64) -> Option<PathBuf> {
+    let path = alive_path();
+    let meta = std::fs::metadata(&path).ok()?;
+    let modified = meta.modified().ok()?;
     modified
         .elapsed()
-        .map(|e| e.as_secs() <= max_age_secs)
-        .unwrap_or(false)
+        .ok()
+        .filter(|e| e.as_secs() <= max_age_secs)
+        .map(|_| path)
+}
+
+/// Human-readable reason a GUI command should not run, or `None` when a usable desktop is present.
+pub fn gate_desktop(max_age_secs: u64) -> Option<String> {
+    let r = desktop_report(max_age_secs);
+    match r.state {
+        DesktopState::Ready => None,
+        DesktopState::Unavailable => Some(match r.detail {
+            Some(d) => format!(
+                "desktop unavailable: {d}; sign in or run `ufoagent autologon` on this node"
+            ),
+            None => {
+                "desktop unavailable; sign in or run `ufoagent autologon` on this node".to_string()
+            }
+        }),
+    }
 }
 
 // ---- tray side (consumer) — compiled on Windows (the tray) and in tests ----
@@ -105,9 +174,23 @@ pub fn tray_alive(max_age_secs: u64) -> bool {
 pub fn touch_alive() -> Result<()> {
     let dir = tasks_dir();
     std::fs::create_dir_all(&dir)?;
-    // Only the file's mtime matters to tray_alive(); the content is informational.
-    std::fs::write(alive_path(), crate::util::now().to_string())?;
+    let report = probe_desktop();
+    std::fs::write(alive_path(), serde_json::to_vec(&report)?)?;
     Ok(())
+}
+
+#[cfg(all(windows, not(test)))]
+fn probe_desktop() -> DesktopReport {
+    imp::probe_desktop()
+}
+
+#[cfg(test)]
+fn probe_desktop() -> DesktopReport {
+    DesktopReport {
+        state: DesktopState::Ready,
+        detail: None,
+        updated_at: crate::util::now(),
+    }
 }
 
 /// Pop the next pending task (oldest first), removing its inbox file. `None` if the inbox is empty.
@@ -216,6 +299,156 @@ mod tests {
             assert!(!tray_alive(15));
             touch_alive().unwrap();
             assert!(tray_alive(15));
+            let r = desktop_report(15);
+            assert_eq!(r.state, DesktopState::Ready);
+            assert!(gate_desktop(15).is_none());
         });
+    }
+
+    #[test]
+    fn stale_or_unavailable_desktop_gates_gui_work() {
+        with_temp(|| {
+            assert!(gate_desktop(15).unwrap().contains("desktop unavailable"));
+            std::fs::create_dir_all(tasks_dir()).unwrap();
+            std::fs::write(
+                alive_path(),
+                serde_json::to_vec(&DesktopReport {
+                    state: DesktopState::Unavailable,
+                    detail: Some("desktop is locked".into()),
+                    updated_at: crate::util::now(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+            let reason = gate_desktop(15).unwrap();
+            assert!(reason.contains("desktop is locked"));
+            assert!(tray_alive(15));
+        });
+    }
+}
+
+#[cfg(all(windows, not(test)))]
+mod imp {
+    use super::{DesktopReport, DesktopState};
+
+    pub fn probe_desktop() -> DesktopReport {
+        let updated_at = crate::util::now();
+        let mut problems = Vec::new();
+
+        if let Some(state) = session_connect_state() {
+            if state != "active" {
+                problems.push(format!("session is {state}"));
+            }
+        }
+
+        match input_desktop_name() {
+            Some(name) if name.eq_ignore_ascii_case("Default") => {}
+            Some(name) => problems.push(format!("input desktop is {name}")),
+            None => problems.push("input desktop is unavailable".to_string()),
+        }
+
+        if problems.is_empty() {
+            DesktopReport {
+                state: DesktopState::Ready,
+                detail: None,
+                updated_at,
+            }
+        } else {
+            DesktopReport {
+                state: DesktopState::Unavailable,
+                detail: Some(problems.join("; ")),
+                updated_at,
+            }
+        }
+    }
+
+    fn session_connect_state() -> Option<&'static str> {
+        use std::ffi::c_void;
+        use windows::core::PWSTR;
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::RemoteDesktop::{
+            ProcessIdToSessionId, WTSActive, WTSConnectQuery, WTSConnectState, WTSConnected,
+            WTSDisconnected, WTSDown, WTSFreeMemory, WTSIdle, WTSInit, WTSListen,
+            WTSQuerySessionInformationW, WTSReset, WTSShadow, WTS_CONNECTSTATE_CLASS,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+
+        let mut session = 0u32;
+        unsafe {
+            ProcessIdToSessionId(GetCurrentProcessId(), &mut session).ok()?;
+
+            let mut buf = PWSTR::null();
+            let mut len = 0u32;
+            WTSQuerySessionInformationW(
+                HANDLE::default(),
+                session,
+                WTSConnectState,
+                &mut buf,
+                &mut len,
+            )
+            .ok()?;
+            if buf.is_null() {
+                return None;
+            }
+            let state = *(buf.0 as *const WTS_CONNECTSTATE_CLASS);
+            WTSFreeMemory(buf.0 as *mut c_void);
+            Some(if state == WTSActive {
+                "active"
+            } else if state == WTSConnected {
+                "connected"
+            } else if state == WTSConnectQuery {
+                "connect-query"
+            } else if state == WTSShadow {
+                "shadow"
+            } else if state == WTSDisconnected {
+                "disconnected"
+            } else if state == WTSIdle {
+                "idle"
+            } else if state == WTSListen {
+                "listening"
+            } else if state == WTSReset {
+                "resetting"
+            } else if state == WTSDown {
+                "down"
+            } else if state == WTSInit {
+                "initializing"
+            } else {
+                "unknown"
+            })
+        }
+    }
+
+    fn input_desktop_name() -> Option<String> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::StationsAndDesktops::{
+            CloseDesktop, GetUserObjectInformationW, OpenInputDesktop, DESKTOP_READOBJECTS,
+            UOI_NAME,
+        };
+
+        unsafe {
+            let desktop = OpenInputDesktop(Default::default(), false, DESKTOP_READOBJECTS).ok()?;
+            let desktop_handle = HANDLE(desktop.0);
+
+            let mut needed = 0u32;
+            let _ = GetUserObjectInformationW(desktop_handle, UOI_NAME, None, 0, Some(&mut needed));
+            if needed == 0 {
+                let _ = CloseDesktop(desktop);
+                return None;
+            }
+            let mut buf = vec![0u16; (needed as usize).div_ceil(2)];
+            let read_name = GetUserObjectInformationW(
+                desktop_handle,
+                UOI_NAME,
+                Some(buf.as_mut_ptr() as *mut _),
+                needed,
+                Some(&mut needed),
+            );
+            let _ = CloseDesktop(desktop);
+            read_name.ok()?;
+            if let Some(pos) = buf.iter().position(|&c| c == 0) {
+                buf.truncate(pos);
+            }
+            String::from_utf16(&buf).ok()
+        }
     }
 }

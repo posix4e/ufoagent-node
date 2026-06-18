@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, Credential};
 use crate::status::{self, Status};
-use crate::{env, store, ufo_config, update, util, ws};
+use crate::{env, store, taskqueue, ufo_config, update, util, ws};
 
 pub fn platform() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
@@ -74,6 +74,9 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     };
     // Last environment report we pushed — resend only on change (the hello carries the initial one).
     let mut last_envs: Option<Vec<env::EnvReport>> = None;
+    // Last desktop availability report pushed — separate from WS liveness so "online but no GUI" is
+    // visible and can gate run_task/screenshot.
+    let mut last_desktop: Option<taskqueue::DesktopReport> = None;
 
     // Path to our own exe, to (re)launch the tray into the interactive session below.
     let self_exe = std::env::current_exe().ok();
@@ -108,6 +111,26 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
         //     if the tray dies). No-op when nobody's logged on or a tray is already alive.
         if let Some(exe) = self_exe.as_deref() {
             crate::session::ensure_tray_in_active_session(exe);
+        }
+        let desktop = taskqueue::desktop_report(20);
+        st.desktop_state = Some(match desktop.state {
+            taskqueue::DesktopState::Ready => "ready".to_string(),
+            taskqueue::DesktopState::Unavailable => "unavailable".to_string(),
+        });
+        st.desktop_detail = desktop.detail.clone();
+        if last_desktop.as_ref() != Some(&desktop) {
+            if let Ok(v) = serde_json::to_value(&desktop) {
+                ws_state.queue_send(serde_json::json!({ "type": "desktop", "desktop": v }));
+                info!(
+                    "desktop availability changed -> {}{}",
+                    st.desktop_state.as_deref().unwrap_or("unknown"),
+                    st.desktop_detail
+                        .as_deref()
+                        .map(|d| format!(" ({d})"))
+                        .unwrap_or_default()
+                );
+            }
+            last_desktop = Some(desktop);
         }
 
         // 2b) Environment health — push a delta when install state changes (e.g. bootstrap, running
