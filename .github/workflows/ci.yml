@@ -1,23 +1,28 @@
 name: ci
 
 # Fast per-PR gate: lint, unit tests, compile, and build the Inno installer. On main, when that passes,
-# publish the exact installer to the rolling `beta` prerelease. Production stays on v* tags -> `latest`
-# (release.yml).
+# publish the exact installer to the rolling `beta` prerelease, then verify that beta on the headful
+# self-hosted Windows VM. Production stays on v* tags -> `latest` (release.yml).
 #
-# The full end-to-end — install + cold-provision on a BARE Windows VM + auto-logon + run_task GUI + tray
-# menu + linked smoke + the marketing screenshots — is NOT here: it runs on a real headful VM in
-# selfhost-e2e.yml (workflow_run, right after this `ci` publishes beta), reusing the same tests/e2e +
-# tests/gui scripts. A GitHub runner can't represent a bare customer box (it preinstalls VC++/MFC,
-# Python, .NET) nor reboot into an auto-logon session — which is how the win32ui/MFC + login-agent
-# bugs shipped "green" here before. So beta is gated by build, then verified on the VM after publish.
+# The full end-to-end installs and cold-provisions on a BARE Windows VM with auto-logon, then proves
+# run_task GUI automation, screenshot capture, dashboard preview, and the marketing screenshots. It runs
+# only for trusted main/manual events on a real headful VM. A GitHub runner can't represent a bare customer
+# box (it preinstalls VC++/MFC, Python, .NET) nor reboot into an auto-logon session, which is how the
+# win32ui/MFC + login-agent bugs shipped "green" here before.
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
+    inputs:
+      beta_url:
+        description: "Override the beta installer URL for the self-hosted e2e (optional)"
+        required: false
+        default: ""
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   build:
@@ -61,7 +66,7 @@ jobs:
           path: ${{ runner.temp }}/ufoagent-setup.exe
           if-no-files-found: error
 
-      # Publish the rolling beta on main once build/unit/compile pass. selfhost-e2e.yml then verifies
+      # Publish the rolling beta on main once build/unit/compile pass. The selfhost-e2e job then verifies
       # THIS exact beta on a real bare VM right after (verify-after-publish for a rolling prerelease).
       - name: Publish rolling beta (main only)
         if: github.event_name == 'push'
@@ -82,3 +87,54 @@ jobs:
           fi
           gh release upload beta "$setup" --clobber
           echo "beta -> $GITHUB_SHA"
+
+  selfhost-e2e:
+    name: self-hosted e2e
+    needs: build
+    # Trusted events only. Never run the self-hosted box for pull_request, especially fork PRs.
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, kvm-winvm]
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    concurrency:
+      group: selfhost-e2e
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: installer
+          path: selfhost-installer
+
+      - name: Run the journey (revert cold -> record -> install/tray/link/remote/dashboard -> slice)
+        env:
+          CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
+          CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
+          CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
+          UFOAGENT_BETA_URL: ${{ github.event.inputs.beta_url || '' }}
+          UFOAGENT_INSTALLER_PATH: ${{ github.workspace }}/selfhost-installer/ufoagent-setup.exe
+        run: bash tests/selfhost/run-e2e.sh
+
+      - name: Publish the marketing gifs to the screenshots branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          g=/mnt/ram/e2e/gifs
+          rm -rf pub && mkdir pub
+          # The site uses install-screen.gif, link-screen.gif, remote-task.gif, and mission-control.gif.
+          # Publish gif + a still fallback for each; missing ones are skipped.
+          for f in install-screen link-screen remote-task mission-control; do
+            cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
+            cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
+          done
+          # The raw captured desktop still powers dashboard previews and the website node image.
+          cp "$g/node-desktop.png" "pub/node-desktop.png" 2>/dev/null || true
+          ls -la pub
+          cd pub && git init -q && git checkout -q -b screenshots
+          git add .
+          git -c user.email=ci@ufoagent.xyz -c user.name='ufoagent ci' commit -q -m "screenshots from self-hosted e2e ${GITHUB_SHA}"
+          git push -f "https://x-access-token:${GH_TOKEN}@github.com/ufoagent/ufoagent-node.git" screenshots
+          echo "published from ${GITHUB_SHA}"

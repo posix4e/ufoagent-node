@@ -209,14 +209,32 @@ mod imp {
         cmd.env("UFOAGENT_REMOTE_TASK", "1");
         // No flashing console on the user's desktop while UFO2 drives the GUI — run it headless.
         cmd.creation_flags(CREATE_NO_WINDOW);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = match cmd.spawn() {
             Ok(c) => c,
+            Err(e) if e.raw_os_error() == Some(50) => {
+                log::warn!(
+                    "tray: hidden task runner launch unsupported ({e}); retrying without CREATE_NO_WINDOW"
+                );
+                cmd.creation_flags(0);
+                match cmd.spawn() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        return runtime::RemoteTaskResult {
+                            id: req.id.clone(),
+                            status: "failed".into(),
+                            result: format!("could not launch task runner after retry: {e}"),
+                        }
+                    }
+                }
+            }
             Err(e) => {
                 return runtime::RemoteTaskResult {
                     id: req.id.clone(),
                     status: "failed".into(),
-                    result: format!("could not launch UFO2: {e}"),
+                    result: format!("could not launch task runner: {e}"),
                 }
             }
         };
