@@ -1,5 +1,5 @@
 # First-principles e2e on the self-hosted KVM box: one bare Windows VM, one journey, recorded end to end,
-# sliced into the marketing gifs. Replaces the Azure cold-vm harness. SECURITY: this repo is public and
+# sliced into the marketing gifs. Replaces the old Azure VM harness. SECURITY: this repo is public and
 # this job runs on a self-hosted runner, so it triggers ONLY on trusted events — manual dispatch and (added
 # at cut-over) workflow_run after a green `ci` on main. NEVER on pull_request (a fork must not run on the box).
 name: selfhost-e2e
@@ -10,7 +10,7 @@ on:
         description: "Override the beta installer URL (optional)"
         required: false
         default: ""
-  # Verify the published beta after a green `ci` on main (same model the old cold-vm used). Trusted
+  # Verify the published beta after a green `ci` on main (same model the old Azure VM harness used). Trusted
   # events only — never pull_request — so a fork can't run on the self-hosted box.
   workflow_run:
     workflows: [ci]
@@ -32,7 +32,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run the journey (revert cold -> record -> install/tray/link/local/remote/activity -> slice)
+      - name: Run the journey (revert cold -> record -> install/tray/link/remote/dashboard -> slice)
         env:
           CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
           CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
@@ -48,10 +48,9 @@ jobs:
           set -euo pipefail
           g=/mnt/ram/e2e/gifs
           rm -rf pub && mkdir pub
-          # The site uses install-screen.gif, remote-task.gif, local-task.gif, activity-summary.gif (link is
-          # the robot SVG) + mission-control.gif (the dashboard). Publish gif + a still fallback for each;
-          # missing ones are skipped.
-          for f in install-screen link-screen local-task remote-task activity-summary mission-control; do
+          # The site uses install-screen.gif, link-screen.gif, remote-task.gif, and mission-control.gif.
+          # Publish gif + a still fallback for each; missing ones are skipped.
+          for f in install-screen link-screen remote-task mission-control; do
             cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
             cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
           done

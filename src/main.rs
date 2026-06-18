@@ -1,4 +1,6 @@
 mod activity;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod agent;
 mod autologon;
 mod bootstrap;
 #[cfg(windows)]
@@ -7,20 +9,21 @@ mod cli;
 mod cmdlog;
 mod config;
 mod controlplane;
-mod daemon;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod env;
 mod linker;
 mod qr;
 mod repair;
-mod service;
-mod session;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod runtime;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod status;
 mod store;
-mod taskqueue;
 mod tray;
 mod ufo_config;
 mod update;
 mod util;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod ws;
 
 use anyhow::Result;
@@ -48,20 +51,18 @@ fn cmd_label(cmd: &Cmd) -> &'static str {
         Cmd::Configure { .. } => "configure",
         Cmd::Link { .. } => "link",
         Cmd::Refresh => "refresh",
-        Cmd::RunDaemon => "run-daemon",
         Cmd::Run { .. } => "run",
         Cmd::Bootstrap { .. } => "bootstrap",
         Cmd::Repair => "repair",
         Cmd::Activity { .. } => "activity",
         Cmd::Update { .. } => "update",
-        Cmd::Service { .. } => "service",
         Cmd::Tray => "tray",
         Cmd::Autologon { .. } => "autologon",
     }
 }
 
 /// Set up logging. Always writes to the rotating log file; additionally mirrors to stderr
-/// unless `quiet` (tray/service run without a console, so a stderr logger would either be lost
+/// unless `quiet` (the tray agent runs without a console, so a stderr logger would either be lost
 /// or spew into a parent shell — file-only is correct there).
 fn init_logging(quiet: bool) {
     use simplelog::{
@@ -110,21 +111,21 @@ fn main() -> Result<()> {
     set_utf8_console();
     // Bare `ufoagent.exe` (no subcommand) opens the tray manager.
     let cmd = Cli::parse().cmd.unwrap_or(Cmd::Tray);
-    // The tray and service run without an attached console; keep their logging file-only so
-    // they don't write to a parent shell (or a dead stderr).
-    let quiet = matches!(cmd, Cmd::Tray | Cmd::Service { .. });
+    // The tray agent runs without an attached console; keep its logging file-only so it doesn't
+    // write to a parent shell (or a dead stderr).
+    let quiet = matches!(cmd, Cmd::Tray);
     init_logging(quiet);
     let label = cmd_label(&cmd);
-    // The tray/service run without a console, so a panic (or a returned Err, below) would otherwise
+    // The tray agent runs without a console, so a panic (or a returned Err, below) would otherwise
     // vanish — printed to a dead stderr and never logged. Route panics to the file log so we can see
     // why a long-lived process died (e.g. the tray failing to build its icon on a bare VM).
     std::panic::set_hook(Box::new(|info| log::error!("panic: {info}")));
     // Stamp the exact build at the top of every run — so `ufoagent.log` always answers "what's
-    // running?" (especially for the long-lived service/tray) without needing the dashboard.
+    // running?" (especially for the long-lived tray agent) without needing the dashboard.
     log::info!(
         "ufoagent {} {} starting (cmd={})",
         build_string(),
-        daemon::platform(),
+        agent::platform(),
         label
     );
     let result: Result<()> = (|| {
@@ -158,13 +159,12 @@ fn main() -> Result<()> {
             Cmd::Refresh => {
                 let c = Config::load();
                 let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
-                let cred = daemon::refresh_once(&cp, &c.ufo_home_path())?;
+                let cred = agent::refresh_once(&cp, &c.ufo_home_path())?;
                 println!(
                     "credential written: lease={} model={} expires_at={}",
                     cred.lease_id, cred.model, cred.expires_at
                 );
             }
-            Cmd::RunDaemon => daemon::run_daemon(VERSION, || false)?,
             Cmd::Run { task, request } => cmd_run(task, request)?,
             Cmd::Bootstrap {
                 ufo_home,
@@ -211,9 +211,9 @@ fn main() -> Result<()> {
                 );
                 if apply {
                     match update::maybe_self_update(&c, VERSION, Some(&s.min_version)) {
-                    Ok(true) => {
-                        println!("update downloaded + verified; installer launched (service will restart)")
-                    }
+                    Ok(true) => println!(
+                        "update downloaded + verified; installer launched (login agent will restart)"
+                    ),
                     Ok(false) => println!(
                         "no update applied (already current, disabled, or signature check refused — see log)"
                     ),
@@ -221,14 +221,28 @@ fn main() -> Result<()> {
                 }
                 }
             }
-            Cmd::Service { action } => service::run_action(&action)?,
             Cmd::Tray => tray::run(VERSION)?,
             Cmd::Autologon {
                 user,
                 password,
                 domain,
                 disable,
-            } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
+                pause,
+            } => {
+                let result = autologon::run(
+                    user.as_deref(),
+                    password.as_deref(),
+                    domain.as_deref(),
+                    disable,
+                );
+                if let Err(e) = &result {
+                    eprintln!("\n  Unattended GUI setup failed: {e:#}\n");
+                }
+                if pause {
+                    pause_enter();
+                }
+                result?;
+            }
         }
         Ok(())
     })();
@@ -306,7 +320,7 @@ fn cmd_link(
         println!("  Or open:       {uri}\n");
         println!("  Waiting for approval…");
     };
-    let (agent_id, token) = linker::link(&cp, &host, &daemon::platform(), announce, 600)?;
+    let (agent_id, token) = linker::link(&cp, &host, &agent::platform(), announce, 600)?;
     store::set_token(&token)?;
     println!("\n  Linked \u{2713}  as {host}  (agent {agent_id})\n");
     if pause {
@@ -317,12 +331,12 @@ fn cmd_link(
 
 fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     // Gate on the target environment first. This is the shared local launcher — the tray "Run a
-    // task…" menu, the tray's queue consumer, and the CLI all reach UFO2 through here — so without
-    // this gate a run mid-install died with a raw "not provisioned". Now it refuses with the same
-    // friendly message as the dashboard/remote path. ufo2 is the only env today.
+    // task…" menu, the remote executor, and the CLI all reach UFO2 through here — so without this
+    // gate a run mid-install died with a raw "not provisioned". Now it refuses with the same friendly
+    // message as the dashboard/remote path. ufo2 is the only env today.
     if let Some(reason) = env::gate(env::UFO2) {
-        // The service already records queue/remote runs; don't double-log when invoked from the queue.
-        if std::env::var("UFOAGENT_FROM_QUEUE").is_err() {
+        // The connection loop already records remote runs; don't double-log the child process.
+        if std::env::var("UFOAGENT_REMOTE_TASK").is_err() {
             cmdlog::record(
                 "local",
                 "run_task",
@@ -339,7 +353,7 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     let c = Config::load();
     let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
     let home = c.ufo_home_path();
-    daemon::refresh_once(&cp, &home)?;
+    agent::refresh_once(&cp, &home)?;
     let python = c
         .python
         .clone()
@@ -353,10 +367,10 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     // and UFO2's post-task markdown log prints emoji (✅) — UnicodeEncodeError → exit 1 even after
     // the task succeeded (issue #8, second layer).
     cmd.env("PYTHONUTF8", "1");
-    // When the tray drives this off the queue, run UFO2 headless too — no console flashing on the
-    // desktop while it works (the tray already runs `ufoagent run` itself with no window).
+    // When the tray drives a remote task, run UFO2 headless too — no console flashing on the desktop
+    // while it works (the tray already runs `ufoagent run` itself with no window).
     #[cfg(windows)]
-    if std::env::var("UFOAGENT_FROM_QUEUE").is_ok() {
+    if std::env::var("UFOAGENT_REMOTE_TASK").is_ok() {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -372,9 +386,9 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
         home.display()
     );
     let st = cmd.status()?;
-    // Record in the on-node command history — unless the tray ran us off the remote queue, in which
-    // case the service already logged it as a remote command (avoid double-counting).
-    if std::env::var("UFOAGENT_FROM_QUEUE").is_err() {
+    // Record in the on-node command history — unless the tray ran us as a remote task, in which case
+    // the connection loop already logged it as a remote command (avoid double-counting).
+    if std::env::var("UFOAGENT_REMOTE_TASK").is_err() {
         let status = if st.success() { "done" } else { "failed" };
         cmdlog::record("local", "run_task", request.as_deref(), status, None);
     }

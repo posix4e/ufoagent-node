@@ -11,9 +11,7 @@ command -v jq >/dev/null || { echo "jq missing on host"; exit 1; }
 gifname(){ case "$1" in
   install)   echo install-screen;;
   link)      echo link-screen;;
-  local)     echo local-task;;
   remote)    echo remote-task;;
-  activity)  echo activity-summary;;
   dashboard) echo mission-control;;
   *)         echo "$1";; esac; }
 
@@ -30,6 +28,12 @@ if [ -n "$first" ]; then d=$(ffprobe -v error -select_streams v:0 -show_entries 
 
 for i in $(seq 0 $((n-1))); do
   label=$(echo "$PH" | jq -r ".[$i].label")
+  ok=$(echo "$PH" | jq -r ".[$i].ok // false")
+  skipped=$(echo "$PH" | jq -r ".[$i].skipped // false")
+  if [ "$ok" != "true" ] || [ "$skipped" = "true" ]; then
+    echo "  $label: skipped/failed phase - no asset"
+    continue
+  fi
   gs=$(echo "$PH" | jq -r ".[$i].start"); ge=$(echo "$PH" | jq -r ".[$i].end")
   hs=$(( gs + SKEW )); he=$(( ge + SKEW ))
   d="$OUT/frames-$label"; rm -rf "$d"; mkdir -p "$d"; k=0

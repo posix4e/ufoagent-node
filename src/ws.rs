@@ -17,21 +17,24 @@ use tungstenite::{Message, WebSocket};
 
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, USER_AGENT};
-use crate::{daemon, repair, store, taskqueue};
+use crate::{agent, repair, runtime, store};
 
-/// Max time we wait for the tray to finish a run_task before reporting a timeout.
+/// Max time we wait for the login-session executor to finish a run_task before reporting a timeout.
 const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(600);
-/// Screenshots are a quick GDI grab + PNG encode in the tray — give it a short, snappy ceiling.
+/// Screenshots are a quick GDI grab + PNG encode in the login session.
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Result strings are unbounded TEXT on the control plane; keep WS frames sane.
 const RESULT_MAX: usize = 8192;
+/// Live progress appears in the dashboard header; keep it compact.
+const PROGRESS_MAX: usize = 240;
+const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 type Sock = WebSocket<MaybeTlsStream<TcpStream>>;
 
 const PING_EVERY: Duration = Duration::from_secs(45);
 const READ_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Shared with the daemon thread: socket liveness (the tray's online state), the control plane's
+/// Shared with the login-agent loop: socket liveness, the control plane's
 /// minimum-version floor from the hello_ack (drives forced self-updates), and an outbound queue so
 /// background run_task workers can push results/status without owning the socket (the read loop
 /// drains and sends them — see `connect_and_serve`). The queue survives reconnects, so a result
@@ -65,13 +68,18 @@ impl WsState {
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
     }
-    /// Drop queued `environments` frames. The `hello` sent on (re)connect carries the authoritative
-    /// current env state, so any env deltas queued while disconnected are stale — draining them after
-    /// the hello would clobber the server with an old state (the flaky "ready vs installing" we saw).
-    /// Results/status frames are kept (those must still be delivered). Called right after hello.
-    fn drop_env_frames(&self) {
+    /// Drop queued transient state frames. The `hello` sent on (re)connect carries the authoritative
+    /// current env + desktop state, so deltas queued while disconnected are stale — draining them
+    /// after the hello could clobber the server with an old state. Results/status frames are kept
+    /// (those must still be delivered). Called right after hello.
+    fn drop_transient_state_frames(&self) {
         if let Ok(mut q) = self.outbound.lock() {
-            q.retain(|v| v.get("type").and_then(Value::as_str) != Some("environments"));
+            q.retain(|v| {
+                !matches!(
+                    v.get("type").and_then(Value::as_str),
+                    Some("environments" | "desktop")
+                )
+            });
         }
     }
 }
@@ -141,9 +149,10 @@ fn connect_and_serve(
     set_read_timeout(&mut socket, READ_TIMEOUT);
 
     let environments = serde_json::to_value(crate::env::report_all()).unwrap_or(Value::Null);
+    let desktop = serde_json::to_value(runtime::desktop_report(20)).unwrap_or(Value::Null);
     send(
         &mut socket,
-        json!({ "type": "hello", "agent_version": version, "platform": daemon::platform(), "environments": environments }),
+        json!({ "type": "hello", "agent_version": version, "platform": agent::platform(), "environments": environments, "desktop": desktop }),
     )?;
     log::info!(
         "ws: connected to control plane (ufoagent {version}); environments: {}",
@@ -151,7 +160,7 @@ fn connect_and_serve(
     );
     // The hello above carries the current env state; discard any stale env deltas queued while we
     // were disconnected so they can't drain afterward and overwrite it with an older state.
-    state.drop_env_frames();
+    state.drop_transient_state_frames();
     state.connected.store(true, Ordering::Relaxed);
 
     let mut last_ping = Instant::now();
@@ -203,11 +212,11 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
     let cmd = msg.get("kind").and_then(Value::as_str).unwrap_or("");
     log::info!("ws: command {cmd} ({id})");
 
-    // run_task drives the GUI, so it runs in the interactive session (the tray), and can take
+    // run_task drives the GUI, so it runs in the login-session executor, and can take
     // minutes — hand it to a worker so the read loop keeps pinging. The result/status come back
     // asynchronously via the outbound queue.
     if cmd == "run_task" {
-        // Self-gate before queuing: the control plane already gated on its last-reported state, but
+        // Self-gate before running: the control plane already gated on its last-reported state, but
         // the node has ground truth (the env may have broken since). Same words as the server.
         let env_name = msg
             .get("args")
@@ -238,7 +247,7 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
         return Ok(());
     }
 
-    // A screenshot is captured in the interactive session (the tray, like run_task) and the PNG is
+    // A screenshot is captured in the login-session executor, like run_task, and the PNG is
     // uploaded out-of-band to the control plane; hand it to a worker so the read loop keeps pinging.
     if cmd == "screenshot" {
         spawn_screenshot(state.clone(), id, cfg.control_plane_url());
@@ -258,7 +267,7 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
     match kind {
         "refresh" => {
             let cp = ControlPlane::new(&cfg.control_plane_url(), store::get_token());
-            match daemon::refresh_once(&cp, &cfg.ufo_home_path()) {
+            match agent::refresh_once(&cp, &cfg.ufo_home_path()) {
                 Ok(c) => (
                     "done",
                     format!("credential refreshed (lease {})", c.lease_id),
@@ -274,17 +283,18 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
     }
 }
 
-/// Hand a run_task to the Session-1 tray and report the result asynchronously. The service (this
-/// process) is in Session 0 with no desktop; the tray — already on the logged-in desktop — picks
-/// the task off the file queue, runs UFO2, and writes back the result.
+/// Hand a run_task to the login-session executor and report the result asynchronously. The executor
+/// runs UFO2 on the logged-in desktop and returns the result.
 fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option<String>) {
     std::thread::spawn(move || {
         let label = request.clone().unwrap_or_else(|| task.clone());
         let req_log = request.clone();
-        state.queue_send(json!({ "type": "status", "current_task": label }));
+        state.queue_send(
+            json!({ "type": "status", "current_task": truncate(&label, PROGRESS_MAX) }),
+        );
 
         let finish = |state: &WsState, status: &str, result: String| {
-            // On-node history (the tray's `ufoagent run` is suppressed via UFOAGENT_FROM_QUEUE so
+            // On-node history (the child `ufoagent run` is suppressed via UFOAGENT_REMOTE_TASK so
             // this remote entry is the single record of the task).
             crate::cmdlog::record(
                 "remote",
@@ -298,51 +308,75 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             state.queue_send(json!({ "type": "status", "current_task": Value::Null }));
         };
 
-        // No live desktop session means no tray to run UFO2 — fail fast and actionably.
-        if !taskqueue::tray_alive(20) {
-            finish(
-                &state,
-                "failed",
-                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
-                    .to_string(),
-            );
+        // No live, usable desktop means the executor cannot drive UFO2 — fail fast and actionably.
+        if let Some(reason) = runtime::gate_desktop(20) {
+            finish(&state, "failed", reason);
             return;
         }
 
-        let req = taskqueue::TaskRequest {
+        let req = runtime::RemoteTaskRequest {
             id: id.clone(),
-            kind: "run_task".into(),
             task,
             request,
         };
-        if let Err(e) = taskqueue::enqueue(&req) {
-            finish(&state, "failed", format!("could not queue task: {e}"));
-            return;
-        }
-
-        let deadline = Instant::now() + RUN_TASK_TIMEOUT;
-        loop {
-            if let Some(res) = taskqueue::take_result(&id) {
-                finish(&state, &res.status, res.result);
-                return;
+        let progress = progress_callback(state.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::tray::execute_remote(&req, progress));
+        });
+        match rx.recv_timeout(RUN_TASK_TIMEOUT) {
+            Ok(res) => finish(&state, &res.status, res.result),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finish(
+                &state,
+                "failed",
+                "task timed out after 10 minutes".to_string(),
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                finish(&state, "failed", "task worker stopped".to_string());
             }
-            if Instant::now() >= deadline {
-                finish(
-                    &state,
-                    "failed",
-                    "task timed out after 10 minutes".to_string(),
-                );
-                return;
-            }
-            std::thread::sleep(Duration::from_secs(2));
         }
     });
 }
 
+fn progress_callback(state: Arc<WsState>) -> runtime::ProgressCallback {
+    let last = Arc::new(Mutex::new((None::<Instant>, String::new())));
+    Arc::new(move |line: String| {
+        let Some(text) = progress_text(&line) else {
+            return;
+        };
+        let mut send = false;
+        if let Ok(mut prev) = last.lock() {
+            let interval_ok = prev
+                .0
+                .map(|sent_at| sent_at.elapsed() >= PROGRESS_MIN_INTERVAL)
+                .unwrap_or(true);
+            if prev.1 != text && interval_ok {
+                *prev = (Some(Instant::now()), text.clone());
+                send = true;
+            }
+        }
+        if send {
+            state.queue_send(json!({ "type": "status", "current_task": text }));
+        }
+    })
+}
+
+fn progress_text(line: &str) -> Option<String> {
+    let cleaned: String = line
+        .chars()
+        .filter(|c| *c == '\t' || !c.is_control())
+        .collect();
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(format!("UFO2: {}", truncate(&cleaned, PROGRESS_MAX)))
+    }
+}
+
 /// Capture a desktop screenshot and upload the PNG to the control plane. Like run_task, the capture
-/// happens in the Session-1 tray (Session 0 has no display): we queue a `screenshot` job, the tray
-/// grabs the desktop and writes `outbox/<id>.png`, then this worker PUTs it to the control plane and
-/// reports the command result. The PNG rides out-of-band (binary upload), not inside the WS result.
+/// happens in the login-session executor; this worker then PUTs it to the control plane and reports
+/// the command result. The PNG rides out-of-band (binary upload), not inside the WS result.
 fn spawn_screenshot(state: Arc<WsState>, id: String, control_plane: String) {
     std::thread::spawn(move || {
         let finish = |state: &WsState, status: &str, result: String| {
@@ -350,59 +384,33 @@ fn spawn_screenshot(state: Arc<WsState>, id: String, control_plane: String) {
             state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
         };
 
-        // No live desktop session means no tray to capture the screen — fail fast and actionably.
-        if !taskqueue::tray_alive(20) {
-            finish(
-                &state,
-                "failed",
-                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
-                    .to_string(),
-            );
+        // No live, usable desktop means the executor cannot capture the screen — fail fast and actionably.
+        if let Some(reason) = runtime::gate_desktop(20) {
+            finish(&state, "failed", reason);
             return;
         }
 
-        let req = taskqueue::TaskRequest {
-            id: id.clone(),
-            kind: "screenshot".into(),
-            task: "screenshot".into(),
-            request: None,
-        };
-        if let Err(e) = taskqueue::enqueue(&req) {
-            finish(&state, "failed", format!("could not queue screenshot: {e}"));
-            return;
-        }
-
-        let deadline = Instant::now() + SCREENSHOT_TIMEOUT;
-        loop {
-            if let Some(res) = taskqueue::take_result(&id) {
-                if res.status != "done" {
-                    finish(&state, "failed", res.result);
-                    return;
-                }
-                // Tray captured OK; the PNG it wrote rides alongside the JSON result.
-                let Some(png) = taskqueue::take_screenshot(&id) else {
-                    finish(
-                        &state,
-                        "failed",
-                        "tray reported success but left no screenshot file".to_string(),
-                    );
-                    return;
-                };
-                match upload_screenshot(&control_plane, &id, &png) {
-                    Ok(()) => finish(
-                        &state,
-                        "done",
-                        format!("screenshot captured ({} bytes)", png.len()),
-                    ),
-                    Err(e) => finish(&state, "failed", format!("screenshot upload failed: {e}")),
-                }
-                return;
+        let shot_id = id.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::tray::capture_remote_screenshot(&shot_id));
+        });
+        match rx.recv_timeout(SCREENSHOT_TIMEOUT) {
+            Ok(Ok(png)) => match upload_screenshot(&control_plane, &id, &png) {
+                Ok(()) => finish(
+                    &state,
+                    "done",
+                    format!("screenshot captured ({} bytes)", png.len()),
+                ),
+                Err(e) => finish(&state, "failed", format!("screenshot upload failed: {e}")),
+            },
+            Ok(Err(e)) => finish(&state, "failed", e),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                finish(&state, "failed", "screenshot timed out".to_string())
             }
-            if Instant::now() >= deadline {
-                finish(&state, "failed", "screenshot timed out".to_string());
-                return;
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                finish(&state, "failed", "screenshot worker stopped".to_string())
             }
-            std::thread::sleep(Duration::from_secs(1));
         }
     });
 }
@@ -464,17 +472,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drop_env_frames_keeps_results_and_status() {
+    fn drop_transient_state_frames_keeps_results_and_status() {
         let s = WsState::new();
         s.queue_send(json!({ "type": "environments", "environments": [] }));
+        s.queue_send(
+            json!({ "type": "desktop", "desktop": { "state": "ready", "updated_at": 1 } }),
+        );
         s.queue_send(json!({ "type": "result", "id": "x", "status": "done" }));
         s.queue_send(json!({ "type": "status", "current_task": "y" }));
         s.queue_send(json!({ "type": "environments", "environments": [] }));
-        s.drop_env_frames();
+        s.drop_transient_state_frames();
         let left = s.drain_outbound();
-        assert_eq!(left.len(), 2, "both environments frames should be dropped");
+        assert_eq!(
+            left.len(),
+            2,
+            "environment and desktop frames should be dropped"
+        );
         assert!(left.iter().all(|v| v["type"] != "environments"));
+        assert!(left.iter().all(|v| v["type"] != "desktop"));
         assert_eq!(left[0]["type"], "result");
         assert_eq!(left[1]["type"], "status");
+    }
+
+    #[test]
+    fn progress_text_is_dashboard_safe() {
+        assert_eq!(
+            progress_text("  Observing   Notepad window\r\n").as_deref(),
+            Some("UFO2: Observing Notepad window")
+        );
+        assert!(progress_text("\x07\r\n").is_none());
     }
 }

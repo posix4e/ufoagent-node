@@ -6,9 +6,9 @@ name: ci
 #
 # The full end-to-end — install + cold-provision on a BARE Windows VM + auto-logon + run_task GUI + tray
 # menu + linked smoke + the marketing screenshots — is NOT here: it runs on a real headful VM in
-# cold-vm.yml (workflow_run, right after this `ci` publishes beta), reusing the same tests/e2e +
+# selfhost-e2e.yml (workflow_run, right after this `ci` publishes beta), reusing the same tests/e2e +
 # tests/gui scripts. A GitHub runner can't represent a bare customer box (it preinstalls VC++/MFC,
-# Python, .NET) nor reboot into an auto-logon session — which is how the win32ui/MFC + tray-autostart
+# Python, .NET) nor reboot into an auto-logon session — which is how the win32ui/MFC + login-agent
 # bugs shipped "green" here before. So beta is gated by build, then verified on the VM after publish.
 on:
   push:
@@ -61,8 +61,8 @@ jobs:
           path: ${{ runner.temp }}/ufoagent-setup.exe
           if-no-files-found: error
 
-      # Publish the rolling beta on main once build/unit/compile pass. cold-vm.yml then verifies THIS
-      # exact beta on a real bare VM right after (verify-after-publish for a rolling prerelease).
+      # Publish the rolling beta on main once build/unit/compile pass. selfhost-e2e.yml then verifies
+      # THIS exact beta on a real bare VM right after (verify-after-publish for a rolling prerelease).
       - name: Publish rolling beta (main only)
         if: github.event_name == 'push'
         shell: bash
@@ -78,7 +78,7 @@ jobs:
           git push -f origin beta
           if ! gh release view beta >/dev/null 2>&1; then
             gh release create beta --prerelease --title "UFOAgent beta (rolling)" \
-              --notes "Rolling beta: the newest main build that passed lint/unit/compile. The full headful e2e (cold-vm) then verifies this exact build on a real bare Windows VM. Want stable? Grab the latest production release instead."
+              --notes "Rolling beta: the newest main build that passed lint/unit/compile. The full headful self-hosted e2e then verifies this exact build on a real bare Windows VM. Want stable? Grab the latest production release instead."
           fi
           gh release upload beta "$setup" --clobber
           echo "beta -> $GITHUB_SHA"

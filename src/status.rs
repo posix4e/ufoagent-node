@@ -1,4 +1,4 @@
-//! On-disk node status (written by the daemon, read by the tray/manager).
+//! On-disk node status (written by the login-session agent, read by the tray UI).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,10 @@ pub struct Status {
     pub current_task: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub desktop_detail: Option<String>,
 }
 
 #[allow(dead_code)] // only caller is the cfg(windows) tray, so non-Windows builds see it unused

@@ -122,26 +122,12 @@ Phase 'link' {
 }
 Stop-Process -Id $script:linkProc.Id -Force -ErrorAction SilentlyContinue
 
-# 4) LOCAL TASK - `ufoagent run`; Notepad must open + the message typed (UIA). The timed phase ENDS on the
-#    typed-Notepad frame (clean gif + still); UFO2 is left to finish AFTER the phase window.
-$script:localProc = $null
-Phase 'local' {
-  Stop-UfoWindows
-  $rout = Join-Path $ROOT 'local-run.out.txt'; $rerr = Join-Path $ROOT 'local-run.err.txt'
-  $script:localProc = Start-Process $Exe -ArgumentList 'run --task adhoc -r "Open Notepad and type the message: hello from ufoagent"' -RedirectStandardOutput $rout -RedirectStandardError $rerr -PassThru
-  $opened = Wait-For -TimeoutSec 360 -StreamAgentLog -Condition { [bool](Get-Process notepad -ErrorAction SilentlyContinue) }
-  if (-not $opened) { Show-FileTail 'run stdout' $rout; Show-FileTail 'run stderr' $rerr; Show-FileTail 'agent log' $AgentLog 40; throw 'local run_task did not open Notepad' }
-  Assert-TypedVerdict (Wait-NotepadTyped) 'local run_task'
-  Set-Crop 'notepad'; Start-Sleep 1   # end frame = Notepad with the typed message
-}
-if ($script:localProc) { $null = $script:localProc.WaitForExit(240000) }   # let UFO2 finish (outside the timed window)
-
-# 5) REMOTE TASK - enqueue via the control-plane command API -> WS -> tray -> UFO2. Same clean end frame.
+# 4) REMOTE TASK - command API -> WS -> login-session agent -> UFO2.
 Phase 'remote' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping remote task'; return 'SKIP' }
   Stop-UfoWindows
   $resp = Send-NodeCommand 'run_task' 'Open Notepad and type the message: hello from ufoagent'
-  Write-Host "enqueued run_task: id=$($resp.id) status=$($resp.status)"
+  Write-Host "sent run_task: id=$($resp.id) status=$($resp.status)"
   $script:remoteId = $resp.id
   $opened = Wait-For -TimeoutSec 300 -StreamAgentLog -Condition { [bool](Get-Process notepad -ErrorAction SilentlyContinue) }
   if (-not $opened) { Show-FileTail 'agent log' $AgentLog 40; throw 'remote run_task did not open Notepad' }
@@ -150,64 +136,39 @@ Phase 'remote' {
 }
 if ($haveAdm -and $script:remoteId) {
   $null = Wait-For -TimeoutSec 240 -StreamAgentLog -Condition { $c = Get-NodeCommand $script:remoteId; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
-  Stop-UfoWindows
 }
 
-# 6) ACTIVITY - the on-device LLM recap. Show it on screen (Notepad) so the gif captures the real recap
-#    text, not whatever window happened to be foreground.
-Phase 'activity' {
-  if (-not $haveTok) { Write-Host 'no CI token: skipping activity recap (needs a linked node)'; return 'SKIP' }
-  $summary = & $Exe activity | Out-String
-  Write-Host '=== activity summary ==='; Write-Host $summary
-  if ([string]::IsNullOrWhiteSpace($summary)) { throw 'activity summary was empty' }
-  if ($summary -match 'summary unavailable') { throw 'activity fell back to the raw listing (LLM path did not run)' }
-  Stop-UfoWindows
-  $script:recap = Join-Path $ROOT 'activity-recap.txt'
-  "What's this node been doing?`r`n`r`n$($summary.Trim())" | Set-Content $script:recap -Encoding Ascii
-  Start-Process notepad $script:recap
-  $shown = Wait-For -TimeoutSec 30 -PollSec 2 -Condition { [bool](Get-Process notepad -ErrorAction SilentlyContinue) }
-  if (-not $shown) { throw 'recap Notepad did not open' }
-  Set-Crop 'notepad'; Start-Sleep 3
-}
-Stop-UfoWindows
-
-# 7) DASHBOARD - the mission-control view itself. Capture this node's REAL desktop via the live
-#    `screenshot` command (tray -> GDI -> R2), then open the dashboard (a CI-token preview of the REAL
-#    CI-tenant data, since the headless VM browser can't do GitHub OAuth) on this node's detail and
-#    record it. Also save the raw captured desktop still for the website demo + /preview. Non-fatal:
-#    if the installed (beta) agent predates the screenshot feature, the phase SKIPs rather than failing
-#    the journey, so the existing gifs keep flowing until a beta with the feature ships.
+# 5) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
+#    dashboard (a CI-token preview of the REAL CI-tenant data, since the headless VM browser can't do
+#    GitHub OAuth) on this node's detail and record it. On trusted CI this phase is required: do not
+#    publish a misleading desktop gif if the browser/dashboard did not open.
 Phase 'dashboard' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping dashboard phase'; return 'SKIP' }
   $edge = @("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe") |
     Where-Object { Test-Path $_ } | Select-Object -First 1
-  if (-not $edge) { Write-Host 'no Microsoft Edge on this box: skipping dashboard phase'; return 'SKIP' }
+  if (-not $edge) { throw 'Microsoft Edge not found; cannot capture mission control' }
 
-  # Put something real on the desktop so the captured screenshot shows the node working.
-  if ($script:recap -and (Test-Path $script:recap)) { Start-Process notepad $script:recap; Start-Sleep 2 }
-
-  # 7a) capture this node's desktop through the REAL screenshot command.
+  # Capture this node's desktop through the REAL screenshot command. The remote-task Notepad remains
+  # open so the live desktop image has concrete work visible.
   $shot = Send-NodeCommand 'screenshot'
-  Write-Host "enqueued screenshot: id=$($shot.id) status=$($shot.status)"
+  Write-Host "sent screenshot: id=$($shot.id) status=$($shot.status)"
   $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition { $c = Get-NodeCommand $shot.id; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
   $c = if ($shot.id) { Get-NodeCommand $shot.id } else { $null }
   if (-not $done -or -not $c -or $c.status -ne 'done') {
-    Write-Host "screenshot not available (installed agent may predate the feature): status=$($c.status) result=$($c.result)"
-    Stop-UfoWindows; return 'SKIP'
+    throw "screenshot command failed: status=$($c.status) result=$($c.result)"
   }
   Write-Host "screenshot captured: $($c.result)"
-  Stop-UfoWindows   # clear the recap notepad before showing the browser
+  Stop-UfoWindows   # clear the remote-task Notepad before showing the browser
 
-  # 7b) save the raw captured desktop still (published next to the gifs; powers the website demo + /preview).
+  # Save the raw captured desktop still (published next to the gifs; powers dashboard previews).
   $shotUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/screenshot/latest"
   try { Invoke-WebRequest -UseBasicParsing -Headers (Get-ApiHeaders) -Uri $shotUrl -OutFile (Join-Path $OUT 'node-desktop.png'); Write-Host 'saved node-desktop.png' }
   catch { Write-Host "could not save node-desktop.png: $($_.Exception.Message)" }
 
-  # 7c) open mission control (real data via the CI-token preview) on this node's detail and record it.
+  # Open mission control (real data via the CI-token preview) on this node's detail and record it.
   #     App mode = no toolbar/address bar, so the token in the URL never appears in the gif. A FRESH
   #     dedicated profile (+ --no-first-run) is what makes the app window actually appear on a clean box;
-  #     --inprivate (the previous attempt) silently produced no window. If Edge still never shows a
-  #     window, SKIP rather than crop the bare desktop into a misleading "dashboard" gif.
+  #     --inprivate (the previous attempt) silently produced no window.
   $cp = 'https://app.ufoagent.xyz/preview/ci?token=' + [Uri]::EscapeDataString($env:CI_ADMIN_TOKEN) + '&node=' + [Uri]::EscapeDataString($env:CI_AGENT_ID)
   Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   $eprof = Join-Path $ROOT 'edge-app'; Remove-Item $eprof -Recurse -Force -ErrorAction SilentlyContinue
@@ -220,15 +181,19 @@ Phase 'dashboard' {
     [bool](Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
   }
   if (-not $win) {
-    Write-Host 'Edge never opened a window: skipping dashboard capture'
     Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    return 'SKIP'
+    throw 'Edge never opened a mission control window'
   }
   Start-Sleep 14   # let fonts + the inlined screenshot fully load and the layout settle before cropping
   Set-Crop 'msedge'
   # Only a real Edge window should anchor the crop; the launcher console is ~880px wide, the maximized
   # Edge app window is near full screen. If the crop looks like the console, drop it (full-frame gif).
-  if ($script:curCrop -and $script:curCrop.w -lt 1000) { Write-Host "crop too small (w=$($script:curCrop.w)) - Edge not foreground; SKIP"; $script:curCrop = $null; Get-Process msedge -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue; return 'SKIP' }
+  if (-not $script:curCrop -or $script:curCrop.w -lt 1000) {
+    $w = if ($script:curCrop) { $script:curCrop.w } else { 0 }
+    $script:curCrop = $null
+    Get-Process msedge -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
+    throw "mission control was not foreground or was too small (w=$w)"
+  }
   Start-Sleep 2
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue

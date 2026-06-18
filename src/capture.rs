@@ -1,6 +1,6 @@
 //! Native desktop screen capture (Windows GDI) for the on-demand `screenshot` command. Runs in the
-//! interactive Session-1 tray (Session 0 has no display). Grabs the full virtual screen via BitBlt +
-//! GetDIBits and encodes a PNG. (Blacks out on the UAC secure desktop / lock screen — a GDI limitation.)
+//! login-session tray agent. Grabs the full virtual screen via BitBlt + GetDIBits and encodes a PNG.
+//! (Blacks out on the UAC secure desktop / lock screen — a GDI limitation.)
 #![cfg(windows)]
 
 use anyhow::{anyhow, Result};

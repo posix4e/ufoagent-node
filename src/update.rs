@@ -1,8 +1,8 @@
-//! Update check + service-driven self-update.
+//! Update check + login-agent self-update.
 //!
 //! Flow: compare against the latest GitHub release (and the control plane's `min_version`
 //! floor) → download the signed `ufoagent-setup.exe` → **verify its Authenticode signature**
-//! → launch it silently (it stops the service, swaps files, restarts). The signature check is
+//! → launch it silently (it stops the login agent, swaps files, restarts). The signature check is
 //! the safety gate: an unsigned/tampered installer is refused, so this is safe to ship before
 //! code-signing is live (it simply won't self-install until signed builds exist).
 
@@ -102,8 +102,8 @@ pub fn verify_authenticode(_path: &Path) -> Result<()> {
     anyhow::bail!("Authenticode verification is only available on Windows")
 }
 
-/// Launch the verified installer silently and detached, so it survives the service being
-/// stopped mid-update. The installer stops the service, replaces files, and restarts it.
+/// Launch the verified installer silently and detached, so it survives the login agent being
+/// stopped mid-update. The installer stops the agent, replaces files, and restarts it.
 #[cfg(windows)]
 pub fn apply_update(installer: &Path) -> Result<()> {
     use std::os::windows::process::CommandExt;
