@@ -90,6 +90,19 @@ SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/de
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
 
+# Capture the Windows service health the box's Server Manager flags (the red "Services" count), so we can
+# analyze them across runs. Diagnostic only - never fails the run.
+echo "=== capture service errors (Server Manager 'Services' flags) ==="
+SSH '
+"=== auto-start services NOT running ==="
+Get-CimInstance Win32_Service | Where-Object { $_.StartMode -eq "Auto" -and $_.State -ne "Running" } |
+  Select-Object Name, DisplayName, State, ExitCode | Format-Table -AutoSize | Out-String -Width 200
+"=== Service Control Manager errors/warnings (System log, last 50) ==="
+Get-WinEvent -FilterHashtable @{LogName="System"; ProviderName="Service Control Manager"; Level=1,2,3} -MaxEvents 50 -ErrorAction SilentlyContinue |
+  Select-Object TimeCreated, Id, LevelDisplayName, @{n="Msg";e={($_.Message -split "`r?`n")[0]}} | Format-Table -AutoSize | Out-String -Width 200
+' > "$WORK/service-errors.txt" 2>/dev/null || true
+echo "--- service-errors (head) ---"; head -50 "$WORK/service-errors.txt" 2>/dev/null
+
 # Clock skew computed NOW (post-journey): the guest RTC can be hours off at boot but Windows time-sync
 # corrects it within seconds, so by here host+guest are stable and aligned. (Computing it at boot caught
 # the pre-sync clock and mis-mapped every window.)
