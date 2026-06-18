@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::{Config, DEFAULT_CONTROL_PLANE};
 use crate::controlplane::ControlPlane;
 use crate::env::{self, EnvState};
-use crate::{bootstrap, daemon, store};
+use crate::{agent, bootstrap, store};
 
 pub fn repair() -> Result<Vec<String>> {
     let mut log = Vec::new();
@@ -34,7 +34,7 @@ pub fn repair() -> Result<Vec<String>> {
 
     if store::get_token().is_some() {
         let cp = ControlPlane::new(&cfg.control_plane_url(), store::get_token());
-        match daemon::refresh_once(&cp, &home) {
+        match agent::refresh_once(&cp, &home) {
             Ok(c) => log.push(format!("credential refreshed (lease {})", c.lease_id)),
             Err(e) => log.push(format!("credential refresh failed: {e}")),
         }

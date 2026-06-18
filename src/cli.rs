@@ -38,8 +38,6 @@ pub enum Cmd {
     },
     /// Fetch a credential and write agents.yaml.
     Refresh,
-    /// Foreground refresh + heartbeat loop (the service body).
-    RunDaemon,
     /// Refresh credential then run a UFO2 task.
     Run {
         #[arg(long)]
@@ -75,12 +73,7 @@ pub enum Cmd {
     Status,
     /// Print version.
     Version,
-    /// Windows service control (install/uninstall/run).
-    Service {
-        #[command(subcommand)]
-        action: ServiceAction,
-    },
-    /// System-tray manager UI (Windows).
+    /// Login-session node agent and tray UI (Windows).
     Tray,
     /// Configure unattended GUI mode by enabling Windows auto-logon (Windows).
     Autologon {
@@ -100,11 +93,4 @@ pub enum Cmd {
         #[arg(long)]
         pause: bool,
     },
-}
-
-#[derive(Subcommand)]
-pub enum ServiceAction {
-    Install,
-    Uninstall,
-    Run,
 }

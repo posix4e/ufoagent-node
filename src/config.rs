@@ -37,7 +37,7 @@ pub struct Config {
     pub ufo_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub python: Option<String>,
-    /// Kill-switch for service self-update (default on).
+    /// Kill-switch for login-agent self-update (default on).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_update: Option<bool>,
     /// Override the GitHub repo updates are pulled from.

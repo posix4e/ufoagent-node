@@ -1,5 +1,5 @@
-//! The service body: credential-refresh + self-update loop, with the WebSocket command channel
-//! on its own thread as the single control-plane connection. Also the one-shot refresh.
+//! Login-session agent loop: credential refresh, self-update, status, and the WebSocket command
+//! channel. Also provides the one-shot credential refresh command.
 
 use anyhow::Result;
 use log::{info, warn};
@@ -9,7 +9,7 @@ use std::time::Duration;
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, Credential};
 use crate::status::{self, Status};
-use crate::{env, store, taskqueue, ufo_config, update, util, ws};
+use crate::{env, runtime, store, ufo_config, update, util, ws};
 
 pub fn platform() -> String {
     format!("{} ({})", std::env::consts::OS, std::env::consts::ARCH)
@@ -37,17 +37,17 @@ fn boot_jitter_secs() -> i64 {
     (h % 1800) as i64
 }
 
-/// Long-running loop (the service body). The WebSocket (own thread) is the control-plane
-/// connection: command delivery, liveness, and the min_version floor (hello_ack). This loop
-/// refreshes the credential near lease expiry, checks self-updates on a slow cadence (and right
-/// after boot, to catch a forced min_version bump), and writes status.json each tick. Runs
-/// until `should_stop()` flips.
-pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
+/// Long-running login-session loop. The WebSocket (own thread) is the control-plane connection:
+/// command delivery, liveness, and the min_version floor (hello_ack). This loop refreshes the
+/// credential near lease expiry, checks self-updates on a slow cadence (and right after boot, to
+/// catch a forced min_version bump), and writes status.json each tick. Runs until `should_stop()`
+/// flips.
+pub fn run_agent(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     let cfg = Config::load();
     let ufo_home = cfg.ufo_home_path();
 
-    // Not joined on exit: the WS read timeout means it can take ~20s to notice the stop flag,
-    // and the service must stop promptly; the thread dies with the process.
+    // Not joined on exit: the WS read timeout means it can take ~20s to notice the stop flag; the
+    // thread dies with the process.
     let ws_state = std::sync::Arc::new(ws::WsState::new());
     let ws_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
@@ -76,10 +76,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
     let mut last_envs: Option<Vec<env::EnvReport>> = None;
     // Last desktop availability report pushed — separate from WS liveness so "online but no GUI" is
     // visible and can gate run_task/screenshot.
-    let mut last_desktop: Option<taskqueue::DesktopReport> = None;
-
-    // Path to our own exe, to (re)launch the tray into the interactive session below.
-    let self_exe = std::env::current_exe().ok();
+    let mut last_desktop: Option<runtime::DesktopReport> = None;
 
     while !should_stop() {
         let now = util::now();
@@ -103,19 +100,16 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
             }
         }
 
-        // 2) Liveness for the tray = the socket state (the control plane sees the same thing).
+        // 2) Control-plane liveness = the socket state.
         st.online = ws_state.connected();
 
-        // 2a) Keep a tray alive in the active console session. The installer's Startup-folder shortcut
-        //     doesn't reliably fire on unattended auto-logon, so the service guarantees it (self-heals
-        //     if the tray dies). No-op when nobody's logged on or a tray is already alive.
-        if let Some(exe) = self_exe.as_deref() {
-            crate::session::ensure_tray_in_active_session(exe);
-        }
-        let desktop = taskqueue::desktop_report(20);
+        // 2a) Desktop availability comes from this same login-session process. If the session locks
+        //     or switches to a secure desktop, GUI commands fail fast instead of queuing work that
+        //     cannot run.
+        let desktop = runtime::desktop_report(20);
         st.desktop_state = Some(match desktop.state {
-            taskqueue::DesktopState::Ready => "ready".to_string(),
-            taskqueue::DesktopState::Unavailable => "unavailable".to_string(),
+            runtime::DesktopState::Ready => "ready".to_string(),
+            runtime::DesktopState::Unavailable => "unavailable".to_string(),
         });
         st.desktop_detail = desktop.detail.clone();
         if last_desktop.as_ref() != Some(&desktop) {
@@ -153,7 +147,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
             next_update_check = util::now() + update_interval;
             let min_version = ws_state.min_version();
             match update::maybe_self_update(&cfg, version, min_version.as_deref()) {
-                Ok(true) => info!("self-update launched; expecting service restart"),
+                Ok(true) => info!("self-update launched; expecting login agent restart"),
                 Ok(false) => {}
                 Err(e) => warn!("self-update check failed: {}", e),
             }
@@ -161,7 +155,7 @@ pub fn run_daemon(version: &str, should_stop: impl Fn() -> bool) -> Result<()> {
 
         let _ = status::save(&st);
 
-        // Sleep one tick, in short slices so the service can stop promptly.
+        // Sleep one tick, in short slices so the process can stop promptly.
         let mut slept = 0;
         while slept < TICK_SECS && !should_stop() {
             std::thread::sleep(Duration::from_secs(2));

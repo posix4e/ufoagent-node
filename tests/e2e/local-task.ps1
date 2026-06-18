@@ -5,7 +5,7 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot/helpers.ps1"
 Stop-UfoWindows
 $rout = "$env:RUNNER_TEMP\local-run.out.txt"; $rerr = "$env:RUNNER_TEMP\local-run.err.txt"
-# Record this run too (assembled into the site's local-task.gif).
+# Standalone local CLI smoke: UFO2 must open Notepad and type the message.
 Start-FrameRecorder 'local'
 # Pass the command line as a SINGLE quoted string — Start-Process -ArgumentList with an array
 # does NOT quote the spaced request, so clap saw 'Open'/'the'/'Notepad'/... as stray positional

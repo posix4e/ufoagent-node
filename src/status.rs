@@ -1,4 +1,4 @@
-//! On-disk node status (written by the daemon, read by the tray/manager).
+//! On-disk node status (written by the login-session agent, read by the tray UI).
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

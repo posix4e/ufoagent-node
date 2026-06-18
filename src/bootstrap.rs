@@ -344,7 +344,7 @@ fn verify_ufo_imports(vpy: &Path) -> Result<()> {
 /// Provision UFO2. Idempotent. Returns (ufo_home, venv_python). Records the install lifecycle in the
 /// env marker (`installing` → `ready`/`broken`) so the dashboard chips and the `run_task` gate track
 /// real state — including for a bootstrap launched as its own process (installer `nowait`, the tray's
-/// Repair), which the daemon picks up by re-reading the marker each tick.
+/// Repair), which the login agent picks up by re-reading the marker each tick.
 pub fn bootstrap(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, PathBuf)> {
     use crate::env::{self, EnvState};
     env::set_state(

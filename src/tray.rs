@@ -1,4 +1,4 @@
-//! System-tray manager UI (Windows). Status + Link/Repair/Run-task/View-log/Dashboard.
+//! Login-session UFOAgent runtime (Windows): control-plane connection, GUI task worker, and tray UI.
 //! Non-Windows builds get a stub so the crate checks on macOS/Linux.
 
 use anyhow::Result;
@@ -8,21 +8,54 @@ pub fn run(_version: &str) -> Result<()> {
     anyhow::bail!("the tray manager is only available on Windows")
 }
 
+#[cfg(not(windows))]
+pub fn execute_remote(
+    req: &crate::runtime::RemoteTaskRequest,
+    _progress: crate::runtime::ProgressCallback,
+) -> crate::runtime::RemoteTaskResult {
+    crate::runtime::RemoteTaskResult {
+        id: req.id.clone(),
+        status: "failed".into(),
+        result: "GUI tasks are only available on Windows".into(),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn capture_remote_screenshot(_id: &str) -> std::result::Result<Vec<u8>, String> {
+    Err("desktop screenshots are only available on Windows".into())
+}
+
 #[cfg(windows)]
 pub fn run(version: &str) -> Result<()> {
     imp::run(version)
 }
 
 #[cfg(windows)]
+pub fn execute_remote(
+    req: &crate::runtime::RemoteTaskRequest,
+    progress: crate::runtime::ProgressCallback,
+) -> crate::runtime::RemoteTaskResult {
+    imp::run_one(req, progress)
+}
+
+#[cfg(windows)]
+pub fn capture_remote_screenshot(id: &str) -> std::result::Result<Vec<u8>, String> {
+    imp::capture_screenshot(id)
+}
+
+#[cfg(windows)]
 mod imp {
     use anyhow::Result;
+    use std::io::BufRead;
+    use std::process::Stdio;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tao::event::Event;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder};
 
-    use crate::{status, taskqueue};
+    use crate::{runtime, status};
 
     const DASHBOARD: &str = "https://app.ufoagent.xyz";
 
@@ -111,37 +144,59 @@ mod imp {
         }
     }
 
-    /// Capture the desktop in THIS interactive session and hand the PNG back to the service (which
-    /// uploads it to the control plane). Session 0 has no display, so the capture must happen here in
-    /// the tray; the PNG rides alongside the JSON result as `outbox/<id>.png`.
-    fn run_screenshot(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
-        log::info!("tray: capturing screenshot {}", req.id);
-        let fail = |e: String| taskqueue::TaskResult {
-            id: req.id.clone(),
-            status: "failed".into(),
-            result: e,
-        };
-        match crate::capture::capture_png() {
-            Ok(png) => {
-                if let Err(e) = taskqueue::report_screenshot(&req.id, &png) {
-                    return fail(format!("could not write screenshot: {e}"));
-                }
-                taskqueue::TaskResult {
-                    id: req.id.clone(),
-                    status: "done".into(),
-                    result: format!("captured {} bytes", png.len()),
-                }
-            }
-            Err(e) => fail(format!("capture failed: {e}")),
-        }
+    /// Capture the desktop in THIS interactive session. The connection loop uploads the PNG to the
+    /// control plane.
+    pub(super) fn capture_screenshot(id: &str) -> std::result::Result<Vec<u8>, String> {
+        log::info!("tray: capturing screenshot {id}");
+        crate::capture::capture_png().map_err(|e| format!("capture failed: {e}"))
     }
 
-    /// Run one queued task in this interactive session: `ufoagent run --task <task> -r <request>`.
-    /// Captures output to tasks\logs\<id>.txt and returns the exit + a tail as the result.
-    fn run_one(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
-        if req.kind == "screenshot" {
-            return run_screenshot(req);
-        }
+    fn spawn_reader<R: std::io::Read + Send + 'static>(
+        name: &'static str,
+        reader: R,
+        transcript: Arc<Mutex<String>>,
+        progress: runtime::ProgressCallback,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut reader = std::io::BufReader::new(reader);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let raw = String::from_utf8_lossy(&buf);
+                        let line = raw.trim_end_matches(&['\r', '\n'][..]).trim();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if let Ok(mut t) = transcript.lock() {
+                            if name == "stderr" {
+                                t.push_str("[stderr] ");
+                            }
+                            t.push_str(line);
+                            t.push('\n');
+                        }
+                        progress(line.to_string());
+                    }
+                    Err(e) => {
+                        if let Ok(mut t) = transcript.lock() {
+                            t.push_str(&format!("[{name}] read failed: {e}\n"));
+                        }
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    /// Run one remote task in this interactive session: `ufoagent run --task <task> -r <request>`.
+    /// Streams UFO2 output to the dashboard, captures the full transcript to
+    /// tasks\logs\<id>.txt, and returns the exit + a tail as the result.
+    pub(super) fn run_one(
+        req: &runtime::RemoteTaskRequest,
+        progress: runtime::ProgressCallback,
+    ) -> runtime::RemoteTaskResult {
         log::info!("tray: running task {} ({})", req.id, req.task);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -150,14 +205,15 @@ mod imp {
         if let Some(r) = &req.request {
             cmd.arg("-r").arg(r);
         }
-        // The service already records this as a remote command; tell `run` not to double-log it.
-        cmd.env("UFOAGENT_FROM_QUEUE", "1");
+        // The connection loop already records this as a remote command; tell `run` not to double-log it.
+        cmd.env("UFOAGENT_REMOTE_TASK", "1");
         // No flashing console on the user's desktop while UFO2 drives the GUI — run it headless.
         cmd.creation_flags(CREATE_NO_WINDOW);
-        let out = match cmd.output() {
-            Ok(o) => o,
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(e) => {
-                return taskqueue::TaskResult {
+                return runtime::RemoteTaskResult {
                     id: req.id.clone(),
                     status: "failed".into(),
                     result: format!("could not launch UFO2: {e}"),
@@ -165,9 +221,34 @@ mod imp {
             }
         };
 
-        // Persist the full transcript for diagnostics; the result carries a tail.
-        let mut transcript = String::from_utf8_lossy(&out.stdout).into_owned();
-        transcript.push_str(&String::from_utf8_lossy(&out.stderr));
+        let transcript = Arc::new(Mutex::new(String::new()));
+        let mut readers = Vec::new();
+        if let Some(stdout) = child.stdout.take() {
+            readers.push(spawn_reader(
+                "stdout",
+                stdout,
+                transcript.clone(),
+                progress.clone(),
+            ));
+        }
+        if let Some(stderr) = child.stderr.take() {
+            readers.push(spawn_reader("stderr", stderr, transcript.clone(), progress));
+        }
+
+        let status = match child.wait() {
+            Ok(s) => s,
+            Err(e) => {
+                return runtime::RemoteTaskResult {
+                    id: req.id.clone(),
+                    status: "failed".into(),
+                    result: format!("could not wait for UFO2: {e}"),
+                }
+            }
+        };
+        for reader in readers {
+            let _ = reader.join();
+        }
+        let transcript = transcript.lock().map(|t| t.clone()).unwrap_or_default();
         let logs = crate::config::config_dir().join("tasks").join("logs");
         if std::fs::create_dir_all(&logs).is_ok() {
             let _ = std::fs::write(logs.join(format!("{}.txt", req.id)), &transcript);
@@ -182,17 +263,17 @@ mod imp {
             .rev()
             .collect::<Vec<_>>()
             .join("\n");
-        taskqueue::TaskResult {
+        runtime::RemoteTaskResult {
             id: req.id.clone(),
-            status: if out.status.success() {
+            status: if status.success() {
                 "done".into()
             } else {
                 "failed".into()
             },
             result: if tail.is_empty() {
-                format!("exit {:?}", out.status.code())
+                format!("exit {:?}", status.code())
             } else {
-                format!("exit {:?}\n{tail}", out.status.code())
+                format!("exit {:?}\n{tail}", status.code())
             },
         }
     }
@@ -206,10 +287,10 @@ mod imp {
         )
     }
 
-    /// Per-session single-instance guard. The service (re)spawns the tray into the console session
-    /// while the installer's Startup-folder shortcut may also launch one — without this they'd both
-    /// appear. Holds a session-named mutex for the process lifetime; returns true if another tray
-    /// already owns it. On any failure to create the guard, returns false (better to run than not).
+    /// Per-session single-instance guard. The installer launches the tray immediately and the Startup
+    /// shortcut launches it again at logon; without this they'd both appear. Holds a session-named
+    /// mutex for the process lifetime; returns true if another tray already owns it. On any failure
+    /// to create the guard, returns false (better to run than not).
     fn another_tray_running() -> bool {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, TRUE};
@@ -232,7 +313,7 @@ mod imp {
         }
     }
 
-    pub fn run(_version: &str) -> Result<()> {
+    pub fn run(version: &str) -> Result<()> {
         if another_tray_running() {
             log::info!("tray: another instance is already running in this session; exiting");
             return Ok(());
@@ -243,29 +324,27 @@ mod imp {
             let _ = windows::Win32::System::Console::FreeConsole();
         }
 
-        // Start the FUNCTIONAL Session-1 worker first and UNCONDITIONALLY — it must not hinge on the
-        // system-tray icon. The liveness marker tells the SYSTEM service there's a live interactive
-        // session to run GUI tasks on; the executor pulls run_task requests from the file queue and
-        // runs them here (where UFO2 can drive the GUI). On some boxes Shell_NotifyIcon fails (E_FAIL)
-        // so the icon can't be built — but the node must still run tasks, so these come first.
+        // Start the functional login-session agent first and unconditionally — it must not hinge on
+        // the system-tray icon. The liveness marker is the GUI availability source of truth; remote
+        // task workers call this process' executor directly, where UFO2 can drive the desktop. On
+        // some boxes Shell_NotifyIcon fails (E_FAIL), but the node must still run tasks, so these
+        // come before the cosmetic tray UI.
+        let _ = runtime::touch_alive();
         std::thread::spawn(|| loop {
-            let _ = taskqueue::touch_alive();
+            let _ = runtime::touch_alive();
             std::thread::sleep(Duration::from_secs(5));
         });
-        std::thread::spawn(|| loop {
-            if let Some(req) = taskqueue::next_pending() {
-                let _ = taskqueue::report(&run_one(&req));
-            } else {
-                std::thread::sleep(Duration::from_secs(2));
+        let agent_version = version.to_string();
+        std::thread::spawn(move || {
+            if let Err(e) = crate::agent::run_agent(&agent_version, || false) {
+                log::error!("login agent loop failed: {e:#}");
             }
         });
 
         // Best-effort system-tray icon + menu. If it can't be built, don't take the worker down with
-        // it — log and park so the threads above keep the node usable as a headless Session-1 worker.
+        // it — log and park so the threads above keep the node usable as a headless login agent.
         if let Err(e) = run_tray_ui() {
-            log::warn!(
-                "tray: system-tray UI unavailable ({e}); running as a headless Session-1 worker"
-            );
+            log::warn!("tray: system-tray UI unavailable ({e}); running as a headless login agent");
             loop {
                 std::thread::sleep(Duration::from_secs(3600));
             }
