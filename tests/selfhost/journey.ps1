@@ -211,9 +211,11 @@ Phase 'dashboard' {
   $cp = 'https://app.ufoagent.xyz/preview/ci?token=' + [Uri]::EscapeDataString($env:CI_ADMIN_TOKEN) + '&node=' + [Uri]::EscapeDataString($env:CI_AGENT_ID)
   Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
   $eprof = Join-Path $ROOT 'edge-app'; Remove-Item $eprof -Recurse -Force -ErrorAction SilentlyContinue
+  # --force-device-scale-factor=1 pins 1:1 rendering: the VM's display scaling otherwise reflowed the
+  # layout (collapsed the screenshot column, clipped the status values) in the first capture.
   Start-Process $edge -ArgumentList '--no-first-run', '--no-default-browser-check', '--disable-sync',
-    '--disable-features=msEdgeWelcomeExperience', "--user-data-dir=$eprof", '--start-maximized',
-    '--window-size=1280,800', ('--app=' + $cp)
+    '--disable-features=msEdgeWelcomeExperience', '--force-device-scale-factor=1', "--user-data-dir=$eprof",
+    '--start-maximized', '--window-size=1280,800', ('--app=' + $cp)
   $win = Wait-For -TimeoutSec 30 -PollSec 2 -Condition {
     [bool](Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
   }
@@ -222,7 +224,7 @@ Phase 'dashboard' {
     Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     return 'SKIP'
   }
-  Start-Sleep 8    # let the page + the inlined screenshot paint
+  Start-Sleep 14   # let fonts + the inlined screenshot fully load and the layout settle before cropping
   Set-Crop 'msedge'
   # Only a real Edge window should anchor the crop; the launcher console is ~880px wide, the maximized
   # Edge app window is near full screen. If the crop looks like the console, drop it (full-frame gif).
