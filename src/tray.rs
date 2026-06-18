@@ -111,9 +111,37 @@ mod imp {
         }
     }
 
+    /// Capture the desktop in THIS interactive session and hand the PNG back to the service (which
+    /// uploads it to the control plane). Session 0 has no display, so the capture must happen here in
+    /// the tray; the PNG rides alongside the JSON result as `outbox/<id>.png`.
+    fn run_screenshot(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
+        log::info!("tray: capturing screenshot {}", req.id);
+        let fail = |e: String| taskqueue::TaskResult {
+            id: req.id.clone(),
+            status: "failed".into(),
+            result: e,
+        };
+        match crate::capture::capture_png() {
+            Ok(png) => {
+                if let Err(e) = taskqueue::report_screenshot(&req.id, &png) {
+                    return fail(format!("could not write screenshot: {e}"));
+                }
+                taskqueue::TaskResult {
+                    id: req.id.clone(),
+                    status: "done".into(),
+                    result: format!("captured {} bytes", png.len()),
+                }
+            }
+            Err(e) => fail(format!("capture failed: {e}")),
+        }
+    }
+
     /// Run one queued task in this interactive session: `ufoagent run --task <task> -r <request>`.
     /// Captures output to tasks\logs\<id>.txt and returns the exit + a tail as the result.
     fn run_one(req: &taskqueue::TaskRequest) -> taskqueue::TaskResult {
+        if req.kind == "screenshot" {
+            return run_screenshot(req);
+        }
         log::info!("tray: running task {} ({})", req.id, req.task);
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;

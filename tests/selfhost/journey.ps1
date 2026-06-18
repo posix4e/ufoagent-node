@@ -162,13 +162,57 @@ Phase 'activity' {
   if ([string]::IsNullOrWhiteSpace($summary)) { throw 'activity summary was empty' }
   if ($summary -match 'summary unavailable') { throw 'activity fell back to the raw listing (LLM path did not run)' }
   Stop-UfoWindows
-  $recap = Join-Path $ROOT 'activity-recap.txt'
-  "What's this node been doing?`r`n`r`n$($summary.Trim())" | Set-Content $recap -Encoding Ascii
-  Start-Process notepad $recap
+  $script:recap = Join-Path $ROOT 'activity-recap.txt'
+  "What's this node been doing?`r`n`r`n$($summary.Trim())" | Set-Content $script:recap -Encoding Ascii
+  Start-Process notepad $script:recap
   $shown = Wait-For -TimeoutSec 30 -PollSec 2 -Condition { [bool](Get-Process notepad -ErrorAction SilentlyContinue) }
   if (-not $shown) { throw 'recap Notepad did not open' }
   Set-Crop 'notepad'; Start-Sleep 3
 }
+Stop-UfoWindows
+
+# 7) DASHBOARD - the mission-control view itself. Capture this node's REAL desktop via the live
+#    `screenshot` command (tray -> GDI -> R2), then open the dashboard (a CI-token preview of the REAL
+#    CI-tenant data, since the headless VM browser can't do GitHub OAuth) on this node's detail and
+#    record it. Also save the raw captured desktop still for the website demo + /preview. Non-fatal:
+#    if the installed (beta) agent predates the screenshot feature, the phase SKIPs rather than failing
+#    the journey, so the existing gifs keep flowing until a beta with the feature ships.
+Phase 'dashboard' {
+  if (-not $haveAdm) { Write-Host 'no CI admin token: skipping dashboard phase'; return 'SKIP' }
+  $edge = @("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe") |
+    Where-Object { Test-Path $_ } | Select-Object -First 1
+  if (-not $edge) { Write-Host 'no Microsoft Edge on this box: skipping dashboard phase'; return 'SKIP' }
+
+  # Put something real on the desktop so the captured screenshot shows the node working.
+  if ($script:recap -and (Test-Path $script:recap)) { Start-Process notepad $script:recap; Start-Sleep 2 }
+
+  # 7a) capture this node's desktop through the REAL screenshot command.
+  $shot = Send-NodeCommand 'screenshot'
+  Write-Host "enqueued screenshot: id=$($shot.id) status=$($shot.status)"
+  $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition { $c = Get-NodeCommand $shot.id; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
+  $c = if ($shot.id) { Get-NodeCommand $shot.id } else { $null }
+  if (-not $done -or -not $c -or $c.status -ne 'done') {
+    Write-Host "screenshot not available (installed agent may predate the feature): status=$($c.status) result=$($c.result)"
+    Stop-UfoWindows; return 'SKIP'
+  }
+  Write-Host "screenshot captured: $($c.result)"
+  Stop-UfoWindows   # clear the recap notepad before showing the browser
+
+  # 7b) save the raw captured desktop still (published next to the gifs; powers the website demo + /preview).
+  $shotUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/screenshot/latest"
+  try { Invoke-WebRequest -UseBasicParsing -Headers (Get-ApiHeaders) -Uri $shotUrl -OutFile (Join-Path $OUT 'node-desktop.png'); Write-Host 'saved node-desktop.png' }
+  catch { Write-Host "could not save node-desktop.png: $($_.Exception.Message)" }
+
+  # 7c) open mission control (real data via the CI-token preview) on this node's detail and record it.
+  #     App mode = no toolbar/address bar, so the token in the URL never appears in the gif; InPrivate
+  #     avoids first-run/profile nags.
+  $cp = 'https://app.ufoagent.xyz/preview/ci?token=' + [Uri]::EscapeDataString($env:CI_ADMIN_TOKEN) + '&node=' + [Uri]::EscapeDataString($env:CI_AGENT_ID)
+  Start-Process $edge -ArgumentList '--inprivate', '--no-first-run', '--no-default-browser-check', '--window-size=1280,800', ('--app=' + $cp)
+  Start-Sleep 12   # let the page load + the inlined screenshot render
+  Set-Crop 'msedge'
+  Start-Sleep 2
+}
+Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-UfoWindows
 
 Write-Result 'PASS'

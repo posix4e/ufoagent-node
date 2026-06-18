@@ -49,11 +49,14 @@ jobs:
           g=/mnt/ram/e2e/gifs
           rm -rf pub && mkdir pub
           # The site uses install-screen.gif, remote-task.gif, local-task.gif, activity-summary.gif (link is
-          # the robot SVG). Publish gif + a still fallback for each; missing ones are skipped.
-          for f in install-screen link-screen local-task remote-task activity-summary; do
+          # the robot SVG) + mission-control.gif (the dashboard). Publish gif + a still fallback for each;
+          # missing ones are skipped.
+          for f in install-screen link-screen local-task remote-task activity-summary mission-control; do
             cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
             cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
           done
+          # The raw captured desktop still — powers the dashboard /preview demo + the website node image.
+          cp "$g/node-desktop.png" "pub/node-desktop.png" 2>/dev/null || true
           ls -la pub
           cd pub && git init -q && git checkout -q -b screenshots
           git add .

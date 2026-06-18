@@ -86,6 +86,10 @@ echo "=== collect ==="
 SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
+# The real captured desktop still (binary -> SCP, not Get-Content). Lands in gifs/ so the publish step
+# ships it next to the gifs. Absent if the dashboard phase skipped (old agent / no Edge).
+mkdir -p "$WORK/gifs"
+SCP "$GUSER@$IP:C:/e2e/out/node-desktop.png" "$WORK/gifs/node-desktop.png" 2>/dev/null || true
 SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/dev/null 2>&1 || true
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
