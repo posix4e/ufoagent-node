@@ -15,6 +15,23 @@ gifname(){ case "$1" in
   dashboard) echo mission-control;;
   *)         echo "$1";; esac; }
 
+gha_escape(){
+  local s="${1:-}"
+  s=${s//'%'/'%25'}; s=${s//$'\r'/'%0D'}; s=${s//$'\n'/'%0A'}
+  printf '%s' "$s"
+}
+
+emit_slice_progress(){
+  local msg="$1"
+  echo "  $msg"
+  if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+    printf -- '- %s %s\n' "$(date -u +%H:%M:%SZ)" "$msg" >> "$GITHUB_STEP_SUMMARY"
+  fi
+  if [ -n "${GITHUB_ACTIONS:-}" ]; then
+    printf '::notice title=Selfhost e2e::%s\n' "$(gha_escape "$msg")"
+  fi
+}
+
 # PowerShell ConvertTo-Json unwraps a single-element array to a bare object; normalize to an array.
 [ -s "$PHASES" ] || { echo "no phases.json (journey produced none)"; exit 0; }
 PH=$(jq -c 'if type=="array" then . else [.] end' "$PHASES" 2>/dev/null || echo '[]')
@@ -31,9 +48,11 @@ for i in $(seq 0 $((n-1))); do
   ok=$(echo "$PH" | jq -r ".[$i].ok // false")
   skipped=$(echo "$PH" | jq -r ".[$i].skipped // false")
   if [ "$ok" != "true" ] || [ "$skipped" = "true" ]; then
-    echo "  $label: skipped/failed phase - no asset"
+    emit_slice_progress "slice skipped: $label phase did not pass"
     continue
   fi
+  asset=$(gifname "$label")
+  emit_slice_progress "slice started: $asset"
   gs=$(echo "$PH" | jq -r ".[$i].start"); ge=$(echo "$PH" | jq -r ".[$i].end")
   hs=$(( gs + SKEW )); he=$(( ge + SKEW ))
   d="$OUT/frames-$label"; rm -rf "$d"; mkdir -p "$d"; k=0
@@ -44,7 +63,7 @@ for i in $(seq 0 $((n-1))); do
       cp "$f" "$(printf '%s/%04d.png' "$d" "$k")"; k=$((k+1))
     fi
   done
-  if [ "$k" -lt 4 ]; then echo "  $label: only $k frames in window - skip"; continue; fi
+  if [ "$k" -lt 4 ]; then emit_slice_progress "slice skipped: $asset only had $k frames"; continue; fi
 
   # crop filter from the phase's window rect (clamped to the frame, even dims); empty = full frame
   cropf=""
@@ -65,10 +84,15 @@ for i in $(seq 0 $((n-1))); do
   esac
 
   vf="${cropf}mpdecimate,setpts=N/(4*TB),scale=min(900\\,iw):-2:flags=lanczos,split[a][b];[a]palettegen=max_colors=${colors}[p];[b][p]paletteuse=dither=bayer:bayer_scale=3"
-  gif="$OUT/$(gifname "$label").gif"
+  gif="$OUT/$asset.gif"
+  emit_slice_progress "slice building: $asset.gif ($k frames)"
   ffmpeg -y -framerate 4 -i "$d/%04d.png" -vf "$vf" -frames:v "$cap" -loop 0 "$gif" >/dev/null 2>&1
   # representative still = last in-window frame, cropped to match
-  png="$OUT/$(gifname "$label").png"
+  png="$OUT/$asset.png"
   ffmpeg -y -i "$(printf '%s/%04d.png' "$d" $((k-1)))" ${cropf:+-vf ${cropf%,}} "$png" >/dev/null 2>&1 || cp "$(printf '%s/%04d.png' "$d" $((k-1)))" "$png" 2>/dev/null || true
-  if [ -f "$gif" ]; then echo "  $(gifname "$label").gif  ($k frames, crop=[${cropf:-full}], $(du -h "$gif" | cut -f1))"; else echo "  $label: ffmpeg produced no gif"; fi
+  if [ -f "$gif" ]; then
+    emit_slice_progress "slice done: $asset.gif ($k frames, crop=[${cropf:-full}], $(du -h "$gif" | cut -f1))"
+  else
+    emit_slice_progress "slice failed: $asset.gif was not produced"
+  fi
 done

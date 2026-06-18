@@ -374,6 +374,7 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
+        cmd.stdin(std::process::Stdio::null());
     }
     // Log (flushed per-record to ufoagent.log) as well as print: stdout block-buffers when
     // redirected to a file, so the log line is the reliable "UFO2 launched" signal.
@@ -385,7 +386,17 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
         "running UFO2: -m ufo --task {task} (cwd={})",
         home.display()
     );
-    let st = cmd.status()?;
+    let st = match cmd.status() {
+        Ok(st) => st,
+        #[cfg(windows)]
+        Err(e) if std::env::var("UFOAGENT_REMOTE_TASK").is_ok() && e.raw_os_error() == Some(50) => {
+            use std::os::windows::process::CommandExt;
+            log::warn!("hidden UFO2 launch unsupported ({e}); retrying without CREATE_NO_WINDOW");
+            cmd.creation_flags(0);
+            cmd.status()?
+        }
+        Err(e) => return Err(e.into()),
+    };
     // Record in the on-node command history — unless the tray ran us as a remote task, in which case
     // the connection loop already logged it as a remote command (avoid double-counting).
     if std::env::var("UFOAGENT_REMOTE_TASK").is_err() {

@@ -40,6 +40,8 @@ $haveAdm  = [bool]($env:CI_ADMIN_TOKEN -and $env:CI_AGENT_ID)
 
 $phases = New-Object System.Collections.ArrayList
 $script:curCrop = $null
+$script:lastInstallDetail = ''
+$script:lastRemoteStatus = ''
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Get-FgRect {
   $h = [Win32]::GetForegroundWindow(); $r = New-Object RECT
@@ -56,34 +58,69 @@ function Focus-Proc([string]$name) {
 # Capture the crop for the current phase: focus $proc (if given), then record the foreground window rect.
 function Set-Crop([string]$proc = $null) { if ($proc) { Focus-Proc $proc }; $script:curCrop = Get-FgRect }
 
+function Write-ProgressEvent([string]$kind, [string]$phase = '', [string]$detail = '') {
+  $obj = [ordered]@{ ts = (Now); event = $kind }
+  if ($phase) { $obj.phase = $phase }
+  if ($detail) { $obj.detail = $detail }
+  ([pscustomobject]$obj | ConvertTo-Json -Compress) | Add-Content (Join-Path $OUT 'progress.ndjson') -Encoding Ascii
+}
+
 function Write-Result($status) {
   [pscustomobject]@{ status = $status; ended = (Now); phases = $phases } |
     ConvertTo-Json -Depth 6 | Set-Content (Join-Path $OUT 'result.json') -Encoding Ascii
 }
 function Phase([string]$name, [scriptblock]$body) {
   Write-Host "=== phase: $name ==="
+  Write-ProgressEvent 'phase_start' $name
   $script:curCrop = $null
   $s = Now; $ok = $true; $err = ''; $skip = $false
   try { $skip = (& $body) -eq 'SKIP' } catch { $ok = $false; $err = "$($_.Exception.Message)" }
   $e = Now
+  $dur = '{0:n1}s' -f (($e - $s) / 1000.0)
   $obj = [ordered]@{ label = $name; start = $s; end = $e; ok = $ok; skipped = $skip; error = $err }
   if ($script:curCrop) { $obj.crop = $script:curCrop }
   [void]$phases.Add([pscustomobject]$obj)
   ($phases | ConvertTo-Json -Depth 4) | Set-Content (Join-Path $OUT 'phases.json') -Encoding Ascii
+  if ($ok -and $skip) {
+    Write-ProgressEvent 'phase_skipped' $name $dur
+  } elseif ($ok) {
+    Write-ProgressEvent 'phase_done' $name $dur
+  } else {
+    Write-ProgressEvent 'phase_failed' $name $err
+  }
   if (-not $ok) { Write-Host "PHASE FAILED: $name : $err"; Write-Result 'FAIL'; throw "phase '$name' failed: $err" }
 }
 [pscustomobject]@{ status = 'RUNNING'; started = (Now) } | ConvertTo-Json | Set-Content (Join-Path $OUT 'result.json') -Encoding Ascii
+Write-ProgressEvent 'journey_start'
 
 # 1) INSTALL - the REAL installer in this session; /SILENT shows the visible "UFOAgent setup" console
 #    streaming the uv provisioning. Detached (bootstrap --pause hangs); poll the marker to ready.
 Phase 'install' {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
   $setup = Join-Path $ROOT 'dl\ufoagent-setup.exe'
-  Invoke-WebRequest -UseBasicParsing $BetaUrl -OutFile $setup
+  $installer = if ($env:UFOAGENT_INSTALLER_PATH -and -not $env:UFOAGENT_BETA_URL) { $env:UFOAGENT_INSTALLER_PATH } else { $null }
+  if ($installer) {
+    if (-not (Test-Path $installer)) { throw "staged installer not found: $installer" }
+    Write-ProgressEvent 'phase_update' 'install' 'using staged installer artifact'
+    if ($installer -ne $setup) { Copy-Item $installer $setup -Force }
+  } else {
+    Write-ProgressEvent 'phase_update' 'install' 'downloading installer'
+    Invoke-WebRequest -UseBasicParsing $BetaUrl -OutFile $setup
+  }
   Write-Host "installer: $((Get-Item $setup).Length) bytes"
+  Write-ProgressEvent 'phase_update' 'install' "installer ready: $((Get-Item $setup).Length) bytes"
   Start-Process $setup -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL'
+  Write-ProgressEvent 'phase_update' 'install' 'installer launched; waiting for UFO2 ready'
   $ready = Wait-For -TimeoutSec 600 -PollSec 5 -StreamAgentLog -Condition {
-    if (Test-Path $marker) { if ((Get-Content $marker -Raw | ConvertFrom-Json).state -in @('ready', 'broken')) { return $true } }
+    if (Test-Path $marker) {
+      $m = Get-Content $marker -Raw | ConvertFrom-Json
+      $detail = if ($m.detail) { "$($m.state): $($m.detail)" } else { "$($m.state)" }
+      if ($detail -and $detail -ne $script:lastInstallDetail) {
+        Write-ProgressEvent 'phase_update' 'install' $detail
+        $script:lastInstallDetail = $detail
+      }
+      if ($m.state -in @('ready', 'broken')) { return $true }
+    }
     $false
   }
   if (-not $ready) { throw 'provisioning did not reach a terminal state in 10m' }
@@ -128,9 +165,23 @@ Phase 'remote' {
   Stop-UfoWindows
   $resp = Send-NodeCommand 'run_task' 'Open Notepad and type the message: hello from ufoagent'
   Write-Host "sent run_task: id=$($resp.id) status=$($resp.status)"
+  Write-ProgressEvent 'phase_update' 'remote' "command queued: $($resp.id)"
   $script:remoteId = $resp.id
-  $opened = Wait-For -TimeoutSec 300 -StreamAgentLog -Condition { [bool](Get-Process notepad -ErrorAction SilentlyContinue) }
-  if (-not $opened) { Show-FileTail 'agent log' $AgentLog 40; throw 'remote run_task did not open Notepad' }
+  $opened = Wait-For -TimeoutSec 300 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $script:remoteId
+    if ($c -and $c.status -and $c.status -ne $script:lastRemoteStatus) {
+      Write-ProgressEvent 'phase_update' 'remote' "command status: $($c.status)"
+      $script:lastRemoteStatus = $c.status
+    }
+    if ($c -and $c.status -eq 'failed') { throw "run_task command failed: $($c.result)" }
+    [bool](Get-Process notepad -ErrorAction SilentlyContinue)
+  }
+  if (-not $opened) {
+    $c = if ($script:remoteId) { Get-NodeCommand $script:remoteId } else { $null }
+    if ($c) { Write-Host "run_task command result: status=$($c.status) result=$($c.result)" }
+    Show-FileTail 'agent log' $AgentLog 40
+    throw 'remote run_task did not open Notepad'
+  }
   Assert-TypedVerdict (Wait-NotepadTyped -StreamAgentLog) 'remote run_task'
   Set-Crop 'notepad'; Start-Sleep 1
 }
@@ -200,4 +251,5 @@ Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAct
 Stop-UfoWindows
 
 Write-Result 'PASS'
+Write-ProgressEvent 'journey_done'
 Write-Host 'JOURNEY DONE: PASS'
