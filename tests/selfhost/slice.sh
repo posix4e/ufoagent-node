@@ -9,12 +9,13 @@ command -v ffmpeg >/dev/null || { echo "ffmpeg missing on host"; exit 1; }
 command -v jq >/dev/null || { echo "jq missing on host"; exit 1; }
 
 gifname(){ case "$1" in
-  install)  echo install-screen;;
-  link)     echo link-screen;;
-  local)    echo local-task;;
-  remote)   echo remote-task;;
-  activity) echo activity-summary;;
-  *)        echo "$1";; esac; }
+  install)   echo install-screen;;
+  link)      echo link-screen;;
+  local)     echo local-task;;
+  remote)    echo remote-task;;
+  activity)  echo activity-summary;;
+  dashboard) echo mission-control;;
+  *)         echo "$1";; esac; }
 
 # PowerShell ConvertTo-Json unwraps a single-element array to a bare object; normalize to an array.
 [ -s "$PHASES" ] || { echo "no phases.json (journey produced none)"; exit 0; }
