@@ -204,12 +204,29 @@ Phase 'dashboard' {
   catch { Write-Host "could not save node-desktop.png: $($_.Exception.Message)" }
 
   # 7c) open mission control (real data via the CI-token preview) on this node's detail and record it.
-  #     App mode = no toolbar/address bar, so the token in the URL never appears in the gif; InPrivate
-  #     avoids first-run/profile nags.
+  #     App mode = no toolbar/address bar, so the token in the URL never appears in the gif. A FRESH
+  #     dedicated profile (+ --no-first-run) is what makes the app window actually appear on a clean box;
+  #     --inprivate (the previous attempt) silently produced no window. If Edge still never shows a
+  #     window, SKIP rather than crop the bare desktop into a misleading "dashboard" gif.
   $cp = 'https://app.ufoagent.xyz/preview/ci?token=' + [Uri]::EscapeDataString($env:CI_ADMIN_TOKEN) + '&node=' + [Uri]::EscapeDataString($env:CI_AGENT_ID)
-  Start-Process $edge -ArgumentList '--inprivate', '--no-first-run', '--no-default-browser-check', '--window-size=1280,800', ('--app=' + $cp)
-  Start-Sleep 12   # let the page load + the inlined screenshot render
+  Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+  $eprof = Join-Path $ROOT 'edge-app'; Remove-Item $eprof -Recurse -Force -ErrorAction SilentlyContinue
+  Start-Process $edge -ArgumentList '--no-first-run', '--no-default-browser-check', '--disable-sync',
+    '--disable-features=msEdgeWelcomeExperience', "--user-data-dir=$eprof", '--start-maximized',
+    '--window-size=1280,800', ('--app=' + $cp)
+  $win = Wait-For -TimeoutSec 30 -PollSec 2 -Condition {
+    [bool](Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 })
+  }
+  if (-not $win) {
+    Write-Host 'Edge never opened a window: skipping dashboard capture'
+    Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    return 'SKIP'
+  }
+  Start-Sleep 8    # let the page + the inlined screenshot paint
   Set-Crop 'msedge'
+  # Only a real Edge window should anchor the crop; the launcher console is ~880px wide, the maximized
+  # Edge app window is near full screen. If the crop looks like the console, drop it (full-frame gif).
+  if ($script:curCrop -and $script:curCrop.w -lt 1000) { Write-Host "crop too small (w=$($script:curCrop.w)) - Edge not foreground; SKIP"; $script:curCrop = $null; Get-Process msedge -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue; return 'SKIP' }
   Start-Sleep 2
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
