@@ -32,7 +32,9 @@ windows-service = "0.7"
 tray-icon = "0.19"
 tao = "0.30"
 winreg = "0.52"
-# UTF-8 console (QR glyphs) + Authenticode verification for self-update.
+# PNG encoding for the on-demand desktop screenshot (capture.rs). No decoders/other formats → small.
+image = { version = "0.25", default-features = false, features = ["png"] }
+# UTF-8 console (QR glyphs) + Authenticode verification for self-update + GDI desktop capture.
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Console",
@@ -42,6 +44,7 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
 ] }
 
 [profile.release]

@@ -14,12 +14,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::config_dir;
 
-/// A queued task the tray should execute (`ufoagent run --task <task> -r <request>`).
+/// A queued job the tray should execute in the interactive session. `kind` selects the action:
+/// "run_task" (default — `ufoagent run --task <task> -r <request>`) or "screenshot" (capture the
+/// desktop to `outbox/<id>.png`). `kind` defaults so older inbox files / callers still deserialize.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskRequest {
     pub id: String,
+    #[serde(default = "default_kind")]
+    pub kind: String,
     pub task: String,
     pub request: Option<String>,
+}
+
+fn default_kind() -> String {
+    "run_task".to_string()
 }
 
 /// What the tray reports back after running the task.
@@ -63,6 +71,15 @@ pub fn take_result(id: &str) -> Option<TaskResult> {
     let res: TaskResult = serde_json::from_slice(&data).ok()?;
     let _ = std::fs::remove_file(&p);
     Some(res)
+}
+
+/// Read + remove the screenshot PNG the tray captured for `id` (binary, so it rides alongside the
+/// JSON result rather than inside it). The service uploads it to the control plane.
+pub fn take_screenshot(id: &str) -> Option<Vec<u8>> {
+    let p = outbox_dir().join(format!("{id}.png"));
+    let data = std::fs::read(&p).ok()?;
+    let _ = std::fs::remove_file(&p);
+    Some(data)
 }
 
 /// True if the tray touched its liveness marker within `max_age_secs` — i.e. there's a live
@@ -128,6 +145,15 @@ pub fn report(res: &TaskResult) -> Result<()> {
     Ok(())
 }
 
+/// Write the captured screenshot PNG for the service to upload. Writes `outbox/<id>.png`.
+#[cfg(any(windows, test))]
+pub fn report_screenshot(id: &str, png: &[u8]) -> Result<()> {
+    let dir = outbox_dir();
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(format!("{id}.png")), png)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +170,7 @@ mod tests {
         with_temp(|| {
             let req = TaskRequest {
                 id: "cmd_test1".into(),
+                kind: "run_task".into(),
                 task: "adhoc".into(),
                 request: Some("open notepad".into()),
             };
@@ -167,6 +194,19 @@ mod tests {
             assert_eq!(res.status, "done");
             // Taken results are consumed once.
             assert!(take_result(&req.id).is_none());
+        });
+    }
+
+    #[test]
+    fn screenshot_roundtrip() {
+        with_temp(|| {
+            // Nothing captured yet.
+            assert!(take_screenshot("cmd_shot1").is_none());
+            // Tray writes the PNG, service picks it up exactly once.
+            let png = b"\x89PNG\r\n\x1a\n fake bytes";
+            report_screenshot("cmd_shot1", png).unwrap();
+            assert_eq!(take_screenshot("cmd_shot1").as_deref(), Some(&png[..]));
+            assert!(take_screenshot("cmd_shot1").is_none());
         });
     }
 

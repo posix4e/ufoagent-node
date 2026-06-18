@@ -1,6 +1,8 @@
 mod activity;
 mod autologon;
 mod bootstrap;
+#[cfg(windows)]
+mod capture;
 mod cli;
 mod cmdlog;
 mod config;

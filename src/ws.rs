@@ -21,6 +21,8 @@ use crate::{daemon, repair, store, taskqueue};
 
 /// Max time we wait for the tray to finish a run_task before reporting a timeout.
 const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+/// Screenshots are a quick GDI grab + PNG encode in the tray — give it a short, snappy ceiling.
+const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Result strings are unbounded TEXT on the control plane; keep WS frames sane.
 const RESULT_MAX: usize = 8192;
 
@@ -236,6 +238,13 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
         return Ok(());
     }
 
+    // A screenshot is captured in the interactive session (the tray, like run_task) and the PNG is
+    // uploaded out-of-band to the control plane; hand it to a worker so the read loop keeps pinging.
+    if cmd == "screenshot" {
+        spawn_screenshot(state.clone(), id, cfg.control_plane_url());
+        return Ok(());
+    }
+
     let (status, result) = execute(cfg, cmd);
     crate::cmdlog::record("remote", cmd, None, status, Some(&result));
     send(
@@ -302,6 +311,7 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
 
         let req = taskqueue::TaskRequest {
             id: id.clone(),
+            kind: "run_task".into(),
             task,
             request,
         };
@@ -327,6 +337,98 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             std::thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+/// Capture a desktop screenshot and upload the PNG to the control plane. Like run_task, the capture
+/// happens in the Session-1 tray (Session 0 has no display): we queue a `screenshot` job, the tray
+/// grabs the desktop and writes `outbox/<id>.png`, then this worker PUTs it to the control plane and
+/// reports the command result. The PNG rides out-of-band (binary upload), not inside the WS result.
+fn spawn_screenshot(state: Arc<WsState>, id: String, control_plane: String) {
+    std::thread::spawn(move || {
+        let finish = |state: &WsState, status: &str, result: String| {
+            crate::cmdlog::record("remote", "screenshot", None, status, Some(&result));
+            state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
+        };
+
+        // No live desktop session means no tray to capture the screen — fail fast and actionably.
+        if !taskqueue::tray_alive(20) {
+            finish(
+                &state,
+                "failed",
+                "no interactive desktop (tray not running); run `ufoagent autologon` on this node"
+                    .to_string(),
+            );
+            return;
+        }
+
+        let req = taskqueue::TaskRequest {
+            id: id.clone(),
+            kind: "screenshot".into(),
+            task: "screenshot".into(),
+            request: None,
+        };
+        if let Err(e) = taskqueue::enqueue(&req) {
+            finish(&state, "failed", format!("could not queue screenshot: {e}"));
+            return;
+        }
+
+        let deadline = Instant::now() + SCREENSHOT_TIMEOUT;
+        loop {
+            if let Some(res) = taskqueue::take_result(&id) {
+                if res.status != "done" {
+                    finish(&state, "failed", res.result);
+                    return;
+                }
+                // Tray captured OK; the PNG it wrote rides alongside the JSON result.
+                let Some(png) = taskqueue::take_screenshot(&id) else {
+                    finish(
+                        &state,
+                        "failed",
+                        "tray reported success but left no screenshot file".to_string(),
+                    );
+                    return;
+                };
+                match upload_screenshot(&control_plane, &id, &png) {
+                    Ok(()) => finish(
+                        &state,
+                        "done",
+                        format!("screenshot captured ({} bytes)", png.len()),
+                    ),
+                    Err(e) => finish(&state, "failed", format!("screenshot upload failed: {e}")),
+                }
+                return;
+            }
+            if Instant::now() >= deadline {
+                finish(&state, "failed", "screenshot timed out".to_string());
+                return;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+    });
+}
+
+/// PUT the captured PNG to `/v1/agent/screenshot?cmd=<id>` (agent-token auth). The control plane
+/// stashes it in R2 keyed by the command id; the dashboard fetches it back for the requesting owner.
+fn upload_screenshot(control_plane: &str, id: &str, png: &[u8]) -> Result<()> {
+    let token = store::get_token().ok_or_else(|| anyhow!("not linked; no token"))?;
+    let base = control_plane.trim_end_matches('/');
+    let url = format!("{base}/v1/agent/screenshot?cmd={id}");
+    match ureq::put(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .set("user-agent", USER_AGENT)
+        .set("content-type", "image/png")
+        .send_bytes(png)
+    {
+        Ok(_) => Ok(()),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            Err(anyhow!(
+                "control plane HTTP {code}: {}",
+                body.chars().take(200).collect::<String>()
+            ))
+        }
+        Err(e) => Err(anyhow!("request failed: {e}")),
+    }
 }
 
 /// Truncate a result string to `max` bytes on a char boundary, marking it was cut.
