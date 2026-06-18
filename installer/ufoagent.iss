@@ -30,6 +30,7 @@ Source: "..\target\release\ufoagent.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\Link this machine"; Filename: "{app}\ufoagent.exe"; Parameters: "link"
+Name: "{group}\Configure unattended GUI mode"; Filename: "{app}\ufoagent.exe"; Parameters: "autologon --pause"
 Name: "{group}\Repair UFOAgent"; Filename: "{app}\ufoagent.exe"; Parameters: "repair"
 ; Launch the tray manager for every user at logon (replaces the old schtasks ONLOGON task —
 ; a Startup-folder shortcut is simpler and more reliable). Inno removes it on uninstall.
@@ -42,7 +43,8 @@ Root: HKLM; Subkey: "SYSTEM\CurrentControlSet\Control\Session Manager\Environmen
   Check: NeedsAddPath('{app}')
 
 [Run]
-; Install + start the Windows service (keeps LLM credentials fresh + heartbeats).
+; Install + start the Windows service helper (keeps credentials fresh, heartbeats, self-heals the
+; login-session worker when a desktop is available). GUI tasks still run from the logon tray worker.
 Filename: "{app}\ufoagent.exe"; Parameters: "service install"; Flags: runhidden
 ; Provision UFO2 + dependencies (one-time, large download). Run in a VISIBLE console via
 ; `cmd /c start` so the user sees progress and any failure stays on screen (`--pause`). `nowait`
@@ -52,6 +54,11 @@ Filename: "{cmd}"; \
   Flags: nowait
 ; Launch the tray now so the 🛸 manager appears immediately (it FreeConsole()s its own window).
 Filename: "{app}\ufoagent.exe"; Parameters: "tray"; Flags: nowait runhidden
+; UFOAgent is built for unattended GUI tasks: prompt for Windows auto-logon during install so the
+; machine reboots into a usable desktop. The prompt requires explicit credentials and confirmation.
+Filename: "{cmd}"; \
+  Parameters: "/c start /wait ""UFOAgent unattended GUI"" ""{app}\ufoagent.exe"" autologon --pause"; \
+  Description: "Configure unattended GUI mode (auto-login)"; Flags: postinstall skipifsilent
 ; Offer to link now (opens a console showing a scannable QR — approve from your phone).
 Filename: "{app}\ufoagent.exe"; Parameters: "link --pause"; \
   Description: "Link this machine to UFOAgent now"; Flags: postinstall nowait skipifsilent

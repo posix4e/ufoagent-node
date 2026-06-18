@@ -228,7 +228,22 @@ fn main() -> Result<()> {
                 password,
                 domain,
                 disable,
-            } => autologon::run(&user, password.as_deref(), domain.as_deref(), disable)?,
+                pause,
+            } => {
+                let result = autologon::run(
+                    user.as_deref(),
+                    password.as_deref(),
+                    domain.as_deref(),
+                    disable,
+                );
+                if let Err(e) = &result {
+                    eprintln!("\n  Unattended GUI setup failed: {e:#}\n");
+                }
+                if pause {
+                    pause_enter();
+                }
+                result?;
+            }
         }
         Ok(())
     })();

@@ -82,16 +82,23 @@ pub enum Cmd {
     },
     /// System-tray manager UI (Windows).
     Tray,
-    /// Configure unattended auto-logon (Windows).
+    /// Configure unattended GUI mode by enabling Windows auto-logon (Windows).
     Autologon {
+        /// Windows user to auto-logon. Omit to be prompted.
         #[arg(long)]
-        user: String,
+        user: Option<String>,
+        /// Windows password for --user. Omit to be prompted without echo.
         #[arg(long)]
         password: Option<String>,
+        /// Windows domain/computer name. Omit to use the current domain/computer.
         #[arg(long)]
         domain: Option<String>,
+        /// Disable auto-logon.
         #[arg(long)]
         disable: bool,
+        /// Wait for Enter before exiting, so an installer-spawned console stays readable.
+        #[arg(long)]
+        pause: bool,
     },
 }
 

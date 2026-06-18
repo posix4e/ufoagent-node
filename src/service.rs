@@ -1,4 +1,5 @@
-//! Windows service: install / uninstall / run the credential-refresh + heartbeat daemon.
+//! Windows service helper: install / uninstall / run the credential-refresh + heartbeat daemon.
+//! GUI work runs in the logon-session tray worker; Session 0 is only coordination/maintenance.
 //! Non-Windows builds get a stub so the crate compiles on macOS/Linux for `cargo check`/`test`.
 
 use anyhow::Result;
@@ -88,7 +89,8 @@ mod imp {
         Ok(())
     }
 
-    const DESCRIPTION: &str = "UFOAgent node daemon — keeps LLM credentials fresh";
+    const DESCRIPTION: &str =
+        "UFOAgent helper — credentials, heartbeats, updates, and login-worker self-heal";
 
     pub fn install() -> Result<()> {
         let manager = ServiceManager::local_computer(
