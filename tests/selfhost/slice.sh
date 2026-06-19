@@ -12,7 +12,9 @@ gifname(){ case "$1" in
   install)   echo install-screen;;
   link)      echo link-screen;;
   remote)    echo remote-task;;
+  bambu)     echo bambu-studio;;
   dashboard) echo mission-control;;
+  activity)  echo activity-summary;;
   *)         echo "$1";; esac; }
 
 gha_escape(){

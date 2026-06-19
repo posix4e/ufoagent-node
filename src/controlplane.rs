@@ -2,9 +2,11 @@
 
 use anyhow::{anyhow, bail, Result};
 use serde::Deserialize;
+use std::time::Duration;
 
 /// Explicit User-Agent: the default agent string is blocked by Cloudflare's bot rules (403).
 pub const USER_AGENT: &str = concat!("ufoagent/", env!("CARGO_PKG_VERSION"));
+const HTTP_TIMEOUT: Duration = Duration::from_secs(25);
 
 #[derive(Debug, Deserialize)]
 pub struct Credential {
@@ -59,7 +61,8 @@ impl ControlPlane {
     fn get_json<T: for<'de> Deserialize<'de>>(&self, path: &str, auth: bool) -> Result<T> {
         let mut req = ureq::get(&self.url(path))
             .set("user-agent", USER_AGENT)
-            .set("accept", "application/json");
+            .set("accept", "application/json")
+            .timeout(HTTP_TIMEOUT);
         if auth {
             req = req.set("authorization", &format!("Bearer {}", self.bearer()?));
         }
@@ -74,7 +77,8 @@ impl ControlPlane {
     ) -> Result<T> {
         let mut req = ureq::post(&self.url(path))
             .set("user-agent", USER_AGENT)
-            .set("accept", "application/json");
+            .set("accept", "application/json")
+            .timeout(HTTP_TIMEOUT);
         if auth {
             req = req.set("authorization", &format!("Bearer {}", self.bearer()?));
         }

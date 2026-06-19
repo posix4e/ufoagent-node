@@ -1,12 +1,70 @@
 //! Render UFO2's config/ufo/agents.yaml from a vended credential.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::controlplane::Credential;
 
 const MANAGED_USE_MCP_LINE: &str =
     "USE_MCP: False  # Managed by ufoagent: use UI automation; UFO MCP can crash GUI tasks.";
+const MANAGED_MCP_YAML: &str = r#"# Managed by ufoagent - do not edit by hand.
+# Keep UFO's local UI data/action servers plus HostAgent's constrained app launcher. The managed
+# runner still needs local MCP for screenshots, window enumeration, clicks, typing, and opening GUI
+# apps. Avoid Office/HTTP MCP servers; prompt-level MCP tool loading is skipped separately when
+# USE_MCP=False.
+HostAgent:
+  default:
+    data_collection:
+      - namespace: UICollector
+        type: local
+        start_args: []
+        reset: false
+    action:
+      - namespace: HostUIExecutor
+        type: local
+        start_args: []
+        reset: false
+      - namespace: CommandLineExecutor
+        type: local
+        start_args: []
+        reset: false
+
+AppAgent:
+  default:
+    data_collection:
+      - namespace: UICollector
+        type: local
+        start_args: []
+        reset: false
+    action:
+      - namespace: AppUIExecutor
+        type: local
+        start_args: []
+        reset: false
+"#;
+const MANAGED_SKIP_MCP_MARKER: &str = "Managed by ufoagent: honor USE_MCP=False";
+const MCP_LOAD_SENTINEL: &str = r#"        self.logger.info("Loading MCP tool information...")"#;
+const MANAGED_SKIP_MCP_GUARD: &str = r#"        # Managed by ufoagent: honor USE_MCP=False before UFO's unconditional list_tools call.
+        if not get_ufo_config().system.use_mcp:
+            self.logger.info("Skipping MCP tool information because USE_MCP is disabled.")
+            self.prompter.create_api_prompt_template(tools=[])
+            return
+
+        self.logger.info("Loading MCP tool information...")"#;
+const MANAGED_CLI_ALLOWLIST_MARKER: &str =
+    "Managed by ufoagent: allow Bambu Studio launcher for GUI task demos.";
+const CLI_ALLOWLIST_SENTINEL: &str = r#"        # Common utilities
+        "code",
+        "code.exe","#;
+const MANAGED_CLI_ALLOWLIST: &str = r#"        # Common utilities
+        "code",
+        "code.exe",
+        # Managed by ufoagent: allow Bambu Studio launcher for GUI task demos.
+        "bambu-studio",
+        "bambu-studio.exe",
+        "bambu-studio.cmd",
+        "bambustudio",
+        "bambustudio.exe","#;
 
 fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -47,13 +105,86 @@ pub fn system_yaml_path(ufo_home: &Path) -> PathBuf {
     ufo_home.join("config").join("ufo").join("system.yaml")
 }
 
+pub fn mcp_yaml_path(ufo_home: &Path) -> PathBuf {
+    ufo_home.join("config").join("ufo").join("mcp.yaml")
+}
+
+fn apply_managed_mcp_config(ufo_home: &Path) -> Result<PathBuf> {
+    let path = mcp_yaml_path(ufo_home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(current) if current == MANAGED_MCP_YAML => {}
+        _ => std::fs::write(&path, MANAGED_MCP_YAML)?,
+    }
+    Ok(path)
+}
+
+fn patch_mcp_loader(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO MCP loader {}", path.display()))?;
+    if original.contains(MANAGED_SKIP_MCP_MARKER) {
+        return Ok(false);
+    }
+    let patched = original.replacen(MCP_LOAD_SENTINEL, MANAGED_SKIP_MCP_GUARD, 1);
+    if patched == original {
+        anyhow::bail!(
+            "could not find MCP loader sentinel in UFO file {}",
+            path.display()
+        );
+    }
+    std::fs::write(path, patched)
+        .with_context(|| format!("writing managed UFO MCP loader patch {}", path.display()))?;
+    Ok(true)
+}
+
+fn patch_cli_allowlist(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO CLI launcher {}", path.display()))?;
+    if original.contains(MANAGED_CLI_ALLOWLIST_MARKER) {
+        return Ok(false);
+    }
+    let patched = original.replacen(CLI_ALLOWLIST_SENTINEL, MANAGED_CLI_ALLOWLIST, 1);
+    if patched == original {
+        anyhow::bail!(
+            "could not find CLI launcher allow-list sentinel in UFO file {}",
+            path.display()
+        );
+    }
+    std::fs::write(path, patched)
+        .with_context(|| format!("writing managed UFO CLI launcher patch {}", path.display()))?;
+    Ok(true)
+}
+
+fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
+    for rel in [
+        ["ufo", "agents", "agent", "host_agent.py"],
+        ["ufo", "agents", "agent", "app_agent.py"],
+    ] {
+        let path = rel.iter().fold(ufo_home.to_path_buf(), |p, c| p.join(c));
+        if path.exists() {
+            patch_mcp_loader(&path)?;
+        }
+    }
+    let cli = ["ufo", "client", "mcp", "local_servers", "cli_mcp_server.py"]
+        .iter()
+        .fold(ufo_home.to_path_buf(), |p, c| p.join(c));
+    if cli.exists() {
+        patch_cli_allowlist(&cli)?;
+    }
+    Ok(())
+}
+
 /// Apply UFOAgent-owned UFO defaults that keep the managed GUI runner stable.
 ///
-/// UFO currently enables MCP by default, but its MCP tool-list plumbing can hand strings to code that
-/// expects tool objects, crashing tasks before UI automation can drive the app. The managed node is
-/// specifically a GUI automation runner, so keep UFO on the UI path unless we deliberately support
-/// MCP later.
+/// UFO's local MCP servers are also its UI automation transport. Keep the local UI servers available
+/// for screenshots/clicks/typing and the constrained HostAgent app launcher, but remove Office/HTTP
+/// MCP servers and skip prompt-level MCP tool loading while `USE_MCP` is false.
 pub fn apply_managed_defaults(ufo_home: &Path) -> Result<PathBuf> {
+    apply_managed_mcp_config(ufo_home)?;
+    apply_managed_mcp_loader_patches(ufo_home)?;
+
     let path = system_yaml_path(ufo_home);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -159,10 +290,16 @@ mod tests {
     fn managed_defaults_disable_existing_mcp() {
         let home = temp_home("mcp-existing");
         let system = system_yaml_path(&home);
+        let mcp = mcp_yaml_path(&home);
         std::fs::create_dir_all(system.parent().unwrap()).unwrap();
         std::fs::write(
             &system,
             "# UFO System Configuration\nUSE_MCP: True  # upstream default\nMAX_STEP: 50\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &mcp,
+            "AppAgent:\n  default:\n    data_collection:\n      - namespace: UICollector\n",
         )
         .unwrap();
 
@@ -171,6 +308,13 @@ mod tests {
         assert!(y.contains(MANAGED_USE_MCP_LINE));
         assert!(!y.contains("USE_MCP: True"));
         assert!(y.contains("MAX_STEP: 50"));
+        let mcp_y = std::fs::read_to_string(&mcp).unwrap();
+        assert_eq!(mcp_y, MANAGED_MCP_YAML);
+        assert!(mcp_y.contains("namespace: UICollector"));
+        assert!(mcp_y.contains("namespace: HostUIExecutor"));
+        assert!(mcp_y.contains("namespace: AppUIExecutor"));
+        assert!(mcp_y.contains("namespace: CommandLineExecutor"));
+        assert!(!mcp_y.contains("http"));
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -183,6 +327,82 @@ mod tests {
         let y = std::fs::read_to_string(&path).unwrap();
         assert!(y.contains("# UFOAgent managed defaults"));
         assert!(y.contains(MANAGED_USE_MCP_LINE));
+        assert_eq!(
+            std::fs::read_to_string(mcp_yaml_path(&home)).unwrap(),
+            MANAGED_MCP_YAML
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_defaults_patch_ufo_mcp_loaders() {
+        let home = temp_home("mcp-loader");
+        let host = home
+            .join("ufo")
+            .join("agents")
+            .join("agent")
+            .join("host_agent.py");
+        let app = home
+            .join("ufo")
+            .join("agents")
+            .join("agent")
+            .join("app_agent.py");
+        std::fs::create_dir_all(host.parent().unwrap()).unwrap();
+        for path in [&host, &app] {
+            std::fs::write(
+                path,
+                format!(
+                    "class Agent:\n    async def _load_mcp_context(self, context):\n{MCP_LOAD_SENTINEL}\n        result = await context.command_dispatcher.execute_commands([])\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        apply_managed_defaults(&home).unwrap();
+        for path in [&host, &app] {
+            let patched = std::fs::read_to_string(path).unwrap();
+            assert!(patched.contains(MANAGED_SKIP_MCP_MARKER));
+            assert!(patched.contains("if not get_ufo_config().system.use_mcp:"));
+            assert!(patched.contains("self.prompter.create_api_prompt_template(tools=[])"));
+            assert_eq!(patched.matches(MANAGED_SKIP_MCP_MARKER).count(), 1);
+        }
+
+        apply_managed_defaults(&home).unwrap();
+        for path in [&host, &app] {
+            let patched = std::fs::read_to_string(path).unwrap();
+            assert_eq!(patched.matches(MANAGED_SKIP_MCP_MARKER).count(), 1);
+        }
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_defaults_patch_cli_launcher_allowlist() {
+        let home = temp_home("cli-allowlist");
+        let cli = home
+            .join("ufo")
+            .join("client")
+            .join("mcp")
+            .join("local_servers")
+            .join("cli_mcp_server.py");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cli,
+            format!("ALLOWED_CLI_COMMANDS = frozenset({{\n{CLI_ALLOWLIST_SENTINEL}\n    }}\n)\n"),
+        )
+        .unwrap();
+
+        apply_managed_defaults(&home).unwrap();
+        let patched = std::fs::read_to_string(&cli).unwrap();
+        assert!(patched.contains(MANAGED_CLI_ALLOWLIST_MARKER));
+        assert!(patched.contains("\"bambu-studio.cmd\""));
+        assert!(patched.contains("\"bambustudio.exe\""));
+        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
+
+        apply_managed_defaults(&home).unwrap();
+        let patched = std::fs::read_to_string(&cli).unwrap();
+        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
 
         let _ = std::fs::remove_dir_all(home);
     }

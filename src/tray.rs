@@ -49,7 +49,7 @@ mod imp {
     use std::io::BufRead;
     use std::process::Stdio;
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
     use tao::event::Event;
     use tao::event_loop::{ControlFlow, EventLoopBuilder};
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -156,7 +156,8 @@ mod imp {
         reader: R,
         transcript: Arc<Mutex<String>>,
         progress: runtime::ProgressCallback,
-    ) -> std::thread::JoinHandle<()> {
+        done: std::sync::mpsc::Sender<&'static str>,
+    ) {
         std::thread::spawn(move || {
             let mut reader = std::io::BufReader::new(reader);
             let mut buf = Vec::new();
@@ -187,7 +188,8 @@ mod imp {
                     }
                 }
             }
-        })
+            let _ = done.send(name);
+        });
     }
 
     /// Run one remote task in this interactive session: `ufoagent run --task <task> -r <request>`.
@@ -240,18 +242,29 @@ mod imp {
         };
 
         let transcript = Arc::new(Mutex::new(String::new()));
-        let mut readers = Vec::new();
+        let (reader_done_tx, reader_done_rx) = std::sync::mpsc::channel();
+        let mut reader_count = 0;
         if let Some(stdout) = child.stdout.take() {
-            readers.push(spawn_reader(
+            reader_count += 1;
+            spawn_reader(
                 "stdout",
                 stdout,
                 transcript.clone(),
                 progress.clone(),
-            ));
+                reader_done_tx.clone(),
+            );
         }
         if let Some(stderr) = child.stderr.take() {
-            readers.push(spawn_reader("stderr", stderr, transcript.clone(), progress));
+            reader_count += 1;
+            spawn_reader(
+                "stderr",
+                stderr,
+                transcript.clone(),
+                progress,
+                reader_done_tx.clone(),
+            );
         }
+        drop(reader_done_tx);
 
         let status = match child.wait() {
             Ok(s) => s,
@@ -263,8 +276,27 @@ mod imp {
                 }
             }
         };
-        for reader in readers {
-            let _ = reader.join();
+
+        // GUI apps launched through UFO can inherit redirected stdout/stderr handles and keep them
+        // open after the UFO child exits. Do not let those inherited handles block command result
+        // delivery to the control plane.
+        let drain_deadline = Instant::now() + Duration::from_secs(2);
+        let mut drained = 0;
+        while drained < reader_count {
+            let remaining = drain_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match reader_done_rx.recv_timeout(remaining) {
+                Ok(_) => drained += 1,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        if drained < reader_count {
+            if let Ok(mut t) = transcript.lock() {
+                t.push_str("[ufoagent] output readers still open after child exit; continuing\n");
+            }
         }
         let transcript = transcript.lock().map(|t| t.clone()).unwrap_or_default();
         let logs = crate::config::config_dir().join("tasks").join("logs");
