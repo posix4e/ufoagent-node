@@ -46,8 +46,8 @@ $phases = New-Object System.Collections.ArrayList
 $script:curCrop = $null
 $script:lastInstallDetail = ''
 $script:lastRemoteStatus = ''
-$script:lastBambuStatus = ''
-$script:bambuProcessName = 'bambu-studio'
+$script:lastThirdPartyStatus = ''
+$script:thirdPartyProcessName = 'notepad++'
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Get-FgRect {
   $h = [Win32]::GetForegroundWindow(); $r = New-Object RECT
@@ -185,12 +185,17 @@ function Assert-ManagedUfoConfig {
   $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
   if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
   $cliRaw = Get-Content $cli -Raw
-  foreach ($allowed in @('"bambu-studio.cmd"', '"bambustudio.exe"')) {
+  foreach ($allowed in @('"ufoagent-launch.cmd"')) {
     if ($cliRaw -notmatch [regex]::Escape($allowed)) {
       throw "UFO CLI launcher allow-list missing: $allowed"
     }
   }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, Bambu launcher allowed'
+  foreach ($blocked in @('"notepad-plus-plus.cmd"', '"notepad++.exe"')) {
+    if ($cliRaw -match [regex]::Escape($blocked)) {
+      throw "UFO CLI launcher still exposes per-app command: $blocked"
+    }
+  }
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, generic launcher allowed'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -212,27 +217,25 @@ function Write-CommandResultProgress([string]$phase, $command) {
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
 }
 
-function Get-BambuExe {
+function Get-NotepadPlusPlusExe {
   $candidates = @(
-    "$env:ProgramFiles\Bambu Studio\bambu-studio.exe",
-    "$env:ProgramFiles\Bambu Studio\BambuStudio.exe",
-    "${env:ProgramFiles(x86)}\Bambu Studio\bambu-studio.exe",
-    "${env:ProgramFiles(x86)}\Bambu Studio\BambuStudio.exe"
+    "$env:ProgramFiles\Notepad++\notepad++.exe",
+    "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
   )
   $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
   if ($found) { return $found }
 
-  $portable = Join-Path $ROOT 'apps\BambuStudio'
+  $portable = Join-Path $ROOT 'apps\NotepadPlusPlus'
   if (Test-Path $portable) {
-    Get-ChildItem $portable -Recurse -File -Include 'bambu-studio.exe', 'BambuStudio.exe' -ErrorAction SilentlyContinue |
+    Get-ChildItem $portable -Recurse -File -Include 'notepad++.exe' -ErrorAction SilentlyContinue |
       Select-Object -First 1 -ExpandProperty FullName
   }
 }
 
-function Install-BambuShortcut([string]$exe) {
+function Install-NotepadPlusPlusShortcut([string]$exe) {
   $targets = @(
-    "$env:PUBLIC\Desktop\Bambu Studio.lnk",
-    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Bambu Studio.lnk"
+    "$env:PUBLIC\Desktop\Notepad++.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Notepad++.lnk"
   )
   $shell = New-Object -ComObject WScript.Shell
   foreach ($target in $targets) {
@@ -240,57 +243,116 @@ function Install-BambuShortcut([string]$exe) {
     $lnk = $shell.CreateShortcut($target)
     $lnk.TargetPath = $exe
     $lnk.WorkingDirectory = Split-Path $exe
-    $lnk.Description = 'Bambu Studio'
+    $lnk.Description = 'Notepad++'
     $lnk.Save()
   }
 }
 
-function Install-BambuLaunchShim([string]$exe) {
-  $cmd = Join-Path $env:WINDIR 'bambu-studio.cmd'
+function Quote-PsString([string]$value) {
+  "'" + $value.Replace("'", "''") + "'"
+}
+
+function Install-UfoAgentLauncher {
+  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  $ps1 = Join-Path $env:ProgramData 'UFOAgent\ufoagent-launch.ps1'
+  $psBody = @(
+    'param(',
+    '  [Parameter(Mandatory=$true, Position=0)][string]$AppId,',
+    '  [Parameter(ValueFromRemainingArguments=$true)][string[]]$AppArgs',
+    ')',
+    'if ($AppId -notmatch ''^[A-Za-z0-9_.-]+$'') { Write-Error "ufoagent-launch: invalid app id: $AppId"; exit 2 }',
+    '$script = Join-Path $env:ProgramData ("UFOAgent\launchers\" + $AppId + ".ps1")',
+    'if (-not (Test-Path $script)) { Write-Error "ufoagent-launch: unknown app: $AppId"; exit 2 }',
+    '& $script @AppArgs',
+    'if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }',
+    'exit 0'
+  )
+  Set-Content -Path $ps1 -Value $psBody -Encoding Ascii
+
+  $cmd = Join-Path $env:WINDIR 'ufoagent-launch.cmd'
   $body = @(
     '@echo off',
-    ('start "" /D "' + (Split-Path $exe) + '" "' + $exe + '" %* ^<NUL ^>NUL 2^>NUL')
+    'powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\UFOAgent\ufoagent-launch.ps1" %*',
+    'exit /b %ERRORLEVEL%'
   )
   Set-Content -Path $cmd -Value $body -Encoding Ascii
 }
 
-function Install-BambuStudio {
-  $existing = Get-BambuExe
+function Register-UfoAgentLaunchApp([string]$id, [string]$exe) {
+  Install-UfoAgentLauncher
+  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  $script = Join-Path $dir "$id.ps1"
+  $exeQ = Quote-PsString $exe
+  $dirQ = Quote-PsString (Split-Path $exe)
+  $body = @(
+    'param([Parameter(ValueFromRemainingArguments=$true)][string[]]$AppArgs)',
+    ('$exe = ' + $exeQ),
+    ('$dir = ' + $dirQ),
+    'if ($AppArgs -and $AppArgs.Count -gt 0) {',
+    '  Start-Process -FilePath $exe -WorkingDirectory $dir -ArgumentList $AppArgs',
+    '} else {',
+    '  Start-Process -FilePath $exe -WorkingDirectory $dir',
+    '}',
+    'exit 0'
+  )
+  Set-Content -Path $script -Value $body -Encoding Ascii
+}
+
+function Install-NotepadPlusPlus {
+  $existing = Get-NotepadPlusPlusExe
   if ($existing) {
-    Install-BambuShortcut $existing
-    Install-BambuLaunchShim $existing
-    Write-Host "Bambu Studio already installed: $existing"
+    Install-NotepadPlusPlusShortcut $existing
+    Register-UfoAgentLaunchApp 'notepad-plus-plus' $existing
+    Write-Host "Notepad++ already installed: $existing"
     return $existing
   }
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Write-ProgressEvent 'phase_update' 'bambu' 'resolving latest Bambu Studio release'
-  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/bambulab/BambuStudio/releases/latest'
-  $asset = $rel.assets | Where-Object { $_.name -match '^Bambu_Studio_win-.*\.zip$' } | Select-Object -First 1
-  if (-not $asset) { throw 'latest Bambu Studio release has no Windows zip asset' }
-  $archive = Join-Path $ROOT 'dl\bambu-studio.zip'
-  $dest = Join-Path $ROOT 'apps\BambuStudio'
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'resolving latest Notepad++ release'
+  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/notepad-plus-plus/notepad-plus-plus/releases/latest'
+  $asset = $rel.assets | Where-Object { $_.name -match '^npp\..*\.portable\.x64\.zip$' } | Select-Object -First 1
+  if (-not $asset) { throw 'latest Notepad++ release has no portable x64 zip asset' }
+  $archive = Join-Path $ROOT 'dl\notepad-plus-plus.zip'
+  $dest = Join-Path $ROOT 'apps\NotepadPlusPlus'
   New-Item -ItemType Directory -Force -Path (Split-Path $archive), $dest | Out-Null
-  Write-Host "Bambu Studio archive: $($asset.name) $($asset.size) bytes"
-  Write-ProgressEvent 'phase_update' 'bambu' "downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
+  Write-Host "Notepad++ archive: $($asset.name) $($asset.size) bytes"
+  Write-ProgressEvent 'phase_update' 'thirdparty' "downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
   Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri $asset.browser_download_url -OutFile $archive
-  Write-ProgressEvent 'phase_update' 'bambu' 'extracting Bambu Studio'
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'extracting Notepad++'
   if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
   New-Item -ItemType Directory -Force $dest | Out-Null
   Expand-Archive -Path $archive -DestinationPath $dest -Force
-  $exe = Get-BambuExe
-  if (-not $exe) { throw 'Bambu Studio archive extracted but app executable was not found' }
-  Install-BambuShortcut $exe
-  Install-BambuLaunchShim $exe
-  Write-ProgressEvent 'phase_update' 'bambu' 'Bambu Studio ready'
+  $exe = Get-NotepadPlusPlusExe
+  if (-not $exe) { throw 'Notepad++ archive extracted but app executable was not found' }
+  Install-NotepadPlusPlusShortcut $exe
+  Register-UfoAgentLaunchApp 'notepad-plus-plus' $exe
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'Notepad++ ready'
   $exe
 }
 
-function Get-BambuProcess {
-  Get-Process 'bambu-studio', 'BambuStudio' -ErrorAction SilentlyContinue
+function Get-NotepadPlusPlusProcess {
+  Get-Process 'notepad++' -ErrorAction SilentlyContinue
 }
 
-function Stop-BambuStudio {
-  Get-BambuProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+function Stop-NotepadPlusPlus {
+  Get-NotepadPlusPlusProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Assert-NoNotepadPlusPlusLaunchError {
+  $dlg = Find-UiaByName 'ERROR' 'Window' -ChildrenOnly
+  if (-not $dlg) { return }
+  $names = New-Object System.Collections.ArrayList
+  foreach ($el in (Get-UiaElements $dlg)) {
+    try {
+      $name = $el.Current.Name + ''
+      if ($name) { [void]$names.Add($name) }
+    } catch {}
+  }
+  $text = $names -join ' '
+  if ($text -match 'Cannot open file') {
+    throw "Notepad++ opened an error dialog: $text"
+  }
 }
 
 function Test-UfoTranscriptTyped([string]$id, [string]$want) {
@@ -479,41 +541,43 @@ if ($haveAdm -and $script:remoteId) {
   $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
 }
 
-# 5) BAMBU STUDIO - real third-party Windows app path. This catches AppAgent/config regressions that
-# a Notepad smoke test will not, and produces the website's concrete app demo.
-$script:bambuId = $null
-Phase 'bambu' {
-  if (-not $haveAdm) { Write-Host 'no CI admin token: skipping Bambu Studio task'; return 'SKIP' }
+# 5) THIRD-PARTY APP - a real portable Windows app path. This catches AppAgent/config regressions
+# that a built-in Notepad smoke test will not, without relying on GPU/OpenGL support in the VM.
+$script:thirdPartyId = $null
+Phase 'thirdparty' {
+  if (-not $haveAdm) { Write-Host 'no CI admin token: skipping third-party app task'; return 'SKIP' }
   Stop-UfoWindows
-  Stop-BambuStudio
-  $bambu = Install-BambuStudio
-  $script:bambuProcessName = [IO.Path]::GetFileNameWithoutExtension($bambu)
-  Write-Host "Bambu Studio installed: $bambu"
+  Stop-NotepadPlusPlus
+  $app = Install-NotepadPlusPlus
+  $script:thirdPartyProcessName = [IO.Path]::GetFileNameWithoutExtension($app)
+  Write-Host "Notepad++ installed: $app"
   Minimize-OwnConsole
-  Write-ProgressEvent 'phase_update' 'bambu' 'sending Bambu Studio run_task'
-  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: bambu-studio.cmd. Then wait until the Bambu Studio main window is visible.'
-  Write-Host "sent Bambu run_task: id=$($resp.id) status=$($resp.status)"
-  Write-ProgressEvent 'phase_update' 'bambu' "command queued: $($resp.id)"
-  $script:bambuId = $resp.id
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Notepad++ run_task'
+  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: ufoagent-launch.cmd notepad-plus-plus. Then wait until the Notepad++ main window is visible.'
+  Write-Host "sent Notepad++ run_task: id=$($resp.id) status=$($resp.status)"
+  Write-ProgressEvent 'phase_update' 'thirdparty' "command queued: $($resp.id)"
+  $script:thirdPartyId = $resp.id
   $opened = Wait-For -TimeoutSec 420 -PollSec 5 -StreamAgentLog -Condition {
-    $c = Get-NodeCommand $script:bambuId
-    if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
-      Write-ProgressEvent 'phase_update' 'bambu' "command status: $($c.status)"
-      $script:lastBambuStatus = $c.status
+    $c = Get-NodeCommand $script:thirdPartyId
+    if ($c -and $c.status -and $c.status -ne $script:lastThirdPartyStatus) {
+      Write-ProgressEvent 'phase_update' 'thirdparty' "command status: $($c.status)"
+      $script:lastThirdPartyStatus = $c.status
     }
-    if ($c -and $c.status -eq 'failed') { throw "Bambu run_task command failed: $($c.result)" }
-    [bool](Get-BambuProcess | Where-Object { $_.MainWindowHandle -ne 0 })
+    if ($c -and $c.status -eq 'failed') { throw "Notepad++ run_task command failed: $($c.result)" }
+    [bool](Get-NotepadPlusPlusProcess | Where-Object { $_.MainWindowHandle -ne 0 })
   }
   if (-not $opened) {
-    $c = if ($script:bambuId) { Get-NodeCommand $script:bambuId } else { $null }
-    if ($c) { Write-Host "Bambu run_task command result: status=$($c.status) result=$($c.result)" }
+    $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
+    if ($c) { Write-Host "Notepad++ run_task command result: status=$($c.status) result=$($c.result)" }
     Show-FileTail 'agent log' $AgentLog 60
-    throw 'Bambu Studio did not open'
+    throw 'Notepad++ did not open'
   }
-  Set-Crop $script:bambuProcessName
+  Start-Sleep -Seconds 2
+  Assert-NoNotepadPlusPlusLaunchError
+  Set-Crop $script:thirdPartyProcessName
   Start-Sleep 4
-  $bambuDone = Wait-CommandTerminal $script:bambuId 'Bambu Studio run_task' 300
-  Write-CommandResultProgress 'bambu' $bambuDone
+  $thirdPartyDone = Wait-CommandTerminal $script:thirdPartyId 'Notepad++ run_task' 300
+  Write-CommandResultProgress 'thirdparty' $thirdPartyDone
 }
 
 # 6) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
@@ -526,8 +590,8 @@ Phase 'dashboard' {
     Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $edge) { throw 'Microsoft Edge not found; cannot capture mission control' }
 
-  # Capture this node's desktop through the REAL screenshot command. Bambu Studio remains open so
-  # the live desktop image has concrete app work visible.
+  # Capture this node's desktop through the REAL screenshot command. Notepad++ remains open so
+  # the live desktop image has concrete third-party app work visible.
   $shot = Send-NodeCommand 'screenshot'
   Write-Host "sent screenshot: id=$($shot.id) status=$($shot.status)"
   $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition { $c = Get-NodeCommand $shot.id; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
@@ -573,20 +637,19 @@ Phase 'dashboard' {
     throw "mission control was not foreground or was too small (w=$w)"
   }
   Start-Sleep 2
+
+  # End the same moving proof clip with the tray/taskbar recap of what this node has been doing.
+  # Use full-frame cropping so the dashboard, taskbar interaction, menu, and dialog remain contiguous.
+  if (-not $haveTok) { Write-Host 'not linked: skipping activity summary inside dashboard clip'; return }
+  $script:curCrop = $null
+  $dlg = Open-TrayActivitySummary
+  $script:curCrop = $null
+  Write-Host 'activity summary dialog opened from tray'
+  Start-Sleep 8
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-UfoWindows
-Stop-BambuStudio
-
-# 7) ACTIVITY SUMMARY - the tray/taskbar recap of what this node has been doing. This is the final
-#    story beat: after real remote work, open the tray menu and show the on-device LLM summary.
-Phase 'activity' {
-  if (-not $haveTok) { Write-Host 'not linked: skipping activity summary'; return 'SKIP' }
-  $dlg = Open-TrayActivitySummary
-  Write-Host 'activity summary dialog opened from tray'
-  Start-Sleep 8
-  Close-ActivityDialog $dlg
-}
+Stop-NotepadPlusPlus
 
 Write-Result 'PASS'
 Write-ProgressEvent 'journey_done'

@@ -6,7 +6,7 @@
 # Run it from its own directory (journey.ps1 + slice.sh live alongside).
 set -uo pipefail
 VM=${VM:-ufo-ws2025-base}; SNAP=${SNAP:-cold}; PW=${VM_PW:-'Ufo!Spike2026'}; GUSER=${VM_USER:-ufoadmin}
-WORK=${WORK:-/mnt/ram/e2e}; REC="$WORK/frames"; FPS_SLEEP=${FPS_SLEEP:-0.7}
+WORK=${WORK:-/mnt/ram/e2e}; REC="$WORK/frames"; FPS_SLEEP=${FPS_SLEEP:-0.35}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 IP=""
 SSH(){ sshpass -p "$PW" ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 "$GUSER@$IP" "$@"; }

@@ -52,11 +52,17 @@ const MANAGED_SKIP_MCP_GUARD: &str = r#"        # Managed by ufoagent: honor USE
 
         self.logger.info("Loading MCP tool information...")"#;
 const MANAGED_CLI_ALLOWLIST_MARKER: &str =
-    "Managed by ufoagent: allow Bambu Studio launcher for GUI task demos.";
+    "Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.";
 const CLI_ALLOWLIST_SENTINEL: &str = r#"        # Common utilities
         "code",
         "code.exe","#;
 const MANAGED_CLI_ALLOWLIST: &str = r#"        # Common utilities
+        "code",
+        "code.exe",
+        # Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.
+        "ufoagent-launch",
+        "ufoagent-launch.cmd","#;
+const OLD_BAMBU_CLI_ALLOWLIST: &str = r#"        # Common utilities
         "code",
         "code.exe",
         # Managed by ufoagent: allow Bambu Studio launcher for GUI task demos.
@@ -65,6 +71,22 @@ const MANAGED_CLI_ALLOWLIST: &str = r#"        # Common utilities
         "bambu-studio.cmd",
         "bambustudio",
         "bambustudio.exe","#;
+const OLD_BAMBU_CLI_ALLOWLIST_WITH_NEW_MARKER: &str = r#"        # Common utilities
+        "code",
+        "code.exe",
+        # Managed by ufoagent: allow Notepad++ launcher for GUI task demos.
+        "bambu-studio",
+        "bambu-studio.exe",
+        "bambu-studio.cmd",
+        "bambustudio",
+        "bambustudio.exe","#;
+const OLD_NOTEPADPP_CLI_ALLOWLIST: &str = r#"        # Common utilities
+        "code",
+        "code.exe",
+        # Managed by ufoagent: allow Notepad++ launcher for GUI task demos.
+        "notepad++",
+        "notepad++.exe",
+        "notepad-plus-plus.cmd","#;
 
 fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -145,7 +167,20 @@ fn patch_cli_allowlist(path: &Path) -> Result<bool> {
     if original.contains(MANAGED_CLI_ALLOWLIST_MARKER) {
         return Ok(false);
     }
-    let patched = original.replacen(CLI_ALLOWLIST_SENTINEL, MANAGED_CLI_ALLOWLIST, 1);
+    let mut patched = original.clone();
+    for old in [
+        OLD_BAMBU_CLI_ALLOWLIST,
+        OLD_BAMBU_CLI_ALLOWLIST_WITH_NEW_MARKER,
+        OLD_NOTEPADPP_CLI_ALLOWLIST,
+    ] {
+        patched = patched.replacen(old, MANAGED_CLI_ALLOWLIST, 1);
+        if patched != original {
+            break;
+        }
+    }
+    if patched == original {
+        patched = original.replacen(CLI_ALLOWLIST_SENTINEL, MANAGED_CLI_ALLOWLIST, 1);
+    }
     if patched == original {
         anyhow::bail!(
             "could not find CLI launcher allow-list sentinel in UFO file {}",
@@ -396,12 +431,40 @@ mod tests {
         apply_managed_defaults(&home).unwrap();
         let patched = std::fs::read_to_string(&cli).unwrap();
         assert!(patched.contains(MANAGED_CLI_ALLOWLIST_MARKER));
-        assert!(patched.contains("\"bambu-studio.cmd\""));
-        assert!(patched.contains("\"bambustudio.exe\""));
+        assert!(patched.contains("\"ufoagent-launch.cmd\""));
+        assert!(!patched.contains("\"notepad-plus-plus.cmd\""));
+        assert!(!patched.contains("\"notepad++.exe\""));
         assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
 
         apply_managed_defaults(&home).unwrap();
         let patched = std::fs::read_to_string(&cli).unwrap();
+        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_defaults_migrate_old_per_app_cli_launcher_allowlist() {
+        let home = temp_home("cli-allowlist-migrate");
+        let cli = home
+            .join("ufo")
+            .join("client")
+            .join("mcp")
+            .join("local_servers")
+            .join("cli_mcp_server.py");
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cli,
+            format!("ALLOWED_CLI_COMMANDS = frozenset({{\n{OLD_BAMBU_CLI_ALLOWLIST}\n    }}\n)\n"),
+        )
+        .unwrap();
+
+        apply_managed_defaults(&home).unwrap();
+        let patched = std::fs::read_to_string(&cli).unwrap();
+        assert!(patched.contains(MANAGED_CLI_ALLOWLIST_MARKER));
+        assert!(patched.contains("\"ufoagent-launch.cmd\""));
+        assert!(!patched.contains("\"bambu-studio.cmd\""));
+        assert!(!patched.contains("\"notepad-plus-plus.cmd\""));
         assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
 
         let _ = std::fs::remove_dir_all(home);
