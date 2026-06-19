@@ -245,6 +245,9 @@ function Install-UfoAgentLauncher {
     'if ($AppId -notmatch ''^[A-Za-z0-9_.-]+$'') { Write-Error "ufoagent-launch: invalid app id: $AppId"; exit 2 }',
     '$script = Join-Path $env:ProgramData ("UFOAgent\launchers\" + $AppId + ".ps1")',
     'if (-not (Test-Path $script)) { Write-Error "ufoagent-launch: unknown app: $AppId"; exit 2 }',
+    '$eventPath = Join-Path $env:ProgramData ''UFOAgent\launcher-events.ndjson''',
+    '$event = [ordered]@{ ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); app = $AppId; args = $AppArgs }',
+    '([pscustomobject]$event | ConvertTo-Json -Compress) | Add-Content -Path $eventPath -Encoding Ascii',
     '& $script @AppArgs',
     'if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }',
     'exit 0'
@@ -286,6 +289,38 @@ function Register-UfoAgentLaunchScript([string]$id, [string[]]$body) {
   $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
   New-Item -ItemType Directory -Force $dir | Out-Null
   Set-Content -Path (Join-Path $dir "$id.ps1") -Value $body -Encoding Ascii
+}
+
+function Clear-LauncherEvents {
+  Remove-Item (Join-Path $env:ProgramData 'UFOAgent\launcher-events.ndjson') -Force -ErrorAction SilentlyContinue
+}
+
+function Get-LauncherEvents {
+  $path = Join-Path $env:ProgramData 'UFOAgent\launcher-events.ndjson'
+  if (-not (Test-Path $path)) { return @() }
+  $events = @()
+  foreach ($line in (Get-Content $path -ErrorAction SilentlyContinue)) {
+    if (-not $line) { continue }
+    try { $events += ($line | ConvertFrom-Json) } catch {}
+  }
+  $events
+}
+
+function Test-LauncherEvent([string]$id) {
+  foreach ($event in (Get-LauncherEvents)) {
+    if (($event.app + '') -eq $id) { return $true }
+  }
+  $false
+}
+
+function Assert-LauncherEvent([string]$id, [string]$context) {
+  if (Test-LauncherEvent $id) {
+    Write-ProgressEvent 'phase_update' $context "launcher used: $id"
+    return
+  }
+  $seen = ((Get-LauncherEvents | ForEach-Object { $_.app }) -join ', ')
+  if (-not $seen) { $seen = 'none' }
+  throw "$context did not invoke generic launcher id '$id' (seen: $seen)"
 }
 
 function Get-EdgeExe {
@@ -623,6 +658,7 @@ Phase 'remote' {
   $notepad = Get-NotepadExe
   if (-not $notepad) { throw 'Notepad executable not found' }
   Register-UfoAgentLaunchApp 'notepad' $notepad
+  Clear-LauncherEvents
   Minimize-OwnConsole
   $remotePrompt = @"
 Open Notepad through the shell launcher, then type text.
@@ -647,7 +683,10 @@ hello from ufoagent
     }
     if ($c -and $c.status -eq 'failed') { throw "run_task command failed: $($c.result)" }
     $notepadOpen = [bool](Get-Process notepad -ErrorAction SilentlyContinue)
-    if ($notepadOpen) { return $true }
+    if ($notepadOpen -and (Test-LauncherEvent 'notepad')) { return $true }
+    if ($notepadOpen -and $c -and $c.status -eq 'done') {
+      throw "remote run_task opened Notepad without invoking generic launcher id 'notepad'"
+    }
     if ($c -and $c.status -eq 'done') {
       $summary = Get-CommandResultSummary $c 420
       if ($summary) {
@@ -664,6 +703,7 @@ hello from ufoagent
     Show-FileTail 'agent log' $AgentLog 40
     throw 'remote run_task did not open Notepad'
   }
+  Assert-LauncherEvent 'notepad' 'remote'
   $typed = Wait-NotepadTyped -StreamAgentLog
   if ($typed.Typed) {
     Assert-TypedVerdict $typed 'remote run_task'
@@ -686,6 +726,7 @@ Phase 'thirdparty' {
   Stop-UfoWindows
   Stop-Brave
   Stop-BambuStudio
+  Clear-LauncherEvents
   $edge = Get-EdgeExe
   if (-not $edge) { throw 'Microsoft Edge not found; cannot have UFO download Brave' }
   Register-UfoAgentLaunchApp 'edge' $edge
@@ -693,7 +734,8 @@ Phase 'thirdparty' {
   Minimize-OwnConsole
 
   $brave = Get-BraveExe
-  if (-not $brave) {
+  $braveWasInstalled = [bool]$brave
+  if (-not $braveWasInstalled) {
     Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Brave install run_task'
     $bravePrompt = @"
 Install Brave Browser.
@@ -733,6 +775,8 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
     }
     $braveDone = Wait-CommandTerminal $script:thirdPartyId 'Brave install run_task' 300
     Write-CommandResultProgress 'thirdparty' $braveDone
+    Assert-LauncherEvent 'edge' 'thirdparty'
+    Assert-LauncherEvent 'brave-setup' 'thirdparty'
     $brave = Get-BraveExe
   } else {
     Write-Host "Brave already installed: $brave"
@@ -741,7 +785,8 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
   Register-UfoAgentLaunchApp 'brave' $brave
   Write-ProgressEvent 'phase_update' 'thirdparty' "Brave ready: $brave"
 
-  if (-not (Test-BambuStudioInstalled)) {
+  $bambuWasInstalled = Test-BambuStudioInstalled
+  if (-not $bambuWasInstalled) {
     $bambuUrl = Resolve-BambuStudioInstallerUrl
     Register-BambuInstallerLauncher
     Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio install run_task'
@@ -781,6 +826,8 @@ Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or gr
     }
     $bambuDone = Wait-CommandTerminal $script:thirdPartyId 'Bambu Studio install run_task' 420
     Write-CommandResultProgress 'thirdparty' $bambuDone
+    Assert-LauncherEvent 'brave' 'thirdparty'
+    Assert-LauncherEvent 'bambu-setup' 'thirdparty'
   } else {
     Write-Host 'Bambu Studio already installed'
   }
