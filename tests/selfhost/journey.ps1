@@ -216,10 +216,16 @@ function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 30
   $c
 }
 
-function Write-CommandResultProgress([string]$phase, $command) {
+function Get-CommandResultSummary($command, [int]$MaxLen = 220) {
   if (-not $command -or -not $command.result) { return }
-  $summary = (($command.result -replace '\s+', ' ').Trim())
-  if ($summary.Length -gt 220) { $summary = $summary.Substring(0, 220) + '...' }
+  $summary = (($command.result + '') -replace '[^\x09\x0A\x0D\x20-\x7E]', ' ' -replace '\s+', ' ').Trim()
+  if ($summary.Length -gt $MaxLen) { $summary = $summary.Substring(0, $MaxLen) + '...' }
+  $summary
+}
+
+function Write-CommandResultProgress([string]$phase, $command) {
+  $summary = Get-CommandResultSummary $command
+  if (-not $summary) { return }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
 }
 
@@ -617,7 +623,19 @@ Phase 'remote' {
   $notepad = Get-NotepadExe
   if (-not $notepad) { throw 'Notepad executable not found' }
   Register-UfoAgentLaunchApp 'notepad' $notepad
-  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: ufoagent-launch.cmd notepad. Then type the message into Notepad: hello from ufoagent'
+  Minimize-OwnConsole
+  $remotePrompt = @"
+Open Notepad through the shell launcher, then type text.
+
+Use the CommandLineExecutor run_shell tool directly. Do not use AppUIExecutor to type the command into Command Prompt, PowerShell, Run, or any terminal window.
+
+The run_shell bash_command must be exactly:
+ufoagent-launch.cmd notepad
+
+After Notepad is visible, type exactly:
+hello from ufoagent
+"@
+  $resp = Send-NodeCommand 'run_task' $remotePrompt
   Write-Host "sent run_task: id=$($resp.id) status=$($resp.status)"
   Write-ProgressEvent 'phase_update' 'remote' "command queued: $($resp.id)"
   $script:remoteId = $resp.id
@@ -628,7 +646,17 @@ Phase 'remote' {
       $script:lastRemoteStatus = $c.status
     }
     if ($c -and $c.status -eq 'failed') { throw "run_task command failed: $($c.result)" }
-    [bool](Get-Process notepad -ErrorAction SilentlyContinue)
+    $notepadOpen = [bool](Get-Process notepad -ErrorAction SilentlyContinue)
+    if ($notepadOpen) { return $true }
+    if ($c -and $c.status -eq 'done') {
+      $summary = Get-CommandResultSummary $c 420
+      if ($summary) {
+        Write-ProgressEvent 'phase_update' 'remote' "UFO result: $summary"
+        throw "remote run_task finished without opening Notepad; UFO result: $summary"
+      }
+      throw 'remote run_task finished without opening Notepad'
+    }
+    $false
   }
   if (-not $opened) {
     $c = if ($script:remoteId) { Get-NodeCommand $script:remoteId } else { $null }
@@ -669,6 +697,8 @@ Phase 'thirdparty' {
     Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Brave install run_task'
     $bravePrompt = @"
 Install Brave Browser.
+
+When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type these commands into Command Prompt, PowerShell, Run, or any terminal window.
 
 Step 1: use the run_shell tool with exactly this command:
 ufoagent-launch.cmd edge --no-first-run --no-default-browser-check $($script:BraveDownloadUrl)
@@ -717,6 +747,8 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
     Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio install run_task'
     $bambuPrompt = @"
 Install Bambu Studio using Brave.
+
+When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type these commands into Command Prompt, PowerShell, Run, or any terminal window.
 
 Step 1: use the run_shell tool with exactly this command:
 ufoagent-launch.cmd brave --no-first-run --no-default-browser-check $bambuUrl
