@@ -94,7 +94,7 @@ jobs:
     # Trusted events only. Never run the self-hosted box for pull_request, especially fork PRs.
     if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: [self-hosted, kvm-winvm]
-    timeout-minutes: 45
+    timeout-minutes: 75
     permissions:
       contents: write
     concurrency:

@@ -140,8 +140,8 @@ echo "=== launch journey (one interactive task) ==="
 SSH 'Set-Content C:\e2e\run-journey.cmd -Encoding Ascii -Value @("@echo off","powershell -NoProfile -ExecutionPolicy Bypass -File C:\e2e\journey.ps1 > C:\e2e\out\journey.log 2>&1","echo LAUNCHER-EXIT %ERRORLEVEL% >> C:\e2e\out\journey.log"); "launcher written"'
 SSH "schtasks /Create /TN UFOJourney /TR C:\\e2e\\run-journey.cmd /SC ONCE /ST 23:30 /RU $GUSER /IT /RL HIGHEST /F | Out-Null; schtasks /Run /TN UFOJourney | Out-Null; 'launched'"
 
-echo "=== poll result (<=45m) ==="
-status="PENDING"; d=$(( $(date +%s) + 45*60 ))
+echo "=== poll result (<=75m) ==="
+status="PENDING"; d=$(( $(date +%s) + 75*60 ))
 while [ "$(date +%s)" -lt "$d" ]; do
   report_progress || true
   status=$(SSH 'if(Test-Path C:\e2e\out\result.json){(Get-Content C:\e2e\out\result.json -Raw | ConvertFrom-Json).status}else{"PENDING"}' 2>/dev/null | tr -dc 'A-Za-z')

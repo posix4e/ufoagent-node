@@ -46,8 +46,9 @@ $phases = New-Object System.Collections.ArrayList
 $script:curCrop = $null
 $script:lastInstallDetail = ''
 $script:lastRemoteStatus = ''
-$script:lastThirdPartyStatus = ''
-$script:thirdPartyProcessName = 'notepad++'
+$script:lastBraveStatus = ''
+$script:lastBambuStatus = ''
+$script:BraveDownloadUrl = 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe'
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Get-FgRect {
   $h = [Win32]::GetForegroundWindow(); $r = New-Object RECT
@@ -185,13 +186,18 @@ function Assert-ManagedUfoConfig {
   $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
   if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
   $cliRaw = Get-Content $cli -Raw
+  $allow = [regex]::Match($cliRaw, 'ALLOWED_CLI_COMMANDS[^\n]*=\s*frozenset\(\s*\{(?<body>[\s\S]*?)\n\s*\}\s*\)')
+  if (-not $allow.Success) {
+    throw 'UFO CLI launcher allow-list block was not found'
+  }
+  $allowRaw = $allow.Groups['body'].Value
   foreach ($allowed in @('"ufoagent-launch.cmd"')) {
-    if ($cliRaw -notmatch [regex]::Escape($allowed)) {
+    if ($allowRaw -notmatch [regex]::Escape($allowed)) {
       throw "UFO CLI launcher allow-list missing: $allowed"
     }
   }
-  foreach ($blocked in @('"notepad-plus-plus.cmd"', '"notepad++.exe"')) {
-    if ($cliRaw -match [regex]::Escape($blocked)) {
+  foreach ($blocked in @('"notepad"', '"notepad.exe"', '"notepad-plus-plus.cmd"', '"notepad++.exe"', '"brave.exe"', '"msedge.exe"', '"bambu-studio.exe"', '"bambustudio.exe"')) {
+    if ($allowRaw -match [regex]::Escape($blocked)) {
       throw "UFO CLI launcher still exposes per-app command: $blocked"
     }
   }
@@ -215,37 +221,6 @@ function Write-CommandResultProgress([string]$phase, $command) {
   $summary = (($command.result -replace '\s+', ' ').Trim())
   if ($summary.Length -gt 220) { $summary = $summary.Substring(0, 220) + '...' }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
-}
-
-function Get-NotepadPlusPlusExe {
-  $candidates = @(
-    "$env:ProgramFiles\Notepad++\notepad++.exe",
-    "${env:ProgramFiles(x86)}\Notepad++\notepad++.exe"
-  )
-  $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-  if ($found) { return $found }
-
-  $portable = Join-Path $ROOT 'apps\NotepadPlusPlus'
-  if (Test-Path $portable) {
-    Get-ChildItem $portable -Recurse -File -Include 'notepad++.exe' -ErrorAction SilentlyContinue |
-      Select-Object -First 1 -ExpandProperty FullName
-  }
-}
-
-function Install-NotepadPlusPlusShortcut([string]$exe) {
-  $targets = @(
-    "$env:PUBLIC\Desktop\Notepad++.lnk",
-    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Notepad++.lnk"
-  )
-  $shell = New-Object -ComObject WScript.Shell
-  foreach ($target in $targets) {
-    New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
-    $lnk = $shell.CreateShortcut($target)
-    $lnk.TargetPath = $exe
-    $lnk.WorkingDirectory = Split-Path $exe
-    $lnk.Description = 'Notepad++'
-    $lnk.Save()
-  }
 }
 
 function Quote-PsString([string]$value) {
@@ -300,59 +275,190 @@ function Register-UfoAgentLaunchApp([string]$id, [string]$exe) {
   Set-Content -Path $script -Value $body -Encoding Ascii
 }
 
-function Install-NotepadPlusPlus {
-  $existing = Get-NotepadPlusPlusExe
-  if ($existing) {
-    Install-NotepadPlusPlusShortcut $existing
-    Register-UfoAgentLaunchApp 'notepad-plus-plus' $existing
-    Write-Host "Notepad++ already installed: $existing"
-    return $existing
+function Register-UfoAgentLaunchScript([string]$id, [string[]]$body) {
+  Install-UfoAgentLauncher
+  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  Set-Content -Path (Join-Path $dir "$id.ps1") -Value $body -Encoding Ascii
+}
+
+function Get-EdgeExe {
+  @(
+    "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
+    "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
+  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Get-NotepadExe {
+  @(
+    "$env:WINDIR\System32\notepad.exe",
+    "$env:WINDIR\SysWOW64\notepad.exe"
+  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+}
+
+function Get-DownloadsDir {
+  Join-Path $env:USERPROFILE 'Downloads'
+}
+
+function Get-BraveExe {
+  $candidates = @(
+    "$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe",
+    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe"
+  )
+  $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($found) { return $found }
+  foreach ($entry in (Get-UninstallEntries 'Brave')) {
+    foreach ($base in @($entry.InstallLocation, $entry.DisplayIcon)) {
+      if (-not $base) { continue }
+      $clean = (($base + '') -replace ',.*$', '').Trim('"')
+      $path = if ($clean -match '\.exe$') { $clean } else { Join-Path $clean 'brave.exe' }
+      if (Test-Path $path) { return $path }
+    }
   }
+}
+
+function Get-UninstallEntries([string]$displayName) {
+  $roots = @(
+    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+  )
+  foreach ($root in $roots) {
+    Get-ItemProperty -Path $root -ErrorAction SilentlyContinue |
+      Where-Object { ($_.DisplayName + '') -like "*$displayName*" }
+  }
+}
+
+function Get-BambuStudioExe {
+  $candidates = @(
+    "$env:ProgramFiles\Bambu Studio\bambu-studio.exe",
+    "$env:ProgramFiles\Bambu Studio\BambuStudio.exe",
+    "$env:ProgramFiles\Bambu Studio\Bambu Studio.exe",
+    "${env:ProgramFiles(x86)}\Bambu Studio\bambu-studio.exe",
+    "${env:ProgramFiles(x86)}\Bambu Studio\BambuStudio.exe",
+    "${env:ProgramFiles(x86)}\Bambu Studio\Bambu Studio.exe",
+    "$env:LOCALAPPDATA\Programs\Bambu Studio\bambu-studio.exe",
+    "$env:LOCALAPPDATA\Programs\Bambu Studio\BambuStudio.exe",
+    "$env:LOCALAPPDATA\Programs\Bambu Studio\Bambu Studio.exe"
+  )
+  $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($found) { return $found }
+  foreach ($entry in (Get-UninstallEntries 'Bambu Studio')) {
+    $iconDir = $null
+    if ($entry.DisplayIcon) {
+      $iconPath = (($entry.DisplayIcon + '') -replace ',.*$', '').Trim('"')
+      if ($iconPath) { $iconDir = Split-Path $iconPath -ErrorAction SilentlyContinue }
+    }
+    foreach ($base in @($entry.InstallLocation, $iconDir)) {
+      if (-not $base -or -not (Test-Path $base)) { continue }
+      $exe = Get-ChildItem $base -Recurse -File -Include '*.exe' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match '(?i)bambu.*studio|bambu-studio|bambustudio' -and $_.Name -notmatch '(?i)unins|uninstall|crash' } |
+        Select-Object -First 1 -ExpandProperty FullName
+      if ($exe) { return $exe }
+    }
+  }
+}
+
+function Test-BambuStudioInstalled {
+  if (Get-BambuStudioExe) { return $true }
+  if (Get-UninstallEntries 'Bambu Studio') { return $true }
+  $shortcutRoots = @(
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs",
+    "$env:APPDATA\Microsoft\Windows\Start Menu\Programs",
+    "$env:PUBLIC\Desktop"
+  )
+  foreach ($root in $shortcutRoots) {
+    if ((Test-Path $root) -and (Get-ChildItem $root -Recurse -Filter '*Bambu*Studio*.lnk' -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+      return $true
+    }
+  }
+  $false
+}
+
+function Get-BraveProcess {
+  Get-Process 'brave' -ErrorAction SilentlyContinue
+}
+
+function Register-BraveInstallerLauncher {
+  $downloadsQ = Quote-PsString (Get-DownloadsDir)
+  $body = @(
+    '$ErrorActionPreference = ''Stop''',
+    ('$downloads = ' + $downloadsQ),
+    'if (-not (Test-Path $downloads)) { Write-Error "Brave installer launcher: downloads folder missing: $downloads"; exit 3 }',
+    '$installer = Get-ChildItem -Path $downloads -File -Filter ''BraveBrowserStandalone*Setup*.exe'' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1',
+    'if (-not $installer) { Write-Error "Brave installer launcher: Brave setup exe was not found in $downloads"; exit 3 }',
+    'Write-Host "Brave installer launcher: running $($installer.FullName)"',
+    '$p = Start-Process -FilePath $installer.FullName -WorkingDirectory $installer.DirectoryName -Wait -PassThru',
+    'if ($p.ExitCode -ne 0) { Write-Error "Brave installer exited $($p.ExitCode)"; exit $p.ExitCode }',
+    '$candidates = @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe")',
+    '$brave = $null',
+    'for ($i = 0; $i -lt 60 -and -not $brave; $i++) { $brave = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $brave) { Start-Sleep -Seconds 2 } }',
+    'if (-not $brave) { Write-Error "Brave installer completed but brave.exe was not found"; exit 4 }',
+    'Start-Process -FilePath $brave -ArgumentList @(''--no-first-run'', ''--no-default-browser-check'')',
+    'exit 0'
+  )
+  Register-UfoAgentLaunchScript 'brave-setup' $body
+}
+
+function Stop-Brave {
+  Get-Process 'brave', 'BraveBrowserStandaloneSetup', 'BraveBrowserStandaloneSilentSetup' -ErrorAction SilentlyContinue |
+    Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Resolve-BambuStudioInstallerUrl {
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'resolving latest Notepad++ release'
-  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/notepad-plus-plus/notepad-plus-plus/releases/latest'
-  $asset = $rel.assets | Where-Object { $_.name -match '^npp\..*\.portable\.x64\.zip$' } | Select-Object -First 1
-  if (-not $asset) { throw 'latest Notepad++ release has no portable x64 zip asset' }
-  $archive = Join-Path $ROOT 'dl\notepad-plus-plus.zip'
-  $dest = Join-Path $ROOT 'apps\NotepadPlusPlus'
-  New-Item -ItemType Directory -Force -Path (Split-Path $archive), $dest | Out-Null
-  Write-Host "Notepad++ archive: $($asset.name) $($asset.size) bytes"
-  Write-ProgressEvent 'phase_update' 'thirdparty' "downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
-  Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri $asset.browser_download_url -OutFile $archive
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'extracting Notepad++'
-  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
-  New-Item -ItemType Directory -Force $dest | Out-Null
-  Expand-Archive -Path $archive -DestinationPath $dest -Force
-  $exe = Get-NotepadPlusPlusExe
-  if (-not $exe) { throw 'Notepad++ archive extracted but app executable was not found' }
-  Install-NotepadPlusPlusShortcut $exe
-  Register-UfoAgentLaunchApp 'notepad-plus-plus' $exe
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'Notepad++ ready'
-  $exe
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'resolving latest Bambu Studio release'
+  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/bambulab/BambuStudio/releases/latest'
+  $asset = $rel.assets | Where-Object { $_.name -match '^Bambu_Studio_win-.*\.exe$' } | Select-Object -First 1
+  if (-not $asset) { throw 'latest Bambu Studio release has no Windows exe asset' }
+  Write-Host "Bambu Studio installer asset: $($asset.name) $($asset.size) bytes"
+  Write-ProgressEvent 'phase_update' 'thirdparty' "latest Bambu installer: $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
+  $asset.browser_download_url
 }
 
-function Get-NotepadPlusPlusProcess {
-  Get-Process 'notepad++' -ErrorAction SilentlyContinue
+function Register-BambuInstallerLauncher {
+  $downloadsQ = Quote-PsString (Get-DownloadsDir)
+  $body = @(
+    '$ErrorActionPreference = ''Stop''',
+    ('$downloads = ' + $downloadsQ),
+    'if (-not (Test-Path $downloads)) { Write-Error "Bambu installer launcher: downloads folder missing: $downloads"; exit 3 }',
+    '$installer = Get-ChildItem -Path $downloads -File -Filter ''Bambu_Studio_win-*.exe'' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1',
+    'if (-not $installer) { Write-Error "Bambu installer launcher: Bambu Studio Windows installer was not found in $downloads"; exit 3 }',
+    'Write-Host "Bambu installer launcher: running $($installer.FullName)"',
+    '$p = Start-Process -FilePath $installer.FullName -WorkingDirectory $installer.DirectoryName -ArgumentList ''/S'' -PassThru',
+    'if (-not $p.WaitForExit(900000)) { try { $p.Kill() } catch {}; Write-Error "Bambu installer timed out"; exit 5 }',
+    'if ($p.ExitCode -ne 0) { Write-Error "Bambu installer exited $($p.ExitCode)"; exit $p.ExitCode }',
+    '$candidates = @("$env:ProgramFiles\Bambu Studio\bambu-studio.exe", "$env:ProgramFiles\Bambu Studio\BambuStudio.exe", "$env:ProgramFiles\Bambu Studio\Bambu Studio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\bambu-studio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\BambuStudio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\Bambu Studio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\bambu-studio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\BambuStudio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\Bambu Studio.exe")',
+    '$bambu = $null',
+    'for ($i = 0; $i -lt 90 -and -not $bambu; $i++) { $bambu = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $bambu) { Start-Sleep -Seconds 2 } }',
+    'if ($bambu) { Start-Process -FilePath $bambu; exit 0 }',
+    '$roots = @(''HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'', ''HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'', ''HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'')',
+    '$entry = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue | Where-Object { ($_.DisplayName + "") -like "*Bambu Studio*" } | Select-Object -First 1',
+    'if ($entry) { exit 0 }',
+    'Write-Error "Bambu installer completed but Bambu Studio was not found"; exit 4'
+  )
+  Register-UfoAgentLaunchScript 'bambu-setup' $body
 }
 
-function Stop-NotepadPlusPlus {
-  Get-NotepadPlusPlusProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+function Stop-BambuStudio {
+  Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessName -match '(?i)bambu|Bambu_Studio' } |
+    Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-function Assert-NoNotepadPlusPlusLaunchError {
-  $dlg = Find-UiaByName 'ERROR' 'Window' -ChildrenOnly
-  if (-not $dlg) { return }
-  $names = New-Object System.Collections.ArrayList
-  foreach ($el in (Get-UiaElements $dlg)) {
-    try {
-      $name = $el.Current.Name + ''
-      if ($name) { [void]$names.Add($name) }
-    } catch {}
+function Set-CropAnyProcess([string[]]$names) {
+  foreach ($name in $names) {
+    $p = Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if ($p) {
+      [Win32]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
+      [Win32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
+      Start-Sleep -Milliseconds 500
+      $script:curCrop = Get-FgRect
+      if ($script:curCrop) { return }
+    }
   }
-  $text = $names -join ' '
-  if ($text -match 'Cannot open file') {
-    throw "Notepad++ opened an error dialog: $text"
-  }
+  $script:curCrop = Get-FgRect
 }
 
 function Test-UfoTranscriptTyped([string]$id, [string]$want) {
@@ -508,7 +614,10 @@ Stop-Process -Id $script:linkProc.Id -Force -ErrorAction SilentlyContinue
 Phase 'remote' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping remote task'; return 'SKIP' }
   Stop-UfoWindows
-  $resp = Send-NodeCommand 'run_task' 'Open Notepad and type the message: hello from ufoagent'
+  $notepad = Get-NotepadExe
+  if (-not $notepad) { throw 'Notepad executable not found' }
+  Register-UfoAgentLaunchApp 'notepad' $notepad
+  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: ufoagent-launch.cmd notepad. Then type the message into Notepad: hello from ufoagent'
   Write-Host "sent run_task: id=$($resp.id) status=$($resp.status)"
   Write-ProgressEvent 'phase_update' 'remote' "command queued: $($resp.id)"
   $script:remoteId = $resp.id
@@ -541,43 +650,112 @@ if ($haveAdm -and $script:remoteId) {
   $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
 }
 
-# 5) THIRD-PARTY APP - a real portable Windows app path. This catches AppAgent/config regressions
-# that a built-in Notepad smoke test will not, without relying on GPU/OpenGL support in the VM.
+# 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
+# Studio. The harness does not pre-download either installer; it only asserts the resulting apps exist.
 $script:thirdPartyId = $null
 Phase 'thirdparty' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping third-party app task'; return 'SKIP' }
   Stop-UfoWindows
-  Stop-NotepadPlusPlus
-  $app = Install-NotepadPlusPlus
-  $script:thirdPartyProcessName = [IO.Path]::GetFileNameWithoutExtension($app)
-  Write-Host "Notepad++ installed: $app"
+  Stop-Brave
+  Stop-BambuStudio
+  $edge = Get-EdgeExe
+  if (-not $edge) { throw 'Microsoft Edge not found; cannot have UFO download Brave' }
+  Register-UfoAgentLaunchApp 'edge' $edge
+  Register-BraveInstallerLauncher
   Minimize-OwnConsole
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Notepad++ run_task'
-  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: ufoagent-launch.cmd notepad-plus-plus. Then wait until the Notepad++ main window is visible.'
-  Write-Host "sent Notepad++ run_task: id=$($resp.id) status=$($resp.status)"
-  Write-ProgressEvent 'phase_update' 'thirdparty' "command queued: $($resp.id)"
-  $script:thirdPartyId = $resp.id
-  $opened = Wait-For -TimeoutSec 420 -PollSec 5 -StreamAgentLog -Condition {
-    $c = Get-NodeCommand $script:thirdPartyId
-    if ($c -and $c.status -and $c.status -ne $script:lastThirdPartyStatus) {
-      Write-ProgressEvent 'phase_update' 'thirdparty' "command status: $($c.status)"
-      $script:lastThirdPartyStatus = $c.status
+
+  $brave = Get-BraveExe
+  if (-not $brave) {
+    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Brave install run_task'
+    $bravePrompt = @"
+Install Brave Browser.
+
+Step 1: use the run_shell tool with exactly this command:
+ufoagent-launch.cmd edge --no-first-run --no-default-browser-check $($script:BraveDownloadUrl)
+
+Step 2: in Microsoft Edge, wait for the Brave installer download to finish. If Edge asks, keep or allow the download.
+
+Step 3: use the run_shell tool with exactly this command:
+ufoagent-launch.cmd brave-setup
+
+Wait until Brave Browser is installed and a Brave window is visible. Do not stop after only downloading the installer.
+"@
+    $resp = Send-NodeCommand 'run_task' $bravePrompt
+    Write-Host "sent Brave install run_task: id=$($resp.id) status=$($resp.status)"
+    Write-ProgressEvent 'phase_update' 'thirdparty' "Brave command queued: $($resp.id)"
+    $script:thirdPartyId = $resp.id
+    $braveReady = Wait-For -TimeoutSec 900 -PollSec 5 -StreamAgentLog -Condition {
+      $c = Get-NodeCommand $script:thirdPartyId
+      if ($c -and $c.status -and $c.status -ne $script:lastBraveStatus) {
+        Write-ProgressEvent 'phase_update' 'thirdparty' "Brave command status: $($c.status)"
+        $script:lastBraveStatus = $c.status
+      }
+      if ($c -and $c.status -eq 'failed') { throw "Brave install run_task failed: $($c.result)" }
+      $exe = Get-BraveExe
+      $visible = Get-BraveProcess | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+      [bool]($exe -and $visible)
     }
-    if ($c -and $c.status -eq 'failed') { throw "Notepad++ run_task command failed: $($c.result)" }
-    [bool](Get-NotepadPlusPlusProcess | Where-Object { $_.MainWindowHandle -ne 0 })
+    if (-not $braveReady) {
+      $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
+      if ($c) { Write-Host "Brave install run_task result: status=$($c.status) result=$($c.result)" }
+      Show-FileTail 'agent log' $AgentLog 80
+      throw 'UFO did not install and open Brave'
+    }
+    $braveDone = Wait-CommandTerminal $script:thirdPartyId 'Brave install run_task' 300
+    Write-CommandResultProgress 'thirdparty' $braveDone
+    $brave = Get-BraveExe
+  } else {
+    Write-Host "Brave already installed: $brave"
   }
-  if (-not $opened) {
-    $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
-    if ($c) { Write-Host "Notepad++ run_task command result: status=$($c.status) result=$($c.result)" }
-    Show-FileTail 'agent log' $AgentLog 60
-    throw 'Notepad++ did not open'
+  if (-not $brave) { throw 'Brave install completed but brave.exe was not found' }
+  Register-UfoAgentLaunchApp 'brave' $brave
+  Write-ProgressEvent 'phase_update' 'thirdparty' "Brave ready: $brave"
+
+  if (-not (Test-BambuStudioInstalled)) {
+    $bambuUrl = Resolve-BambuStudioInstallerUrl
+    Register-BambuInstallerLauncher
+    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio install run_task'
+    $bambuPrompt = @"
+Install Bambu Studio using Brave.
+
+Step 1: use the run_shell tool with exactly this command:
+ufoagent-launch.cmd brave --no-first-run --no-default-browser-check $bambuUrl
+
+Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish. If Brave asks, keep or allow the download. Download the .exe installer, not the zip.
+
+Step 3: use the run_shell tool with exactly this command:
+ufoagent-launch.cmd bambu-setup
+
+Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or graphics error, leave that dialog visible and consider the install complete.
+"@
+    $resp = Send-NodeCommand 'run_task' $bambuPrompt
+    Write-Host "sent Bambu Studio install run_task: id=$($resp.id) status=$($resp.status)"
+    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu command queued: $($resp.id)"
+    $script:thirdPartyId = $resp.id
+    $bambuReady = Wait-For -TimeoutSec 1500 -PollSec 10 -StreamAgentLog -Condition {
+      $c = Get-NodeCommand $script:thirdPartyId
+      if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
+        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu command status: $($c.status)"
+        $script:lastBambuStatus = $c.status
+      }
+      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio install run_task failed: $($c.result)" }
+      Test-BambuStudioInstalled
+    }
+    if (-not $bambuReady) {
+      $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
+      if ($c) { Write-Host "Bambu Studio install run_task result: status=$($c.status) result=$($c.result)" }
+      Show-FileTail 'agent log' $AgentLog 100
+      throw 'UFO did not install Bambu Studio'
+    }
+    $bambuDone = Wait-CommandTerminal $script:thirdPartyId 'Bambu Studio install run_task' 420
+    Write-CommandResultProgress 'thirdparty' $bambuDone
+  } else {
+    Write-Host 'Bambu Studio already installed'
   }
-  Start-Sleep -Seconds 2
-  Assert-NoNotepadPlusPlusLaunchError
-  Set-Crop $script:thirdPartyProcessName
+  $bambuExe = Get-BambuStudioExe
+  if ($bambuExe) { Write-Host "Bambu Studio installed: $bambuExe" } else { Write-Host 'Bambu Studio installed: uninstall entry or shortcut detected' }
+  Set-CropAnyProcess @('Bambu Studio', 'BambuStudio', 'bambu-studio', 'brave')
   Start-Sleep 4
-  $thirdPartyDone = Wait-CommandTerminal $script:thirdPartyId 'Notepad++ run_task' 300
-  Write-CommandResultProgress 'thirdparty' $thirdPartyDone
 }
 
 # 6) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
@@ -590,7 +768,7 @@ Phase 'dashboard' {
     Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $edge) { throw 'Microsoft Edge not found; cannot capture mission control' }
 
-  # Capture this node's desktop through the REAL screenshot command. Notepad++ remains open so
+  # Capture this node's desktop through the REAL screenshot command. Brave/Bambu remains open so
   # the live desktop image has concrete third-party app work visible.
   $shot = Send-NodeCommand 'screenshot'
   Write-Host "sent screenshot: id=$($shot.id) status=$($shot.status)"
@@ -649,7 +827,8 @@ Phase 'dashboard' {
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-UfoWindows
-Stop-NotepadPlusPlus
+Stop-Brave
+Stop-BambuStudio
 
 Write-Result 'PASS'
 Write-ProgressEvent 'journey_done'
