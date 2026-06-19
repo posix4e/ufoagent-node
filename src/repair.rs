@@ -5,7 +5,7 @@ use anyhow::Result;
 use crate::config::{Config, DEFAULT_CONTROL_PLANE};
 use crate::controlplane::ControlPlane;
 use crate::env::{self, EnvState};
-use crate::{agent, bootstrap, store};
+use crate::{agent, bootstrap, store, ufo_config};
 
 pub fn repair() -> Result<Vec<String>> {
     let mut log = Vec::new();
@@ -28,6 +28,7 @@ pub fn repair() -> Result<Vec<String>> {
     } else {
         // Genuinely provisioned (possibly before env tracking existed) — record a ready marker so the
         // dashboard chip and run_task gate are marker-based from here on.
+        ufo_config::apply_managed_defaults(&home)?;
         env::set_state(env::UFO2, EnvState::Ready, None, None);
         log.push("UFO2 present".into());
     }

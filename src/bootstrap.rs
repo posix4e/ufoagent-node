@@ -1,16 +1,16 @@
 //! Provision Microsoft UFO2 into a managed home: download source zip + venv + install requirements.
 //! No external tools required — fetches the GitHub source archive over HTTP and unpacks it with
 //! Windows' built-in tar, auto-installs Python if none is present, and uses a pinned `uv` (Astral) to
-//! build the venv + install ~8× faster than pip (falling back to pip if uv can't be fetched). UFO2
-//! stays Python; this just sets it up and records ufo_home + the venv python.
+//! build the venv + install faster than pip (falling back to pip if uv can't be fetched). UFO2 stays
+//! Python; this just sets it up and records ufo_home + the venv python.
 
 use anyhow::{anyhow, bail, Context, Result};
 use log::info;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::Config;
 use crate::controlplane::USER_AGENT;
+use crate::{config::Config, ufo_config};
 
 /// UFO2 pins some packages with no Python 3.11 wheel (build-from-source fails on modern
 /// setuptools). Rewrite those to wheel-backed versions.
@@ -24,9 +24,9 @@ const UFO_ARCHIVE_BASE: &str = "https://github.com/microsoft/UFO/archive/refs/he
 #[cfg(windows)]
 const PYTHON_VERSION: &str = "3.11.9";
 
-/// Pinned `uv` (Astral's installer). Builds the venv + installs requirements ~8× faster than pip:
-/// the UFO2 dep tree (torch/scipy/transformers…) is dominated by pip's single-threaded, byte-compiling
-/// install phase; uv installs in parallel and skips byte-compile. Best-effort — provisioning falls back
+/// Pinned `uv` (Astral's installer). Builds the venv + installs requirements faster than pip: the
+/// UFO2 dep tree (torch/scipy/transformers…) benefits from uv's parallel installer. We ask uv to
+/// compile bytecode so UFO startup pays less import cost later. Best-effort — provisioning falls back
 /// to pip if the binary can't be fetched.
 #[cfg(windows)]
 const UV_VERSION: &str = "0.11.21";
@@ -388,6 +388,8 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
         phase("downloading UFO2 source");
         fetch_ufo(&home, git_ref)?;
     }
+    phase("configuring managed UFO2 defaults");
+    ufo_config::apply_managed_defaults(&home)?;
 
     let scratch = home
         .parent()
@@ -439,6 +441,7 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
             let mut pi = Command::new(uv);
             pi.args(["pip", "install", "--python"])
                 .arg(&vpy)
+                .arg("--compile-bytecode")
                 .arg("-r")
                 .arg(&patched);
             run(pi, "uv pip install")?;
