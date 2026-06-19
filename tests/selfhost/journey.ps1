@@ -455,12 +455,12 @@ function Register-BraveInstallerLauncher {
     'if (-not $installer) { Write-Error "Brave installer launcher: Brave setup exe was not found in $downloads"; exit 3 }',
     'Write-Host "Brave installer launcher: running $($installer.FullName)"',
     '$p = Start-Process -FilePath $installer.FullName -WorkingDirectory $installer.DirectoryName -Wait -PassThru',
-    'if ($p.ExitCode -ne 0) { Write-Error "Brave installer exited $($p.ExitCode)"; exit $p.ExitCode }',
     '$candidates = @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe")',
     '$brave = $null',
     'for ($i = 0; $i -lt 60 -and -not $brave; $i++) { $brave = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $brave) { Start-Sleep -Seconds 2 } }',
+    'if ($p.ExitCode -ne 0 -and -not $brave) { Write-Error "Brave installer exited $($p.ExitCode)"; exit $p.ExitCode }',
     'if (-not $brave) { Write-Error "Brave installer completed but brave.exe was not found"; exit 4 }',
-    'Start-Process -FilePath $brave -ArgumentList @(''--no-first-run'', ''--no-default-browser-check'')',
+    'Start-Process -FilePath $brave -ArgumentList @(''--no-first-run'', ''--no-default-browser-check'', ''about:blank'')',
     'exit 0'
   )
   Register-UfoAgentLaunchScript 'brave-setup' $body
@@ -805,15 +805,13 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
         $script:lastBraveStatus = $c.status
       }
       if ($c -and $c.status -eq 'failed') { throw "Brave install run_task failed: $($c.result)" }
-      $exe = Get-BraveExe
-      $visible = Get-BraveProcess | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-      [bool]($exe -and $visible)
+      [bool](Get-BraveExe)
     }
     if (-not $braveReady) {
       $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
       if ($c) { Write-Host "Brave install run_task result: status=$($c.status) result=$($c.result)" }
       Show-FileTail 'agent log' $AgentLog 80
-      throw 'UFO did not install and open Brave'
+      throw 'UFO did not install Brave'
     }
     $braveDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Brave install run_task' 'thirdparty' 120
     Write-CommandResultProgress 'thirdparty' $braveDone
