@@ -482,6 +482,24 @@ function Resolve-BambuStudioInstallerUrl {
   $asset.browser_download_url
 }
 
+function Get-BambuInstallerDownload {
+  $downloads = Get-DownloadsDir
+  if (-not (Test-Path $downloads)) { return $null }
+  Get-ChildItem -Path $downloads -File -Filter 'Bambu_Studio_win-*.exe' -ErrorAction SilentlyContinue |
+    Where-Object { $_.Length -gt 100MB } |
+    Sort-Object LastWriteTime -Descending |
+    Select-Object -First 1
+}
+
+function Test-StableDownload($file) {
+  if (-not $file -or -not (Test-Path $file.FullName)) { return $false }
+  $len = $file.Length
+  $mtime = $file.LastWriteTimeUtc
+  Start-Sleep -Seconds 2
+  $again = Get-Item $file.FullName -ErrorAction SilentlyContinue
+  [bool]($again -and $again.Length -eq $len -and $again.LastWriteTimeUtc -eq $mtime)
+}
+
 function Register-BambuInstallerLauncher {
   $downloadsQ = Quote-PsString (Get-DownloadsDir)
   $body = @(
@@ -813,44 +831,85 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
   if (-not $bambuWasInstalled) {
     $bambuUrl = Resolve-BambuStudioInstallerUrl
     Register-BambuInstallerLauncher
-    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio install run_task'
-    $bambuPrompt = @"
-Install Bambu Studio using Brave.
+    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio download run_task'
+    $bambuDownloadPrompt = @"
+Download the Bambu Studio Windows installer using Brave.
 
 When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type these commands into Command Prompt, PowerShell, Run, or any terminal window.
 
 Step 1: use the run_shell tool with exactly this command:
 ufoagent-launch.cmd brave --no-first-run --no-default-browser-check $bambuUrl
 
-Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish. If Brave asks, keep or allow the download. Download the .exe installer, not the zip.
+Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish. If Brave asks, keep or allow the download. Download the .exe installer, not the zip. Stop once the download is complete.
+"@
+    $resp = Send-NodeCommand 'run_task' $bambuDownloadPrompt
+    Write-Host "sent Bambu Studio download run_task: id=$($resp.id) status=$($resp.status)"
+    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download command queued: $($resp.id)"
+    $bambuDownloadId = $resp.id
+    $script:thirdPartyId = $bambuDownloadId
+    $bambuDownloaded = Wait-For -TimeoutSec 900 -PollSec 10 -StreamAgentLog -Condition {
+      $c = Get-NodeCommand $bambuDownloadId
+      if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
+        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download command status: $($c.status)"
+        $script:lastBambuStatus = $c.status
+      }
+      $installer = Get-BambuInstallerDownload
+      if ($installer -and (Test-StableDownload $installer)) { return $true }
+      if ($c -and $c.status -eq 'failed') {
+        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download task failed while browser download may still be running"
+      }
+      $false
+    }
+    if (-not $bambuDownloaded) {
+      $c = if ($bambuDownloadId) { Get-NodeCommand $bambuDownloadId } else { $null }
+      if ($c) { Write-Host "Bambu Studio download run_task result: status=$($c.status) result=$($c.result)" }
+      Show-FileTail 'agent log' $AgentLog 100
+      throw 'UFO did not download the Bambu Studio installer'
+    }
+    $bambuDownloadDone = Wait-CommandTerminalAfterState $bambuDownloadId 'Bambu Studio download run_task' 'thirdparty' 60
+    Write-CommandResultProgress 'thirdparty' $bambuDownloadDone
+    Assert-LauncherEvent 'brave' 'thirdparty'
 
-Step 3: use the run_shell tool with exactly this command:
+    $installer = Get-BambuInstallerDownload
+    if (-not $installer) { throw 'Bambu Studio installer download disappeared before setup' }
+    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu installer downloaded: $($installer.Name)"
+    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio setup run_task'
+    $bambuSetupPrompt = @"
+Install the already-downloaded Bambu Studio Windows installer.
+
+When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type this command into Command Prompt, PowerShell, Run, or any terminal window.
+
+Use the run_shell tool with exactly this command:
 ufoagent-launch.cmd bambu-setup
 
 Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or graphics error, leave that dialog visible and consider the install complete.
 "@
-    $resp = Send-NodeCommand 'run_task' $bambuPrompt
-    Write-Host "sent Bambu Studio install run_task: id=$($resp.id) status=$($resp.status)"
-    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu command queued: $($resp.id)"
-    $script:thirdPartyId = $resp.id
-    $bambuReady = Wait-For -TimeoutSec 1500 -PollSec 10 -StreamAgentLog -Condition {
-      $c = Get-NodeCommand $script:thirdPartyId
+    $resp = Send-NodeCommand 'run_task' $bambuSetupPrompt
+    Write-Host "sent Bambu Studio setup run_task: id=$($resp.id) status=$($resp.status)"
+    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu setup command queued: $($resp.id)"
+    $bambuSetupId = $resp.id
+    $script:thirdPartyId = $bambuSetupId
+    $script:lastBambuStatus = ''
+    $bambuReady = Wait-For -TimeoutSec 900 -PollSec 10 -StreamAgentLog -Condition {
+      $c = Get-NodeCommand $bambuSetupId
       if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
-        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu command status: $($c.status)"
+        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu setup command status: $($c.status)"
         $script:lastBambuStatus = $c.status
       }
-      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio install run_task failed: $($c.result)" }
-      Test-BambuStudioInstalled
+      $installed = Test-BambuStudioInstalled
+      if ($c -and $c.status -eq 'failed' -and -not $installed) {
+        throw "Bambu Studio setup run_task failed: $($c.result)"
+      }
+      $installed
     }
     if (-not $bambuReady) {
-      $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
-      if ($c) { Write-Host "Bambu Studio install run_task result: status=$($c.status) result=$($c.result)" }
+      $c = if ($bambuSetupId) { Get-NodeCommand $bambuSetupId } else { $null }
+      if ($c) { Write-Host "Bambu Studio setup run_task result: status=$($c.status) result=$($c.result)" }
       Show-FileTail 'agent log' $AgentLog 100
       throw 'UFO did not install Bambu Studio'
     }
-    $bambuDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Bambu Studio install run_task' 'thirdparty' 120
-    Write-CommandResultProgress 'thirdparty' $bambuDone
-    Assert-LauncherEvent 'brave' 'thirdparty'
+    $bambuSetupDone = Wait-CommandTerminalAfterState $bambuSetupId 'Bambu Studio setup run_task' 'thirdparty' 120
+    Write-CommandResultProgress 'thirdparty' $bambuSetupDone
     Assert-LauncherEvent 'bambu-setup' 'thirdparty'
   } else {
     Write-Host 'Bambu Studio already installed'
