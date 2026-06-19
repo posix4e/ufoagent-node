@@ -224,13 +224,10 @@ function Wait-CommandTerminalAfterState([string]$id, [string]$label, [string]$ph
   $c = if ($id) { Get-NodeCommand $id } else { $null }
   if ($done -and $c) {
     Write-Host "$label result after state verified: status=$($c.status)"
-    if ($c.status -eq 'failed') {
+    if ($c.status -ne 'done') {
       $summary = Get-CommandResultSummary $c
-      if ($summary) {
-        Write-ProgressEvent 'phase_update' $phase "$label reported failed after state verified: $summary"
-      } else {
-        Write-ProgressEvent 'phase_update' $phase "$label reported failed after state verified"
-      }
+      if ($summary) { Write-ProgressEvent 'phase_update' $phase "$label failed after state verified: $summary" }
+      throw "$label failed: $($c.result)"
     }
     return $c
   }
@@ -853,9 +850,7 @@ Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish
       }
       $installer = Get-BambuInstallerDownload
       if ($installer -and (Test-StableDownload $installer)) { return $true }
-      if ($c -and $c.status -eq 'failed') {
-        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download task failed while browser download may still be running"
-      }
+      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio download run_task failed: $($c.result)" }
       $false
     }
     if (-not $bambuDownloaded) {
@@ -895,9 +890,7 @@ Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or gr
         $script:lastBambuStatus = $c.status
       }
       $installed = Test-BambuStudioInstalled
-      if ($c -and $c.status -eq 'failed' -and -not $installed) {
-        throw "Bambu Studio setup run_task failed: $($c.result)"
-      }
+      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio setup run_task failed: $($c.result)" }
       $installed
     }
     if (-not $bambuReady) {

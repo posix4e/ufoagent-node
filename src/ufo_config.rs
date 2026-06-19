@@ -51,6 +51,26 @@ const MANAGED_SKIP_MCP_GUARD: &str = r#"        # Managed by ufoagent: honor USE
             return
 
         self.logger.info("Loading MCP tool information...")"#;
+const MANAGED_APP_CONFIRMATION_MARKER: &str =
+    "Managed by ufoagent: read confirmation details from processing_context.";
+const APP_CONFIRMATION_SENTINEL: &str = r#"        action = self.processor.actions
+        control_text = self.processor.control_text
+
+        decision = interactor.sensitive_step_asker(action, control_text)"#;
+const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: read confirmation details from processing_context.
+        context = self.processor.processing_context
+        action_info = context.get_local("action_info")
+
+        if action_info:
+            action = action_info.to_list_of_dicts()
+            control_text = "\n".join(action_info.to_representation())
+        else:
+            action = context.get_local("action", [])
+            control_text = context.get_local("action_representation", "")
+            if isinstance(control_text, list):
+                control_text = "\n".join(control_text)
+
+        decision = interactor.sensitive_step_asker(action, control_text)"#;
 #[cfg(test)]
 const MANAGED_CLI_ALLOWLIST_MARKER: &str =
     "Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.";
@@ -135,6 +155,37 @@ fn patch_mcp_loader(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn patch_app_confirmation(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "reading UFO AppAgent confirmation handler {}",
+            path.display()
+        )
+    })?;
+    if original.contains(MANAGED_APP_CONFIRMATION_MARKER) {
+        return Ok(false);
+    }
+    if !original.contains("self.processor.actions")
+        && !original.contains("self.processor.control_text")
+    {
+        return Ok(false);
+    }
+    let patched = original.replacen(APP_CONFIRMATION_SENTINEL, MANAGED_APP_CONFIRMATION_BLOCK, 1);
+    if patched == original {
+        anyhow::bail!(
+            "could not find AppAgent confirmation sentinel in UFO file {}",
+            path.display()
+        );
+    }
+    std::fs::write(path, patched).with_context(|| {
+        format!(
+            "writing managed UFO AppAgent confirmation patch {}",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
 fn patch_cli_allowlist(path: &Path) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO CLI launcher {}", path.display()))?;
@@ -165,6 +216,11 @@ fn replace_cli_allowlist_block(original: &str) -> Option<String> {
 }
 
 fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
+    let app_agent = ufo_home
+        .join("ufo")
+        .join("agents")
+        .join("agent")
+        .join("app_agent.py");
     for rel in [
         ["ufo", "agents", "agent", "host_agent.py"],
         ["ufo", "agents", "agent", "app_agent.py"],
@@ -173,6 +229,9 @@ fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
         if path.exists() {
             patch_mcp_loader(&path)?;
         }
+    }
+    if app_agent.exists() {
+        patch_app_confirmation(&app_agent)?;
     }
     let cli = ["ufo", "client", "mcp", "local_servers", "cli_mcp_server.py"]
         .iter()
@@ -356,15 +415,20 @@ mod tests {
             .join("agent")
             .join("app_agent.py");
         std::fs::create_dir_all(host.parent().unwrap()).unwrap();
-        for path in [&host, &app] {
-            std::fs::write(
-                path,
-                format!(
-                    "class Agent:\n    async def _load_mcp_context(self, context):\n{MCP_LOAD_SENTINEL}\n        result = await context.command_dispatcher.execute_commands([])\n"
-                ),
-            )
-            .unwrap();
-        }
+        std::fs::write(
+            &host,
+            format!(
+                "class Agent:\n    async def _load_mcp_context(self, context):\n{MCP_LOAD_SENTINEL}\n        result = await context.command_dispatcher.execute_commands([])\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &app,
+            format!(
+                "class Agent:\n    async def _load_mcp_context(self, context):\n{MCP_LOAD_SENTINEL}\n        result = await context.command_dispatcher.execute_commands([])\n\n    def process_confirmation(self) -> bool:\n{APP_CONFIRMATION_SENTINEL}\n        return decision\n"
+            ),
+        )
+        .unwrap();
 
         apply_managed_defaults(&home).unwrap();
         for path in [&host, &app] {
@@ -374,12 +438,24 @@ mod tests {
             assert!(patched.contains("self.prompter.create_api_prompt_template(tools=[])"));
             assert_eq!(patched.matches(MANAGED_SKIP_MCP_MARKER).count(), 1);
         }
+        let app_patched = std::fs::read_to_string(&app).unwrap();
+        assert!(app_patched.contains(MANAGED_APP_CONFIRMATION_MARKER));
+        assert!(app_patched.contains("context = self.processor.processing_context"));
+        assert!(app_patched.contains("action_info.to_list_of_dicts()"));
+        assert!(app_patched.contains("action = context.get_local(\"action\", [])"));
+        assert!(!app_patched.contains("self.processor.actions"));
+        assert!(!app_patched.contains("self.processor.control_text"));
 
         apply_managed_defaults(&home).unwrap();
         for path in [&host, &app] {
             let patched = std::fs::read_to_string(path).unwrap();
             assert_eq!(patched.matches(MANAGED_SKIP_MCP_MARKER).count(), 1);
         }
+        let app_patched = std::fs::read_to_string(&app).unwrap();
+        assert_eq!(
+            app_patched.matches(MANAGED_APP_CONFIRMATION_MARKER).count(),
+            1
+        );
 
         let _ = std::fs::remove_dir_all(home);
     }
