@@ -87,6 +87,12 @@ for i in $(seq 1 40); do
   echo "  waiting for desktop (explorer)"; sleep 5
 done
 
+# The host records with `virsh screenshot`, so a sleeping/blanked virtual display silently turns the
+# marketing captures black even while the interactive Windows session keeps running. Disable display
+# sleep for the CI session before recording.
+echo "=== keep interactive display awake ==="
+SSH 'powercfg /change monitor-timeout-ac 0; powercfg /change monitor-timeout-dc 0; powercfg /change standby-timeout-ac 0; powercfg /change standby-timeout-dc 0; reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null; "display sleep disabled"'
+
 # the e2e assertion library the journey composes (repo layout: ../e2e; dev layout: ./e2e)
 E2EDIR="$HERE/e2e"; [ -d "$E2EDIR" ] || E2EDIR="$HERE/../e2e"
 echo "=== stage journey + e2e lib ($E2EDIR) ==="
@@ -134,8 +140,8 @@ echo "=== launch journey (one interactive task) ==="
 SSH 'Set-Content C:\e2e\run-journey.cmd -Encoding Ascii -Value @("@echo off","powershell -NoProfile -ExecutionPolicy Bypass -File C:\e2e\journey.ps1 > C:\e2e\out\journey.log 2>&1","echo LAUNCHER-EXIT %ERRORLEVEL% >> C:\e2e\out\journey.log"); "launcher written"'
 SSH "schtasks /Create /TN UFOJourney /TR C:\\e2e\\run-journey.cmd /SC ONCE /ST 23:30 /RU $GUSER /IT /RL HIGHEST /F | Out-Null; schtasks /Run /TN UFOJourney | Out-Null; 'launched'"
 
-echo "=== poll result (<=15m) ==="
-status="PENDING"; d=$(( $(date +%s) + 15*60 ))
+echo "=== poll result (<=45m) ==="
+status="PENDING"; d=$(( $(date +%s) + 45*60 ))
 while [ "$(date +%s)" -lt "$d" ]; do
   report_progress || true
   status=$(SSH 'if(Test-Path C:\e2e\out\result.json){(Get-Content C:\e2e\out\result.json -Raw | ConvertFrom-Json).status}else{"PENDING"}' 2>/dev/null | tr -dc 'A-Za-z')

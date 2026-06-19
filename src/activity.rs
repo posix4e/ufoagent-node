@@ -8,6 +8,7 @@ use crate::cmdlog::{self, Entry};
 use crate::config::Config;
 use crate::controlplane::{ControlPlane, USER_AGENT};
 use crate::store;
+use std::time::Duration;
 
 const SYSTEM_PROMPT: &str = "You are explaining to a non-technical operator what their Windows \
 automation agent has been doing. You are given its recent activity log (most recent last). Write \
@@ -53,6 +54,7 @@ fn llm_summary(entries: &[Entry]) -> anyhow::Result<String> {
     let resp = ureq::post(&url)
         .set("authorization", &format!("Bearer {}", cred.api_key))
         .set("user-agent", USER_AGENT)
+        .timeout(Duration::from_secs(25))
         .send_json(body)?;
     let v: serde_json::Value = resp.into_json()?;
     let text = v["choices"][0]["message"]["content"]

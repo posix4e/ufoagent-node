@@ -23,11 +23,15 @@ using System; using System.Runtime.InteropServices;
 public struct RECT { public int Left, Top, Right, Bottom; }
 public static class Win32 {
   [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
   [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+  [DllImport("user32.dll")] public static extern bool SetCursorPos(int X, int Y);
+  [DllImport("user32.dll")] public static extern void mouse_event(uint flags, uint dx, uint dy, uint data, UIntPtr extraInfo);
 }
 "@
+Add-Type -AssemblyName UIAutomationClient,UIAutomationTypes
 
 # Declutter: WS2025 auto-opens Server Manager + an Azure-Arc nag that otherwise sit behind every shot.
 # (The cold snapshot also disables its auto-open; this is the belt-and-suspenders.)
@@ -42,6 +46,8 @@ $phases = New-Object System.Collections.ArrayList
 $script:curCrop = $null
 $script:lastInstallDetail = ''
 $script:lastRemoteStatus = ''
+$script:lastBambuStatus = ''
+$script:bambuProcessName = 'bambu-studio'
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Get-FgRect {
   $h = [Win32]::GetForegroundWindow(); $r = New-Object RECT
@@ -55,8 +61,280 @@ function Focus-Proc([string]$name) {
   $p = Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
   if ($p) { [Win32]::ShowWindow($p.MainWindowHandle, 9) | Out-Null; [Win32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null; Start-Sleep -Milliseconds 500 }
 }
+function Minimize-OwnConsole {
+  $h = [Win32]::GetConsoleWindow()
+  if ($h -ne [IntPtr]::Zero) {
+    [Win32]::ShowWindow($h, 6) | Out-Null
+    Start-Sleep -Milliseconds 800
+  }
+}
 # Capture the crop for the current phase: focus $proc (if given), then record the foreground window rect.
 function Set-Crop([string]$proc = $null) { if ($proc) { Focus-Proc $proc }; $script:curCrop = Get-FgRect }
+
+function Get-UiaRect($el) {
+  if (-not $el) { return $null }
+  try {
+    $r = $el.Current.BoundingRectangle
+    if ($r.Width -gt 80 -and $r.Height -gt 80) {
+      return [ordered]@{ x = [int]$r.X; y = [int]$r.Y; w = [int]$r.Width; h = [int]$r.Height }
+    }
+  } catch {}
+  $null
+}
+
+function Get-UiaElements($root) {
+  try { return $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition) }
+  catch { return @() }
+}
+
+function Find-UiaByName([string]$needle, [string]$controlType = $null, [switch]$ChildrenOnly) {
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $scope = if ($ChildrenOnly) { [System.Windows.Automation.TreeScope]::Children } else { [System.Windows.Automation.TreeScope]::Descendants }
+  $all = try { $root.FindAll($scope, [System.Windows.Automation.Condition]::TrueCondition) } catch { @() }
+  foreach ($el in $all) {
+    try {
+      if ($controlType -and $el.Current.ControlType.ProgrammaticName -ne "ControlType.$controlType") { continue }
+      if (($el.Current.Name + '') -like "*$needle*") { return $el }
+    } catch {}
+  }
+  $null
+}
+
+function Invoke-UiaElement($el) {
+  if (-not $el) { return $false }
+  try {
+    $p = $el.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    if ($p) { $p.Invoke(); return $true }
+  } catch {}
+  try {
+    $r = $el.Current.BoundingRectangle
+    [Win32]::SetCursorPos([int]($r.X + ($r.Width / 2)), [int]($r.Y + ($r.Height / 2))) | Out-Null
+    [Win32]::mouse_event(0x0002, 0, 0, 0, [UIntPtr]::Zero)
+    [Win32]::mouse_event(0x0004, 0, 0, 0, [UIntPtr]::Zero)
+    return $true
+  } catch { return $false }
+}
+
+function Dismiss-UfoSetupConsole {
+  Write-ProgressEvent 'phase_update' 'install' 'closing installer setup prompt'
+  $win = Find-UiaByName 'UFOAgent setup' 'Window' -ChildrenOnly
+  if ($win) {
+    if (-not $script:curCrop) { $script:curCrop = Get-UiaRect $win }
+    try {
+      [Win32]::SetForegroundWindow([IntPtr]$win.Current.NativeWindowHandle) | Out-Null
+      Start-Sleep -Milliseconds 500
+      [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+      Start-Sleep -Seconds 1
+    } catch {}
+  }
+  Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowTitle -like '*UFOAgent setup*' } |
+    ForEach-Object {
+      try {
+        if (-not $_.CloseMainWindow()) { $_ | Stop-Process -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 500
+        if (-not $_.HasExited) { $_ | Stop-Process -Force -ErrorAction SilentlyContinue }
+      } catch {}
+    }
+}
+
+function RightClick-UiaElement($el) {
+  if (-not $el) { return $false }
+  try {
+    $r = $el.Current.BoundingRectangle
+    [Win32]::SetCursorPos([int]($r.X + ($r.Width / 2)), [int]($r.Y + ($r.Height / 2))) | Out-Null
+    [Win32]::mouse_event(0x0008, 0, 0, 0, [UIntPtr]::Zero)
+    [Win32]::mouse_event(0x0010, 0, 0, 0, [UIntPtr]::Zero)
+    return $true
+  } catch { return $false }
+}
+
+function Assert-ManagedUfoConfig {
+  $system = 'C:\ProgramData\UFOAgent\ufo\config\ufo\system.yaml'
+  if (-not (Test-Path $system)) { throw "UFO system config missing: $system" }
+  $raw = Get-Content $system -Raw
+  if ($raw -notmatch '(?m)^\s*USE_MCP:\s*False\b') {
+    throw 'managed UFO config did not disable USE_MCP'
+  }
+  $mcp = 'C:\ProgramData\UFOAgent\ufo\config\ufo\mcp.yaml'
+  if (-not (Test-Path $mcp)) { throw "UFO MCP config missing: $mcp" }
+  $mcpRaw = Get-Content $mcp -Raw
+  if ($mcpRaw -notmatch 'Managed by ufoagent') {
+    throw 'managed UFO MCP config was not written'
+  }
+  foreach ($required in @('namespace: UICollector', 'namespace: HostUIExecutor', 'namespace: AppUIExecutor', 'namespace: CommandLineExecutor')) {
+    if ($mcpRaw -notmatch [regex]::Escape($required)) {
+      throw "managed UFO MCP config missing UI server: $required"
+    }
+  }
+  foreach ($blocked in @('WordCOMExecutor', 'ExcelCOMExecutor', 'PowerPointCOMExecutor', 'type: http')) {
+    if ($mcpRaw -match [regex]::Escape($blocked)) {
+      throw "managed UFO MCP config exposes blocked server: $blocked"
+    }
+  }
+  foreach ($py in @(
+      'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\host_agent.py',
+      'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'
+    )) {
+    if (-not (Test-Path $py)) { throw "UFO MCP loader missing: $py" }
+    $pyRaw = Get-Content $py -Raw
+    if ($pyRaw -notmatch 'Managed by ufoagent: honor USE_MCP=False') {
+      throw "UFO MCP loader was not patched to honor USE_MCP=False: $py"
+    }
+  }
+  $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
+  if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
+  $cliRaw = Get-Content $cli -Raw
+  foreach ($allowed in @('"bambu-studio.cmd"', '"bambustudio.exe"')) {
+    if ($cliRaw -notmatch [regex]::Escape($allowed)) {
+      throw "UFO CLI launcher allow-list missing: $allowed"
+    }
+  }
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, Bambu launcher allowed'
+}
+
+function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
+  $done = Wait-For -TimeoutSec $TimeoutSec -PollSec 5 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $id
+    $c -and ($c.status -eq 'done' -or $c.status -eq 'failed')
+  }
+  $c = if ($id) { Get-NodeCommand $id } else { $null }
+  if (-not $done -or -not $c) { throw "$label did not finish in ${TimeoutSec}s" }
+  Write-Host "$label result: status=$($c.status)"
+  if ($c.status -ne 'done') { throw "$label failed: $($c.result)" }
+  $c
+}
+
+function Write-CommandResultProgress([string]$phase, $command) {
+  if (-not $command -or -not $command.result) { return }
+  $summary = (($command.result -replace '\s+', ' ').Trim())
+  if ($summary.Length -gt 220) { $summary = $summary.Substring(0, 220) + '...' }
+  Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
+}
+
+function Get-BambuExe {
+  $candidates = @(
+    "$env:ProgramFiles\Bambu Studio\bambu-studio.exe",
+    "$env:ProgramFiles\Bambu Studio\BambuStudio.exe",
+    "${env:ProgramFiles(x86)}\Bambu Studio\bambu-studio.exe",
+    "${env:ProgramFiles(x86)}\Bambu Studio\BambuStudio.exe"
+  )
+  $found = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+  if ($found) { return $found }
+
+  $portable = Join-Path $ROOT 'apps\BambuStudio'
+  if (Test-Path $portable) {
+    Get-ChildItem $portable -Recurse -File -Include 'bambu-studio.exe', 'BambuStudio.exe' -ErrorAction SilentlyContinue |
+      Select-Object -First 1 -ExpandProperty FullName
+  }
+}
+
+function Install-BambuShortcut([string]$exe) {
+  $targets = @(
+    "$env:PUBLIC\Desktop\Bambu Studio.lnk",
+    "$env:ProgramData\Microsoft\Windows\Start Menu\Programs\Bambu Studio.lnk"
+  )
+  $shell = New-Object -ComObject WScript.Shell
+  foreach ($target in $targets) {
+    New-Item -ItemType Directory -Force (Split-Path $target) | Out-Null
+    $lnk = $shell.CreateShortcut($target)
+    $lnk.TargetPath = $exe
+    $lnk.WorkingDirectory = Split-Path $exe
+    $lnk.Description = 'Bambu Studio'
+    $lnk.Save()
+  }
+}
+
+function Install-BambuLaunchShim([string]$exe) {
+  $cmd = Join-Path $env:WINDIR 'bambu-studio.cmd'
+  $body = @(
+    '@echo off',
+    ('start "" /D "' + (Split-Path $exe) + '" "' + $exe + '" %* ^<NUL ^>NUL 2^>NUL')
+  )
+  Set-Content -Path $cmd -Value $body -Encoding Ascii
+}
+
+function Install-BambuStudio {
+  $existing = Get-BambuExe
+  if ($existing) {
+    Install-BambuShortcut $existing
+    Install-BambuLaunchShim $existing
+    Write-Host "Bambu Studio already installed: $existing"
+    return $existing
+  }
+  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+  Write-ProgressEvent 'phase_update' 'bambu' 'resolving latest Bambu Studio release'
+  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/bambulab/BambuStudio/releases/latest'
+  $asset = $rel.assets | Where-Object { $_.name -match '^Bambu_Studio_win-.*\.zip$' } | Select-Object -First 1
+  if (-not $asset) { throw 'latest Bambu Studio release has no Windows zip asset' }
+  $archive = Join-Path $ROOT 'dl\bambu-studio.zip'
+  $dest = Join-Path $ROOT 'apps\BambuStudio'
+  New-Item -ItemType Directory -Force -Path (Split-Path $archive), $dest | Out-Null
+  Write-Host "Bambu Studio archive: $($asset.name) $($asset.size) bytes"
+  Write-ProgressEvent 'phase_update' 'bambu' "downloading $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
+  Invoke-WebRequest -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri $asset.browser_download_url -OutFile $archive
+  Write-ProgressEvent 'phase_update' 'bambu' 'extracting Bambu Studio'
+  if (Test-Path $dest) { Remove-Item $dest -Recurse -Force }
+  New-Item -ItemType Directory -Force $dest | Out-Null
+  Expand-Archive -Path $archive -DestinationPath $dest -Force
+  $exe = Get-BambuExe
+  if (-not $exe) { throw 'Bambu Studio archive extracted but app executable was not found' }
+  Install-BambuShortcut $exe
+  Install-BambuLaunchShim $exe
+  Write-ProgressEvent 'phase_update' 'bambu' 'Bambu Studio ready'
+  $exe
+}
+
+function Get-BambuProcess {
+  Get-Process 'bambu-studio', 'BambuStudio' -ErrorAction SilentlyContinue
+}
+
+function Stop-BambuStudio {
+  Get-BambuProcess | Stop-Process -Force -ErrorAction SilentlyContinue
+}
+
+function Test-UfoTranscriptTyped([string]$id, [string]$want) {
+  if (-not $id) { return $false }
+  $path = "C:\ProgramData\UFOAgent\tasks\logs\$id.txt"
+  if (-not (Test-Path $path)) { return $false }
+  $raw = Get-Content $path -Raw -ErrorAction SilentlyContinue
+  [bool]($raw -and $raw.Contains($want) -and $raw.Contains('set_edit_text') -and $raw.Contains('SUCCESS'))
+}
+
+function Open-TrayActivitySummary {
+  $hidden = Find-UiaByName 'Show Hidden Icons' 'Button'
+  if (-not $hidden) { $hidden = Find-UiaByName 'hidden icons' 'Button' }
+  if ($hidden) { [void](Invoke-UiaElement $hidden); Start-Sleep -Milliseconds 1500 }
+  $icon = Find-UiaByName 'UFOAgent' 'Button'
+  if (-not $icon) { throw 'UFOAgent tray icon button not found' }
+  if (-not (RightClick-UiaElement $icon)) { throw 'could not right-click UFOAgent tray icon' }
+  Start-Sleep -Milliseconds 1500
+  $item = Find-UiaByName 'been doing' 'MenuItem'
+  if (-not $item) { throw "tray menu item containing 'been doing' not found" }
+  if (-not (Invoke-UiaElement $item)) { throw 'could not invoke activity summary menu item' }
+  $dlg = $null
+  for ($i = 0; $i -lt 90 -and -not $dlg; $i++) {
+    Start-Sleep -Seconds 1
+    $dlg = Find-UiaByName 'been doing' 'Window' -ChildrenOnly
+  }
+  if (-not $dlg) { throw 'activity summary dialog never appeared' }
+  try { [Win32]::SetForegroundWindow([IntPtr]$dlg.Current.NativeWindowHandle) | Out-Null } catch {}
+  Start-Sleep -Milliseconds 800
+  $script:curCrop = Get-UiaRect $dlg
+  if (-not $script:curCrop) { $script:curCrop = Get-FgRect }
+  $dlg
+}
+
+function Close-ActivityDialog($dlg) {
+  if (-not $dlg) { return }
+  try {
+    foreach ($el in (Get-UiaElements $dlg)) {
+      if ($el.Current.ControlType.ProgrammaticName -eq 'ControlType.Button' -and (($el.Current.Name + '') -like '*OK*')) {
+        [void](Invoke-UiaElement $el); return
+      }
+    }
+  } catch {}
+}
 
 function Write-ProgressEvent([string]$kind, [string]$phase = '', [string]$detail = '') {
   $obj = [ordered]@{ ts = (Now); event = $kind }
@@ -119,14 +397,19 @@ Phase 'install' {
         Write-ProgressEvent 'phase_update' 'install' $detail
         $script:lastInstallDetail = $detail
       }
-      if ($m.state -in @('ready', 'broken')) { return $true }
+      if ($m.state -in @('ready', 'broken')) {
+        Dismiss-UfoSetupConsole
+        return $true
+      }
     }
     $false
   }
   if (-not $ready) { throw 'provisioning did not reach a terminal state in 10m' }
   $state = (Get-Content $marker -Raw | ConvertFrom-Json).state
   if ($state -ne 'ready') { throw "provisioning state=$state (expected ready)" }
-  Set-Crop   # the "UFOAgent setup" console is foreground here
+  Write-ProgressEvent 'phase_update' 'install' 'validating managed UFO config'
+  Assert-ManagedUfoConfig
+  if (-not $script:curCrop) { Set-Crop }
   Write-Host 'install + provision: UFO2 ready'
 }
 
@@ -182,14 +465,58 @@ Phase 'remote' {
     Show-FileTail 'agent log' $AgentLog 40
     throw 'remote run_task did not open Notepad'
   }
-  Assert-TypedVerdict (Wait-NotepadTyped -StreamAgentLog) 'remote run_task'
+  $typed = Wait-NotepadTyped -StreamAgentLog
+  if ($typed.Typed) {
+    Assert-TypedVerdict $typed 'remote run_task'
+  } elseif (Test-UfoTranscriptTyped $script:remoteId 'hello from ufoagent') {
+    Write-Host 'remote run_task: UFO transcript shows set_edit_text typed hello from ufoagent'
+  } else {
+    Assert-TypedVerdict $typed 'remote run_task'
+  }
   Set-Crop 'notepad'; Start-Sleep 1
 }
 if ($haveAdm -and $script:remoteId) {
-  $null = Wait-For -TimeoutSec 240 -StreamAgentLog -Condition { $c = Get-NodeCommand $script:remoteId; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
+  $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
 }
 
-# 5) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
+# 5) BAMBU STUDIO - real third-party Windows app path. This catches AppAgent/config regressions that
+# a Notepad smoke test will not, and produces the website's concrete app demo.
+$script:bambuId = $null
+Phase 'bambu' {
+  if (-not $haveAdm) { Write-Host 'no CI admin token: skipping Bambu Studio task'; return 'SKIP' }
+  Stop-UfoWindows
+  Stop-BambuStudio
+  $bambu = Install-BambuStudio
+  $script:bambuProcessName = [IO.Path]::GetFileNameWithoutExtension($bambu)
+  Write-Host "Bambu Studio installed: $bambu"
+  Minimize-OwnConsole
+  Write-ProgressEvent 'phase_update' 'bambu' 'sending Bambu Studio run_task'
+  $resp = Send-NodeCommand 'run_task' 'Use the run_shell tool with exactly this command: bambu-studio.cmd. Then wait until the Bambu Studio main window is visible.'
+  Write-Host "sent Bambu run_task: id=$($resp.id) status=$($resp.status)"
+  Write-ProgressEvent 'phase_update' 'bambu' "command queued: $($resp.id)"
+  $script:bambuId = $resp.id
+  $opened = Wait-For -TimeoutSec 420 -PollSec 5 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $script:bambuId
+    if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
+      Write-ProgressEvent 'phase_update' 'bambu' "command status: $($c.status)"
+      $script:lastBambuStatus = $c.status
+    }
+    if ($c -and $c.status -eq 'failed') { throw "Bambu run_task command failed: $($c.result)" }
+    [bool](Get-BambuProcess | Where-Object { $_.MainWindowHandle -ne 0 })
+  }
+  if (-not $opened) {
+    $c = if ($script:bambuId) { Get-NodeCommand $script:bambuId } else { $null }
+    if ($c) { Write-Host "Bambu run_task command result: status=$($c.status) result=$($c.result)" }
+    Show-FileTail 'agent log' $AgentLog 60
+    throw 'Bambu Studio did not open'
+  }
+  Set-Crop $script:bambuProcessName
+  Start-Sleep 4
+  $bambuDone = Wait-CommandTerminal $script:bambuId 'Bambu Studio run_task' 300
+  Write-CommandResultProgress 'bambu' $bambuDone
+}
+
+# 6) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
 #    dashboard (a CI-token preview of the REAL CI-tenant data, since the headless VM browser can't do
 #    GitHub OAuth) on this node's detail and record it. On trusted CI this phase is required: do not
 #    publish a misleading desktop gif if the browser/dashboard did not open.
@@ -199,8 +526,8 @@ Phase 'dashboard' {
     Where-Object { Test-Path $_ } | Select-Object -First 1
   if (-not $edge) { throw 'Microsoft Edge not found; cannot capture mission control' }
 
-  # Capture this node's desktop through the REAL screenshot command. The remote-task Notepad remains
-  # open so the live desktop image has concrete work visible.
+  # Capture this node's desktop through the REAL screenshot command. Bambu Studio remains open so
+  # the live desktop image has concrete app work visible.
   $shot = Send-NodeCommand 'screenshot'
   Write-Host "sent screenshot: id=$($shot.id) status=$($shot.status)"
   $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition { $c = Get-NodeCommand $shot.id; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
@@ -249,6 +576,17 @@ Phase 'dashboard' {
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-UfoWindows
+Stop-BambuStudio
+
+# 7) ACTIVITY SUMMARY - the tray/taskbar recap of what this node has been doing. This is the final
+#    story beat: after real remote work, open the tray menu and show the on-device LLM summary.
+Phase 'activity' {
+  if (-not $haveTok) { Write-Host 'not linked: skipping activity summary'; return 'SKIP' }
+  $dlg = Open-TrayActivitySummary
+  Write-Host 'activity summary dialog opened from tray'
+  Start-Sleep 8
+  Close-ActivityDialog $dlg
+}
 
 Write-Result 'PASS'
 Write-ProgressEvent 'journey_done'

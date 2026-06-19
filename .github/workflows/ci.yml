@@ -124,9 +124,10 @@ jobs:
           set -euo pipefail
           g=/mnt/ram/e2e/gifs
           rm -rf pub && mkdir pub
-          # The site uses install-screen.gif, link-screen.gif, remote-task.gif, and mission-control.gif.
+          # The site uses install-screen.gif, link-screen.gif, bambu-studio.gif,
+          # mission-control.gif, activity-summary.gif, and still fallbacks.
           # Publish gif + a still fallback for each; missing ones are skipped.
-          for f in install-screen link-screen remote-task mission-control; do
+          for f in install-screen link-screen remote-task bambu-studio mission-control activity-summary; do
             cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
             cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
           done
