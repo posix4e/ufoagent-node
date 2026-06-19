@@ -216,6 +216,30 @@ function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 30
   $c
 }
 
+function Wait-CommandTerminalAfterState([string]$id, [string]$label, [string]$phase, [int]$TimeoutSec = 120) {
+  $done = Wait-For -TimeoutSec $TimeoutSec -PollSec 5 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $id
+    $c -and ($c.status -eq 'done' -or $c.status -eq 'failed')
+  }
+  $c = if ($id) { Get-NodeCommand $id } else { $null }
+  if ($done -and $c) {
+    Write-Host "$label result after state verified: status=$($c.status)"
+    if ($c.status -eq 'failed') {
+      $summary = Get-CommandResultSummary $c
+      if ($summary) {
+        Write-ProgressEvent 'phase_update' $phase "$label reported failed after state verified: $summary"
+      } else {
+        Write-ProgressEvent 'phase_update' $phase "$label reported failed after state verified"
+      }
+    }
+    return $c
+  }
+  $status = if ($c -and $c.status) { $c.status } else { 'missing' }
+  Write-Host "::warning::$label still $status after state verified"
+  Write-ProgressEvent 'phase_update' $phase "$label still $status after state verified"
+  $c
+}
+
 function Get-CommandResultSummary($command, [int]$MaxLen = 220) {
   if (-not $command -or -not $command.result) { return }
   $summary = (($command.result + '') -replace '[^\x09\x0A\x0D\x20-\x7E]', ' ' -replace '\s+', ' ').Trim()
@@ -773,7 +797,7 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
       Show-FileTail 'agent log' $AgentLog 80
       throw 'UFO did not install and open Brave'
     }
-    $braveDone = Wait-CommandTerminal $script:thirdPartyId 'Brave install run_task' 300
+    $braveDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Brave install run_task' 'thirdparty' 120
     Write-CommandResultProgress 'thirdparty' $braveDone
     Assert-LauncherEvent 'edge' 'thirdparty'
     Assert-LauncherEvent 'brave-setup' 'thirdparty'
@@ -824,7 +848,7 @@ Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or gr
       Show-FileTail 'agent log' $AgentLog 100
       throw 'UFO did not install Bambu Studio'
     }
-    $bambuDone = Wait-CommandTerminal $script:thirdPartyId 'Bambu Studio install run_task' 420
+    $bambuDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Bambu Studio install run_task' 'thirdparty' 120
     Write-CommandResultProgress 'thirdparty' $bambuDone
     Assert-LauncherEvent 'brave' 'thirdparty'
     Assert-LauncherEvent 'bambu-setup' 'thirdparty'
