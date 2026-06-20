@@ -55,7 +55,7 @@ def normalize_text(value: Any) -> str:
 
 def expected_request(args: argparse.Namespace) -> str:
     if getattr(args, "request_file", ""):
-        return Path(args.request_file).read_text(encoding="utf-8", errors="ignore")
+        return Path(args.request_file).read_text(encoding="utf-8", errors="ignore").lstrip("\ufeff")
     return getattr(args, "request", "")
 
 

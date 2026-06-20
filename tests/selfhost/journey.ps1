@@ -235,6 +235,7 @@ function Write-CommandResultProgress([string]$phase, $command) {
 
 function Export-UfoTrajectory([string]$label, [string]$id, [string]$request = '') {
   if (-not $id) { throw "cannot harvest UFO trajectory for ${label}: missing command id" }
+  if (-not $request) { throw "cannot harvest UFO trajectory for ${label}: missing request text" }
   if (-not (Test-Path $HARVEST)) { throw "UFO harvest script missing: $HARVEST" }
   $py = 'C:\ProgramData\UFOAgent\ufo\.venv\Scripts\python.exe'
   $ufoHome = 'C:\ProgramData\UFOAgent\ufo'
@@ -243,7 +244,7 @@ function Export-UfoTrajectory([string]$label, [string]$id, [string]$request = ''
   $harvestRoot = Join-Path $OUT 'ufo'
   New-Item -ItemType Directory -Force $harvestRoot | Out-Null
   $requestFile = Join-Path $OUT "ufo-request-$label.txt"
-  Set-Content -Path $requestFile -Value $request -Encoding UTF8 -NoNewline
+  [IO.File]::WriteAllText($requestFile, $request, (New-Object System.Text.UTF8Encoding $false))
   Write-ProgressEvent 'phase_update' $label "harvesting UFO trajectory for command $id"
   & $py $HARVEST export --label $label --task-id $id --ufo-home $ufoHome --log-name 'adhoc' --request-file $requestFile --out $harvestRoot
   if ($LASTEXITCODE -ne 0) { throw "UFO trajectory harvest failed for ${label}: exit $LASTEXITCODE" }
@@ -605,11 +606,11 @@ Phase 'remote' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping remote task'; return 'SKIP' }
   Stop-UfoWindows
   Minimize-OwnConsole
-  $remotePrompt = @"
+  $script:remotePrompt = @"
 Open Notepad and type exactly:
 hello from ufoagent
 "@
-  $resp = Send-NodeCommand 'run_task' $remotePrompt
+  $resp = Send-NodeCommand 'run_task' $script:remotePrompt
   Write-Host "sent run_task: id=$($resp.id) status=$($resp.status)"
   Write-ProgressEvent 'phase_update' 'remote' "command queued: $($resp.id)"
   $script:remoteId = $resp.id
@@ -647,10 +648,10 @@ hello from ufoagent
     Assert-TypedVerdict $typed 'remote run_task'
   }
   Start-Sleep 1
-}
-if ($haveAdm -and $script:remoteId) {
-  $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
-  Export-UfoTrajectory 'remote' $script:remoteId $remotePrompt
+  if ($script:remoteId) {
+    $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
+    Export-UfoTrajectory 'remote' $script:remoteId $script:remotePrompt
+  }
 }
 
 # 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
