@@ -388,8 +388,8 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
         phase("downloading UFO2 source");
         fetch_ufo(&home, git_ref)?;
     }
-    phase("configuring managed UFO2 defaults");
-    ufo_config::apply_managed_defaults(&home)?;
+    phase("configuring UFO2 unattended mode");
+    ufo_config::apply_unattended_mode(&home)?;
 
     let scratch = home
         .parent()

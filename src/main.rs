@@ -354,9 +354,9 @@ fn cmd_run(task: String, request: Option<String>) -> Result<()> {
     let cp = ControlPlane::new(&c.control_plane_url(), store::get_token());
     let home = c.ufo_home_path();
     agent::refresh_once(&cp, &home)?;
-    if let Err(e) = ufo_config::apply_managed_defaults(&home) {
-        log::warn!("could not apply managed UFO2 defaults before run: {e:#}");
-        eprintln!("warning: could not apply managed UFO2 defaults before run: {e:#}");
+    if let Err(e) = ufo_config::apply_unattended_mode(&home) {
+        log::warn!("could not configure UFO2 unattended mode before run: {e:#}");
+        eprintln!("warning: could not configure UFO2 unattended mode before run: {e:#}");
     }
     let python = c
         .python

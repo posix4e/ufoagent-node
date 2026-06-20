@@ -28,7 +28,7 @@ pub fn repair() -> Result<Vec<String>> {
     } else {
         // Genuinely provisioned (possibly before env tracking existed) — record a ready marker so the
         // dashboard chip and run_task gate are marker-based from here on.
-        ufo_config::apply_managed_defaults(&home)?;
+        ufo_config::apply_unattended_mode(&home)?;
         env::set_state(env::UFO2, EnvState::Ready, None, None);
         log.push("UFO2 present".into());
     }

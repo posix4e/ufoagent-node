@@ -133,85 +133,59 @@ function RightClick-UiaElement($el) {
   } catch { return $false }
 }
 
-function Assert-ManagedUfoConfig {
+function Assert-NativeUfoConfig {
   $system = 'C:\ProgramData\UFOAgent\ufo\config\ufo\system.yaml'
   if (-not (Test-Path $system)) { throw "UFO system config missing: $system" }
   $raw = Get-Content $system -Raw
-  if ($raw -notmatch '(?m)^\s*USE_MCP:\s*False\b') {
-    throw 'managed UFO config did not disable USE_MCP'
+  if ($raw -notmatch '(?m)^\s*USE_MCP:\s*True\b') {
+    throw 'UFO native config did not keep USE_MCP enabled'
+  }
+  if ($raw -match '(?m)^\s*USE_MCP:\s*False\b') {
+    throw 'UFO native config was overridden with USE_MCP=False'
+  }
+  if ($raw -notmatch '(?m)^\s*MCP_FALLBACK_TO_UI:\s*True\b') {
+    throw 'UFO native config did not keep MCP_FALLBACK_TO_UI enabled'
+  }
+  if ($raw -notmatch '(?m)^\s*SAFE_GUARD:\s*False\b') {
+    throw 'UFO unattended mode did not disable SAFE_GUARD'
   }
   $mcp = 'C:\ProgramData\UFOAgent\ufo\config\ufo\mcp.yaml'
   if (-not (Test-Path $mcp)) { throw "UFO MCP config missing: $mcp" }
   $mcpRaw = Get-Content $mcp -Raw
-  if ($mcpRaw -notmatch 'Managed by ufoagent') {
-    throw 'managed UFO MCP config was not written'
+  if ($mcpRaw -match 'Managed by ufoagent') {
+    throw 'UFO MCP config is still using the old managed override'
   }
   foreach ($required in @('namespace: UICollector', 'namespace: HostUIExecutor', 'namespace: AppUIExecutor', 'namespace: CommandLineExecutor')) {
     if ($mcpRaw -notmatch [regex]::Escape($required)) {
-      throw "managed UFO MCP config missing UI server: $required"
+      throw "UFO native MCP config missing server: $required"
     }
   }
   $shellExecutorCount = ([regex]::Matches($mcpRaw, [regex]::Escape('namespace: CommandLineExecutor'))).Count
   if ($shellExecutorCount -lt 2) {
-    throw 'managed UFO MCP config does not expose CommandLineExecutor to both HostAgent and AppAgent'
+    throw 'UFO native MCP config does not expose CommandLineExecutor to both HostAgent and AppAgent'
   }
-  foreach ($blocked in @('WordCOMExecutor', 'ExcelCOMExecutor', 'PowerPointCOMExecutor', 'type: http')) {
-    if ($mcpRaw -match [regex]::Escape($blocked)) {
-      throw "managed UFO MCP config exposes blocked server: $blocked"
+
+  $legacyChecks = @(
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\host_agent.py'; Marker = 'Managed by ufoagent: honor USE_MCP=False'; Label = 'MCP loader skip patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'; Marker = 'Managed by ufoagent: honor USE_MCP=False'; Label = 'MCP loader skip patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'; Marker = 'Managed by ufoagent: auto-approve confirmation in unattended mode'; Label = 'AppAgent confirmation source patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\ui_mcp_server.py'; Marker = 'Managed by ufoagent: allow focused-app keyboard input'; Label = 'UI keyboard fallback patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'; Marker = 'Managed by ufoagent: allow unrestricted run_shell commands'; Label = 'shell command allowlist patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'; Marker = 'Managed by ufoagent: allow unrestricted run_shell paths'; Label = 'shell path allowlist patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'; Marker = 'Managed by ufoagent: allow unrestricted CLI launcher commands'; Label = 'CLI command allowlist patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'; Marker = 'Managed by ufoagent: launch unrestricted commands without waiting for GUI apps'; Label = 'CLI launcher run_shell patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\host_agent.yaml'; Marker = 'Managed by ufoagent: generic runtime remediation'; Label = 'HostAgent remediation prompt patch' }
+    [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\app_agent.yaml'; Marker = 'Managed by ufoagent: generic runtime remediation'; Label = 'AppAgent remediation prompt patch' }
+  )
+  foreach ($check in $legacyChecks) {
+    if (-not (Test-Path $check.Path)) { throw "UFO file missing: $($check.Path)" }
+    $fileRaw = Get-Content $check.Path -Raw
+    if ($fileRaw -match [regex]::Escape($check.Marker)) {
+      throw "legacy managed UFO patch remains ($($check.Label)): $($check.Path)"
     }
   }
-  foreach ($py in @(
-      'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\host_agent.py',
-      'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'
-    )) {
-    if (-not (Test-Path $py)) { throw "UFO MCP loader missing: $py" }
-    $pyRaw = Get-Content $py -Raw
-    if ($pyRaw -notmatch 'Managed by ufoagent: honor USE_MCP=False') {
-      throw "UFO MCP loader was not patched to honor USE_MCP=False: $py"
-    }
-  }
-  $appPy = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'
-  $appPyRaw = Get-Content $appPy -Raw
-  if ($appPyRaw -notmatch 'Managed by ufoagent: auto-approve confirmation in unattended mode') {
-    throw 'UFO AppAgent unattended confirmation patch is missing'
-  }
-  if ($appPyRaw -match 'sensitive_step_asker\(action, control_text\)') {
-    throw 'UFO AppAgent confirmation handler still prompts interactively'
-  }
-  $ui = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\ui_mcp_server.py'
-  if (-not (Test-Path $ui)) { throw "UFO UI MCP server missing: $ui" }
-  $uiRaw = Get-Content $ui -Raw
-  if ($uiRaw -notmatch 'Managed by ufoagent: allow focused-app keyboard input') {
-    throw 'UFO AppAgent keyboard input patch is missing'
-  }
-  $shell = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'
-  if (-not (Test-Path $shell)) { throw "UFO shell client missing: $shell" }
-  $shellRaw = Get-Content $shell -Raw
-  foreach ($marker in @(
-      'Managed by ufoagent: allow unrestricted run_shell commands',
-      'Managed by ufoagent: allow unrestricted run_shell paths'
-    )) {
-    if ($shellRaw -notmatch [regex]::Escape($marker)) {
-      throw "UFO shell client permissive patch is missing: $marker"
-    }
-  }
-  $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
-  if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
-  $cliRaw = Get-Content $cli -Raw
-  if ($cliRaw -notmatch 'Managed by ufoagent: allow unrestricted CLI launcher commands') {
-    throw 'UFO CLI launcher permissive patch is missing'
-  }
-  foreach ($prompt in @(
-      'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\host_agent.yaml',
-      'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\app_agent.yaml'
-    )) {
-    if (-not (Test-Path $prompt)) { throw "UFO prompt missing: $prompt" }
-    $promptRaw = Get-Content $prompt -Raw
-    if ($promptRaw -notmatch 'Managed by ufoagent: generic runtime remediation') {
-      throw "UFO runtime remediation prompt patch is missing: $prompt"
-    }
-  }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, unattended confirmation, keyboard input fallback, permissive shell patches, remediation prompt'
+
+  Write-Host 'native UFO config: USE_MCP=True, MCP fallback enabled, native MCP map intact, SAFE_GUARD=False for unattended runs'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -559,8 +533,8 @@ Phase 'install' {
   if (-not $ready) { throw 'provisioning did not reach a terminal state in 10m' }
   $state = (Get-Content $marker -Raw | ConvertFrom-Json).state
   if ($state -ne 'ready') { throw "provisioning state=$state (expected ready)" }
-  Write-ProgressEvent 'phase_update' 'install' 'validating managed UFO config'
-  Assert-ManagedUfoConfig
+  Write-ProgressEvent 'phase_update' 'install' 'validating native UFO config'
+  Assert-NativeUfoConfig
   Write-Host 'install + provision: UFO2 ready'
 }
 
