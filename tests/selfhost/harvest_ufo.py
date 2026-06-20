@@ -25,6 +25,7 @@ PREFERRED_ASSET_KEYS = [
     "selected_control_screenshot_path",
 ]
 TRACE_KEYS = [
+    "request",
     "observation",
     "thought",
     "plan",
@@ -44,6 +45,72 @@ TRACE_KEYS = [
 ]
 
 
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        value = str(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def expected_request(args: argparse.Namespace) -> str:
+    if getattr(args, "request_file", ""):
+        return Path(args.request_file).read_text(encoding="utf-8", errors="ignore")
+    return getattr(args, "request", "")
+
+
+def extract_request_values(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        values = [value]
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                values.extend(extract_request_values(json.loads(stripped)))
+            except json.JSONDecodeError:
+                pass
+        return values
+    if isinstance(value, dict):
+        values: list[str] = []
+        for key, child in value.items():
+            if key.startswith("request"):
+                values.extend(extract_request_values(child))
+            elif isinstance(child, (dict, list)):
+                values.extend(extract_request_values(child))
+        return values
+    if isinstance(value, list):
+        values: list[str] = []
+        for child in value:
+            values.extend(extract_request_values(child))
+        return values
+    return [str(value)]
+
+
+def row_matches_request(row: dict[str, Any], request: str) -> bool:
+    expected = normalize_text(request)
+    if not expected:
+        return True
+    for value in extract_request_values(row.get("request")):
+        if normalize_text(value) == expected:
+            return True
+    return False
+
+
+def filter_rows_by_request(
+    rows: list[dict[str, Any]], request: str
+) -> tuple[list[dict[str, Any]], list[int]]:
+    if not normalize_text(request):
+        return rows, list(range(len(rows)))
+    matched: list[dict[str, Any]] = []
+    indices: list[int] = []
+    for index, row in enumerate(rows):
+        if row_matches_request(row, request):
+            matched.append(row)
+            indices.append(index)
+    return matched, indices
+
+
 def read_json_lines(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
@@ -59,6 +126,12 @@ def read_json_lines(path: Path) -> list[dict[str, Any]]:
         if isinstance(obj, dict):
             rows.append(obj)
     return rows
+
+
+def write_json_lines(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row) + "\n")
 
 
 def decode_request_images(steps: list[dict[str, Any]], log_dir: Path) -> list[Path]:
@@ -149,15 +222,69 @@ def copy_tree(src: Path, dst: Path) -> None:
     shutil.copytree(src, dst)
 
 
+def isolate_steps(
+    steps: list[dict[str, Any]],
+    response_rows: list[dict[str, Any]],
+    request: str,
+) -> list[dict[str, Any]]:
+    if not normalize_text(request):
+        return steps
+    if not steps:
+        return []
+    direct, _ = filter_rows_by_request(steps, request)
+    if direct:
+        return direct
+    if len(steps) == len(response_rows):
+        return steps
+    raise SystemExit(
+        "could not isolate UFO trajectory for request: parser rows do not expose "
+        "request text and do not align with response.log"
+    )
+
+
+def prune_unreferenced_pngs(log_dir: Path, rows: list[dict[str, Any]]) -> None:
+    keep: set[str] = set()
+    for row in rows:
+        screenshots = row.get("screenshots") or {}
+        for filename in screenshots.values():
+            if isinstance(filename, str) and filename:
+                keep.add(os.path.basename(filename))
+    if not keep:
+        return
+    for path in log_dir.glob("*.png"):
+        if path.name not in keep:
+            path.unlink(missing_ok=True)
+
+
 def export(args: argparse.Namespace) -> None:
     root = Path(args.out)
     label = args.label
     log_src = Path(args.ufo_home) / "logs" / args.log_name
     if not log_src.is_dir():
         raise SystemExit(f"UFO log directory missing: {log_src}")
+    request = expected_request(args)
 
     log_dst = root / "logs" / label
     copy_tree(log_src, log_dst)
+    response_rows = read_json_lines(log_dst / "response.log")
+    request_rows = read_json_lines(log_dst / "request.log")
+    evaluation_rows = read_json_lines(log_dst / "evaluation.log")
+    response_rows, _ = filter_rows_by_request(response_rows, request)
+    request_rows, _ = filter_rows_by_request(request_rows, request)
+    evaluation_rows, _ = filter_rows_by_request(evaluation_rows, request)
+    if normalize_text(request) and not response_rows:
+        raise SystemExit(f"UFO response.log has no rows for requested task: {label}")
+    write_json_lines(log_dst / "response.log", response_rows)
+    write_json_lines(log_dst / "request.log", request_rows)
+    if evaluation_rows:
+        write_json_lines(log_dst / "evaluation.log", evaluation_rows)
+    output = log_dst / "output.md"
+    if output.exists():
+        output.write_text(
+            f"# Harvested UFO Trajectory\n\nLabel: {label}\n\n"
+            "This output was isolated by ufoagent for one run_task request.\n",
+            encoding="utf-8",
+        )
 
     transcript_src = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "UFOAgent" / "tasks" / "logs" / f"{args.task_id}.txt"
     transcript_dst = root / "transcripts" / f"{label}.txt"
@@ -166,11 +293,12 @@ def export(args: argparse.Namespace) -> None:
         shutil.copy2(transcript_src, transcript_dst)
 
     steps, meta = load_trajectory(log_dst, Path(args.ufo_home))
+    steps = isolate_steps(steps, response_rows, request)
     fallback_used = False
     if not steps:
-        steps = read_json_lines(log_dst / "response.log")
+        steps = response_rows
     if not steps:
-        steps = read_json_lines(log_dst / "request.log")
+        steps = request_rows
         fallback_used = bool(steps)
         decode_request_images(steps, log_dst)
 
@@ -178,12 +306,14 @@ def export(args: argparse.Namespace) -> None:
         "label": label,
         "task_id": args.task_id,
         "source_log": str(log_src),
+        "request": normalize_text(request),
         "trajectory": meta,
         "fallback_used": fallback_used,
         "step_count": len(steps),
         "steps": normalize_steps(steps),
         "transcript_excerpt": transcript_excerpt(transcript_dst),
     }
+    prune_unreferenced_pngs(log_dst, trace["steps"])
 
     trace_dir = root / "trace"
     trace_dir.mkdir(parents=True, exist_ok=True)
@@ -322,6 +452,8 @@ def main() -> None:
     exp.add_argument("--task-id", required=True)
     exp.add_argument("--ufo-home", required=True)
     exp.add_argument("--log-name", default="adhoc")
+    exp.add_argument("--request", default="")
+    exp.add_argument("--request-file", default="")
     exp.add_argument("--out", required=True)
     bld = sub.add_parser("build")
     bld.add_argument("--harvest-root", required=True)

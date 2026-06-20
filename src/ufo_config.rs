@@ -41,6 +41,10 @@ AppAgent:
         type: local
         start_args: []
         reset: false
+      - namespace: CommandLineExecutor
+        type: local
+        start_args: []
+        reset: false
 "#;
 const MANAGED_SKIP_MCP_MARKER: &str = "Managed by ufoagent: honor USE_MCP=False";
 const MCP_LOAD_SENTINEL: &str = r#"        self.logger.info("Loading MCP tool information...")"#;
@@ -590,6 +594,7 @@ mod tests {
         assert!(mcp_y.contains("namespace: HostUIExecutor"));
         assert!(mcp_y.contains("namespace: AppUIExecutor"));
         assert!(mcp_y.contains("namespace: CommandLineExecutor"));
+        assert_eq!(mcp_y.matches("namespace: CommandLineExecutor").count(), 2);
         assert!(!mcp_y.contains("http"));
 
         let _ = std::fs::remove_dir_all(home);

@@ -151,6 +151,10 @@ function Assert-ManagedUfoConfig {
       throw "managed UFO MCP config missing UI server: $required"
     }
   }
+  $shellExecutorCount = ([regex]::Matches($mcpRaw, [regex]::Escape('namespace: CommandLineExecutor'))).Count
+  if ($shellExecutorCount -lt 2) {
+    throw 'managed UFO MCP config does not expose CommandLineExecutor to both HostAgent and AppAgent'
+  }
   foreach ($blocked in @('WordCOMExecutor', 'ExcelCOMExecutor', 'PowerPointCOMExecutor', 'type: http')) {
     if ($mcpRaw -match [regex]::Escape($blocked)) {
       throw "managed UFO MCP config exposes blocked server: $blocked"
@@ -229,7 +233,7 @@ function Write-CommandResultProgress([string]$phase, $command) {
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
 }
 
-function Export-UfoTrajectory([string]$label, [string]$id) {
+function Export-UfoTrajectory([string]$label, [string]$id, [string]$request = '') {
   if (-not $id) { throw "cannot harvest UFO trajectory for ${label}: missing command id" }
   if (-not (Test-Path $HARVEST)) { throw "UFO harvest script missing: $HARVEST" }
   $py = 'C:\ProgramData\UFOAgent\ufo\.venv\Scripts\python.exe'
@@ -238,8 +242,10 @@ function Export-UfoTrajectory([string]$label, [string]$id) {
   if (-not (Test-Path $ufoHome)) { throw "UFO home missing: $ufoHome" }
   $harvestRoot = Join-Path $OUT 'ufo'
   New-Item -ItemType Directory -Force $harvestRoot | Out-Null
+  $requestFile = Join-Path $OUT "ufo-request-$label.txt"
+  Set-Content -Path $requestFile -Value $request -Encoding UTF8 -NoNewline
   Write-ProgressEvent 'phase_update' $label "harvesting UFO trajectory for command $id"
-  & $py $HARVEST export --label $label --task-id $id --ufo-home $ufoHome --log-name 'adhoc' --out $harvestRoot
+  & $py $HARVEST export --label $label --task-id $id --ufo-home $ufoHome --log-name 'adhoc' --request-file $requestFile --out $harvestRoot
   if ($LASTEXITCODE -ne 0) { throw "UFO trajectory harvest failed for ${label}: exit $LASTEXITCODE" }
   Write-ProgressEvent 'phase_update' $label "harvested UFO trajectory for command $id"
 }
@@ -644,7 +650,7 @@ hello from ufoagent
 }
 if ($haveAdm -and $script:remoteId) {
   $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
-  Export-UfoTrajectory 'remote' $script:remoteId
+  Export-UfoTrajectory 'remote' $script:remoteId $remotePrompt
 }
 
 # 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
@@ -686,7 +692,7 @@ Finish only after Brave Browser is installed, Bambu Studio is installed, and Bam
     throw 'third-party run_task did not finish cleanly'
   }
   Write-CommandResultProgress 'thirdparty' $final
-  Export-UfoTrajectory 'thirdparty' $script:thirdPartyId
+  Export-UfoTrajectory 'thirdparty' $script:thirdPartyId $thirdPartyPrompt
   Assert-AgentUsedGeneralRunShell $script:thirdPartyId 'third-party run_task'
 
   $brave = Get-BraveExe
