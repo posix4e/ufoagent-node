@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
 # Runs ON the self-hosted KVM host. The WHOLE self-hosted e2e, first-principles:
-#   revert the `cold` snapshot -> start the VM -> continuously screen-record the display from OUTSIDE
-#   (virsh screenshot) -> run the ONE in-guest journey in the interactive desktop session -> collect its
-#   result -> slice the one recording into marker-based website assets. No Session-0/1 split, no
-#   per-step capture.
-# Run it from its own directory (journey.ps1 + slice.sh live alongside).
+#   revert the `cold` snapshot -> start the VM -> run the ONE in-guest journey in the interactive desktop
+#   session -> collect its result and UFO's own trajectories -> build website assets from UFO artifacts.
+# No Session-0/1 split and no external display recorder.
+# Run it from its own directory (journey.ps1 + harvest_ufo.py live alongside).
 set -uo pipefail
 VM=${VM:-ufo-ws2025-base}; SNAP=${SNAP:-cold}; PW=${VM_PW:-'Ufo!Spike2026'}; GUSER=${VM_USER:-ufoadmin}
-WORK=${WORK:-/mnt/ram/e2e}; REC="$WORK/frames"; FPS_SLEEP=${FPS_SLEEP:-0.35}
+WORK=${WORK:-/mnt/ram/e2e}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 IP=""
 SSH(){ sshpass -p "$PW" ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 "$GUSER@$IP" "$@"; }
@@ -36,7 +35,6 @@ progress_message(){
       phase_done) echo "phase done: $phase${detail:+ ($detail)}";;
       phase_skipped) echo "phase skipped: $phase${detail:+ ($detail)}";;
       phase_failed) echo "phase failed: $phase${detail:+ - $detail}";;
-      capture) echo "capture: $phase${detail:+ - $detail}";;
       *) echo "$event${phase:+: $phase}${detail:+ - $detail}";;
     esac
   else
@@ -103,17 +101,17 @@ for i in $(seq 1 40); do
   echo "  waiting for desktop (explorer)"; sleep 5
 done
 
-# The host records with `virsh screenshot`, so a sleeping/blanked virtual display silently turns the
-# marketing captures black even while the interactive Windows session keeps running. Disable display
-# sleep for the CI session before recording.
+# A sleeping/blanked virtual display can still break GUI tasks and the live screenshot command. Disable
+# display sleep for the CI session.
 echo "=== keep interactive display awake ==="
 SSH 'powercfg /change monitor-timeout-ac 0; powercfg /change monitor-timeout-dc 0; powercfg /change standby-timeout-ac 0; powercfg /change standby-timeout-dc 0; reg add "HKCU\Control Panel\Desktop" /v ScreenSaveActive /t REG_SZ /d 0 /f | Out-Null; "display sleep disabled"'
 
 # the e2e assertion library the journey composes (repo layout: ../e2e; dev layout: ./e2e)
 E2EDIR="$HERE/e2e"; [ -d "$E2EDIR" ] || E2EDIR="$HERE/../e2e"
 echo "=== stage journey + e2e lib ($E2EDIR) ==="
-SSH 'New-Item -ItemType Directory -Force C:\e2e,C:\e2e\out,C:\e2e\dl | Out-Null; Remove-Item C:\e2e\out\*,C:\e2e\e2e,C:\e2e\journey.ps1,C:\e2e\dl\ufoagent-setup.exe -Recurse -Force -EA SilentlyContinue; "staged"'
+SSH 'New-Item -ItemType Directory -Force C:\e2e,C:\e2e\out,C:\e2e\dl | Out-Null; Remove-Item C:\e2e\out\*,C:\e2e\e2e,C:\e2e\journey.ps1,C:\e2e\harvest_ufo.py,C:\e2e\dl\ufoagent-setup.exe -Recurse -Force -EA SilentlyContinue; "staged"'
 SCP "$HERE/journey.ps1" "$GUSER@$IP:C:/e2e/journey.ps1"
+SCP "$HERE/harvest_ufo.py" "$GUSER@$IP:C:/e2e/harvest_ufo.py"
 SCP -r "$E2EDIR" "$GUSER@$IP:C:/e2e/e2e"
 if [ -n "${UFOAGENT_INSTALLER_PATH:-}" ]; then
   [ -f "${UFOAGENT_INSTALLER_PATH:-}" ] || { echo "installer artifact not found: $UFOAGENT_INSTALLER_PATH"; exit 1; }
@@ -140,14 +138,9 @@ fi
 # Re-encode every staged .ps1 as UTF-8 WITH BOM, reading bytes as UTF-8 explicitly via .NET.
 SSH 'Get-ChildItem C:\e2e -Recurse -Filter *.ps1 | ForEach-Object { $c=[IO.File]::ReadAllText($_.FullName); [IO.File]::WriteAllText($_.FullName, $c, (New-Object System.Text.UTF8Encoding $true)) }; "reencoded utf8-bom"'
 
-echo "=== start recorder (virsh screenshot loop) ==="
-rm -rf "$REC" "$WORK/gifs" "$WORK/stop" "$WORK/result.json" "$WORK/phases.json" "$WORK/markers.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp"
-mkdir -p "$REC"   # clear stale frames+gifs/logs so a failed run can't publish or report old ones
-( while [ ! -f "$WORK/stop" ]; do
-    sudo virsh screenshot "$VM" "$REC/frame-$(( $(date +%s%N) / 1000000 )).png" >/dev/null 2>&1 || true
-    sleep "$FPS_SLEEP"
-  done ) &
-RECPID=$!
+echo "=== clear local e2e outputs ==="
+rm -rf "$WORK/gifs" "$WORK/ufo" "$WORK/result.json" "$WORK/phases.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp" "$WORK/service-errors.txt"
+mkdir -p "$WORK/gifs"
 
 echo "=== launch journey (one interactive task) ==="
 # schtasks /TR with spaces is fragile, and a direct /TR gives no output if journey.ps1 dies. Use a
@@ -167,25 +160,19 @@ while [ "$(date +%s)" -lt "$d" ]; do
 done
 report_progress || true
 
-echo "=== stop recorder ==="
-touch "$WORK/stop"; wait "$RECPID" 2>/dev/null || true
-echo "frames=$(ls "$REC" 2>/dev/null | wc -l)"
-
 echo "=== collect ==="
 SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
-SSH 'Get-Content C:\e2e\out\markers.json -Raw' > "$WORK/markers.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\progress.ndjson -Raw' > "$PROGRESS" 2>/dev/null || true
-# The real captured desktop still (binary -> SCP, not Get-Content). Lands in gifs/ so the publish step
-# ships it next to the gifs. Absent if the dashboard phase skipped (old agent / no Edge).
-mkdir -p "$WORK/gifs"
+# UFO trajectories and real captured dashboard stills (binary -> SCP, not Get-Content).
+SCP -r "$GUSER@$IP:C:/e2e/out/ufo" "$WORK/ufo" 2>/dev/null || true
 SCP "$GUSER@$IP:C:/e2e/out/node-desktop.png" "$WORK/gifs/node-desktop.png" 2>/dev/null || true
+SCP "$GUSER@$IP:C:/e2e/out/mission-control.png" "$WORK/gifs/mission-control.png" 2>/dev/null || true
 SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/dev/null 2>&1 || true
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- progress ---"; cat "$PROGRESS" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
-echo "--- markers ---"; cat "$WORK/markers.json" 2>/dev/null
 
 # Capture the Windows service health the box's Server Manager flags (the red "Services" count), so we can
 # analyze them across runs. Diagnostic only - never fails the run.
@@ -200,19 +187,19 @@ Get-WinEvent -FilterHashtable @{LogName="System"; ProviderName="Service Control 
 ' > "$WORK/service-errors.txt" 2>/dev/null || true
 echo "--- service-errors (head) ---"; head -50 "$WORK/service-errors.txt" 2>/dev/null
 
-# Clock skew computed NOW (post-journey): the guest RTC can be hours off at boot but Windows time-sync
-# corrects it within seconds, so by here host+guest are stable and aligned. (Computing it at boot caught
-# the pre-sync clock and mis-mapped every window.)
-echo "=== clock skew (guest->host) ==="
-guest_ms=$(SSH '[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()' | tr -d '\r' | grep -oE '[0-9]{13}' | head -1)
-host_ms=$(( $(date +%s%N) / 1000000 ))
-skew=$(( host_ms - guest_ms ))
-echo "skew_ms=$skew"
-
-echo "=== slice ==="
-bash "$HERE/slice.sh" "$REC" "$WORK/markers.json" "$skew" "$WORK/gifs"
-[ -s "$WORK/gifs/node-desktop.png" ] || { echo "missing required capture asset: node-desktop.png"; exit 1; }
-assert_nonblack_png "$WORK/gifs/node-desktop.png" || { echo "required capture asset appears black: node-desktop.png"; exit 1; }
+if [ "$status" = "PASS" ]; then
+  echo "=== build UFO marketing assets ==="
+  python3 "$HERE/harvest_ufo.py" build --harvest-root "$WORK/ufo" --out "$WORK/gifs" --mission-control "$WORK/gifs/mission-control.png" || exit 1
+  for f in install-screen link-screen third-party-app mission-control; do
+    [ -s "$WORK/gifs/$f.gif" ] || { echo "missing required capture asset: $f.gif"; exit 1; }
+    [ -s "$WORK/gifs/$f.png" ] || { echo "missing required capture asset: $f.png"; exit 1; }
+    assert_nonblack_png "$WORK/gifs/$f.png" || { echo "required capture asset appears black: $f.png"; exit 1; }
+  done
+  [ -s "$WORK/gifs/node-desktop.png" ] || { echo "missing required capture asset: node-desktop.png"; exit 1; }
+  assert_nonblack_png "$WORK/gifs/node-desktop.png" || { echo "required capture asset appears black: node-desktop.png"; exit 1; }
+  [ -s "$WORK/gifs/decision-trace.json" ] || { echo "missing required decision trace: decision-trace.json"; exit 1; }
+  [ -s "$WORK/gifs/decision-trace.ndjson" ] || { echo "missing required decision trace: decision-trace.ndjson"; exit 1; }
+fi
 ls -la "$WORK/gifs" 2>/dev/null
 
 echo "SELFHOST-E2E: $status"

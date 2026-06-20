@@ -1,23 +1,23 @@
-# The ONE end-to-end journey, run inside the VM's interactive desktop session while the HOST screen-records
-# the display. Walks the whole user story linearly, asserting each step; the recording is sliced into the
-# website capture assets by capture markers. Emits:
-#   out\markers.json - [{label,ts,fg_rect:{x,y,w,h}}] guest epoch-ms capture points + foreground crop rect
+# The ONE end-to-end journey, run inside the VM's interactive desktop session. Walks the whole user story
+# linearly, asserting each step, and exports UFO's own per-task trajectories for website assets. Emits:
 #   out\phases.json  - [{label,start,end,ok,error}] guest epoch-ms phase boundaries for diagnosis
 #   out\result.json  - {status: RUNNING|PASS|FAIL, phases}
-# Reuses the proven assertion logic from tests\e2e (staged alongside as .\e2e). The host records, so this
-# does NOT start any in-guest frame recorder. Kept ASCII so Windows PowerShell 5.1 parses it cleanly.
+#   out\ufo          - harvested UFO logs, traces, transcripts, and manifests per run_task phase
+# Reuses the proven assertion logic from tests\e2e (staged alongside as .\e2e). Kept ASCII so Windows
+# PowerShell 5.1 parses it cleanly.
 $ErrorActionPreference = 'Stop'
 $ROOT = $PSScriptRoot
 $E2E  = Join-Path $ROOT 'e2e'
 $OUT  = Join-Path $ROOT 'out'
+$HARVEST = Join-Path $ROOT 'harvest_ufo.py'
 $env:RUNNER_TEMP = $ROOT                      # helpers.ps1 derives $Shots from this
 New-Item -ItemType Directory -Force $OUT, (Join-Path $ROOT 'shots'), (Join-Path $ROOT 'dl') | Out-Null
 if (Test-Path (Join-Path $ROOT 'env.ps1')) { . (Join-Path $ROOT 'env.ps1') }   # CI tokens, if staged
 . (Join-Path $E2E 'helpers.ps1')
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
-# Win32 helpers for capture markers and foreground-window checks. SW_RESTORE+SetForeground brings
-# target windows to the front before a marker records the foreground crop.
+# Win32 helpers for foreground-window checks. SW_RESTORE+SetForeground brings target windows to the front
+# before the live screenshot command captures mission-control recaps.
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public struct RECT { public int Left, Top, Right, Bottom; }
@@ -43,7 +43,6 @@ $haveTok  = [bool]$env:CI_AGENT_TOKEN
 $haveAdm  = [bool]($env:CI_ADMIN_TOKEN -and $env:CI_AGENT_ID)
 
 $phases = New-Object System.Collections.ArrayList
-$markers = New-Object System.Collections.ArrayList
 $script:lastInstallDetail = ''
 $script:lastRemoteStatus = ''
 $script:lastThirdPartyStatus = ''
@@ -66,31 +65,6 @@ function Minimize-OwnConsole {
     [Win32]::ShowWindow($h, 6) | Out-Null
     Start-Sleep -Milliseconds 800
   }
-}
-
-function Get-UiaRect($el) {
-  if (-not $el) { return $null }
-  try {
-    $r = $el.Current.BoundingRectangle
-    if ($r.Width -gt 80 -and $r.Height -gt 80) {
-      return [ordered]@{ x = [int]$r.X; y = [int]$r.Y; w = [int]$r.Width; h = [int]$r.Height }
-    }
-  } catch {}
-  $null
-}
-
-function Write-Markers {
-  ($markers | ConvertTo-Json -Depth 5) | Set-Content (Join-Path $OUT 'markers.json') -Encoding Ascii
-}
-
-function Capture([string]$label, $rect = $null) {
-  if (-not $rect) { $rect = Get-FgRect }
-  $obj = [ordered]@{ label = $label; ts = (Now) }
-  if ($rect) { $obj.fg_rect = $rect }
-  [void]$markers.Add([pscustomobject]$obj)
-  Write-Markers
-  $detail = if ($rect) { "capture marker: $label crop=$($rect.x),$($rect.y),$($rect.w),$($rect.h)" } else { "capture marker: $label full frame" }
-  Write-ProgressEvent 'capture' $label $detail
 }
 
 function Get-UiaElements($root) {
@@ -194,8 +168,11 @@ function Assert-ManagedUfoConfig {
   }
   $appPy = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'
   $appPyRaw = Get-Content $appPy -Raw
-  if ($appPyRaw -notmatch 'Managed by ufoagent: read confirmation details from processing_context') {
-    throw 'UFO AppAgent confirmation handler patch is missing'
+  if ($appPyRaw -notmatch 'Managed by ufoagent: auto-approve confirmation in unattended mode') {
+    throw 'UFO AppAgent unattended confirmation patch is missing'
+  }
+  if ($appPyRaw -match 'sensitive_step_asker\(action, control_text\)') {
+    throw 'UFO AppAgent confirmation handler still prompts interactively'
   }
   $shell = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'
   if (-not (Test-Path $shell)) { throw "UFO shell client missing: $shell" }
@@ -224,7 +201,7 @@ function Assert-ManagedUfoConfig {
       throw "UFO runtime remediation prompt patch is missing: $prompt"
     }
   }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, permissive shell patches, remediation prompt'
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, unattended confirmation, permissive shell patches, remediation prompt'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -250,6 +227,40 @@ function Write-CommandResultProgress([string]$phase, $command) {
   $summary = Get-CommandResultSummary $command
   if (-not $summary) { return }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
+}
+
+function Export-UfoTrajectory([string]$label, [string]$id) {
+  if (-not $id) { throw "cannot harvest UFO trajectory for ${label}: missing command id" }
+  if (-not (Test-Path $HARVEST)) { throw "UFO harvest script missing: $HARVEST" }
+  $py = 'C:\ProgramData\UFOAgent\ufo\.venv\Scripts\python.exe'
+  $ufoHome = 'C:\ProgramData\UFOAgent\ufo'
+  if (-not (Test-Path $py)) { throw "UFO Python missing: $py" }
+  if (-not (Test-Path $ufoHome)) { throw "UFO home missing: $ufoHome" }
+  $harvestRoot = Join-Path $OUT 'ufo'
+  New-Item -ItemType Directory -Force $harvestRoot | Out-Null
+  Write-ProgressEvent 'phase_update' $label "harvesting UFO trajectory for command $id"
+  & $py $HARVEST export --label $label --task-id $id --ufo-home $ufoHome --log-name 'adhoc' --out $harvestRoot
+  if ($LASTEXITCODE -ne 0) { throw "UFO trajectory harvest failed for ${label}: exit $LASTEXITCODE" }
+  Write-ProgressEvent 'phase_update' $label "harvested UFO trajectory for command $id"
+}
+
+function Invoke-NodeScreenshotToFile([string]$label, [string]$outFile) {
+  $shot = Send-NodeCommand 'screenshot'
+  Write-Host "sent ${label} screenshot: id=$($shot.id) status=$($shot.status)"
+  Write-ProgressEvent 'phase_update' 'dashboard' "${label} screenshot command queued: $($shot.id)"
+  $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $shot.id
+    $c -and ($c.status -eq 'done' -or $c.status -eq 'failed')
+  }
+  $c = if ($shot.id) { Get-NodeCommand $shot.id } else { $null }
+  if (-not $done -or -not $c -or $c.status -ne 'done') {
+    throw "${label} screenshot command failed: status=$($c.status) result=$($c.result)"
+  }
+  $shotUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/screenshot/latest"
+  Invoke-WebRequest -UseBasicParsing -Headers (Get-ApiHeaders) -Uri $shotUrl -OutFile $outFile
+  if (-not (Test-Path $outFile)) { throw "${label} screenshot was not saved: $outFile" }
+  Write-ProgressEvent 'phase_update' 'dashboard' "saved ${label} screenshot"
+  $c
 }
 
 function Get-BraveExe {
@@ -510,17 +521,6 @@ Phase 'install' {
   Write-ProgressEvent 'phase_update' 'install' "installer ready: $((Get-Item $setup).Length) bytes"
   Start-Process $setup -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL'
   Write-ProgressEvent 'phase_update' 'install' 'installer launched; waiting for UFO2 ready'
-  $setupWin = $null
-  for ($i = 0; $i -lt 30 -and -not $setupWin; $i++) {
-    Start-Sleep -Seconds 1
-    $setupWin = Find-UiaByName 'UFOAgent setup' 'Window' -ChildrenOnly
-  }
-  if ($setupWin) {
-    try { [Win32]::SetForegroundWindow([IntPtr]$setupWin.Current.NativeWindowHandle) | Out-Null } catch {}
-    Capture 'install-screen' (Get-UiaRect $setupWin)
-  } else {
-    Capture 'install-screen'
-  }
   $ready = Wait-For -TimeoutSec 600 -PollSec 5 -StreamAgentLog -Condition {
     if (Test-Path $marker) {
       $m = Get-Content $marker -Raw | ConvertFrom-Json
@@ -554,12 +554,11 @@ Phase 'tray' {
   Write-Host 'tray alive in the interactive session'; Start-Sleep 2
 }
 
-# 3) LINK - show the REAL QR/pairing screen for the recording, then link functionally via the CI token.
+# 3) LINK - show the REAL QR/pairing screen, then link functionally via the CI token.
 $script:linkProc = $null
 Phase 'link' {
   $script:linkProc = Start-Process $Exe -ArgumentList 'link', '--force' -PassThru -WindowStyle Normal
   Start-Sleep -Seconds 9
-  Capture 'link-screen'   # the link/QR console is foreground
   if ($haveTok) {
     & $Exe configure --agent-token $env:CI_AGENT_TOKEN
     $connected = Wait-For -TimeoutSec 180 -StreamAgentLog -Condition {
@@ -623,6 +622,7 @@ hello from ufoagent
 }
 if ($haveAdm -and $script:remoteId) {
   $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
+  Export-UfoTrajectory 'remote' $script:remoteId
 }
 
 # 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
@@ -664,6 +664,7 @@ Finish only after Brave Browser is installed, Bambu Studio is installed, and Bam
     throw 'third-party run_task did not finish cleanly'
   }
   Write-CommandResultProgress 'thirdparty' $final
+  Export-UfoTrajectory 'thirdparty' $script:thirdPartyId
   Assert-AgentUsedGeneralRunShell $script:thirdPartyId 'third-party run_task'
 
   $brave = Get-BraveExe
@@ -674,14 +675,13 @@ Finish only after Brave Browser is installed, Bambu Studio is installed, and Bam
   $bambuExe = Get-BambuStudioExe
   if ($bambuExe) { Write-Host "Bambu Studio installed: $bambuExe" } else { Write-Host 'Bambu Studio installed: uninstall entry or shortcut detected' }
   Assert-BambuStudioLaunchesClean
-  Capture 'third-party-app'
   Start-Sleep 4
 }
 
 # 6) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
 #    dashboard (a CI-token preview of the REAL CI-tenant data, since the headless VM browser can't do
-#    GitHub OAuth) on this node's detail and record it. On trusted CI this phase is required: do not
-#    publish a misleading desktop gif if the browser/dashboard did not open.
+#    GitHub OAuth) on this node's detail and capture the mission-control recap. On trusted CI this phase
+#    is required: do not publish a misleading desktop image if the browser/dashboard did not open.
 Phase 'dashboard' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping dashboard phase'; return 'SKIP' }
   $edge = @("$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe", "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe") |
@@ -690,20 +690,8 @@ Phase 'dashboard' {
 
   # Capture this node's desktop through the REAL screenshot command. Brave/Bambu remains open so
   # the live desktop image has concrete third-party app work visible.
-  $shot = Send-NodeCommand 'screenshot'
-  Write-Host "sent screenshot: id=$($shot.id) status=$($shot.status)"
-  $done = Wait-For -TimeoutSec 90 -StreamAgentLog -Condition { $c = Get-NodeCommand $shot.id; $c -and ($c.status -eq 'done' -or $c.status -eq 'failed') }
-  $c = if ($shot.id) { Get-NodeCommand $shot.id } else { $null }
-  if (-not $done -or -not $c -or $c.status -ne 'done') {
-    throw "screenshot command failed: status=$($c.status) result=$($c.result)"
-  }
-  Write-Host "screenshot captured: $($c.result)"
+  $null = Invoke-NodeScreenshotToFile 'node-desktop' (Join-Path $OUT 'node-desktop.png')
   Stop-UfoWindows   # clear Notepad before showing the browser
-
-  # Save the raw captured desktop still (published next to the gifs; powers dashboard previews).
-  $shotUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/screenshot/latest"
-  try { Invoke-WebRequest -UseBasicParsing -Headers (Get-ApiHeaders) -Uri $shotUrl -OutFile (Join-Path $OUT 'node-desktop.png'); Write-Host 'saved node-desktop.png' }
-  catch { Write-Host "could not save node-desktop.png: $($_.Exception.Message)" }
 
   # Open mission control (real data via the CI-token preview) on this node's detail and record it.
   #     App mode = no toolbar/address bar, so the token in the URL never appears in the gif. A FRESH
@@ -726,9 +714,8 @@ Phase 'dashboard' {
   }
   Start-Sleep 14   # let fonts + the inlined screenshot fully load and the layout settle before cropping
   Focus-Proc 'msedge'
-  Capture 'mission-control'
-  # Only a real Edge window should anchor the crop; the launcher console is ~880px wide, the maximized
-  # Edge app window is near full screen. If the crop looks like the console, drop it (full-frame gif).
+  # Only a real Edge window should be foreground; the launcher console is ~880px wide, the maximized
+  # Edge app window is near full screen.
   $missionRect = Get-FgRect
   if (-not $missionRect -or $missionRect.w -lt 1000) {
     $w = if ($missionRect) { $missionRect.w } else { 0 }
@@ -742,6 +729,7 @@ Phase 'dashboard' {
   $dlg = Open-TrayActivitySummary
   Write-Host 'activity summary dialog opened from tray'
   Start-Sleep 8
+  $null = Invoke-NodeScreenshotToFile 'mission-control' (Join-Path $OUT 'mission-control.png')
 }
 Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 Stop-UfoWindows

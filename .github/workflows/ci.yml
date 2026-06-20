@@ -107,7 +107,7 @@ jobs:
           name: installer
           path: selfhost-installer
 
-      - name: Run the journey (revert cold -> record -> install/tray/link/remote/third-party/dashboard+summary -> slice)
+      - name: Run the journey (revert cold -> install/tray/link/remote/third-party/dashboard+summary -> harvest)
         env:
           CI_AGENT_TOKEN: ${{ secrets.CI_AGENT_TOKEN }}
           CI_AGENT_ID: ${{ secrets.CI_AGENT_ID }}
@@ -132,6 +132,9 @@ jobs:
           done
           # The raw captured desktop still powers dashboard previews and the website node image.
           cp "$g/node-desktop.png" "pub/node-desktop.png" 2>/dev/null || true
+          # UFO-native activity/observability trace harvested from logs/<task>/.
+          cp "$g/decision-trace.json" "pub/decision-trace.json" 2>/dev/null || true
+          cp "$g/decision-trace.ndjson" "pub/decision-trace.ndjson" 2>/dev/null || true
           ls -la pub
           cd pub && git init -q && git checkout -q -b screenshots
           git add .

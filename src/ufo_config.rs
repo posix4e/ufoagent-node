@@ -52,12 +52,12 @@ const MANAGED_SKIP_MCP_GUARD: &str = r#"        # Managed by ufoagent: honor USE
 
         self.logger.info("Loading MCP tool information...")"#;
 const MANAGED_APP_CONFIRMATION_MARKER: &str =
-    "Managed by ufoagent: read confirmation details from processing_context.";
+    "Managed by ufoagent: auto-approve confirmation in unattended mode.";
 const APP_CONFIRMATION_SENTINEL: &str = r#"        action = self.processor.actions
         control_text = self.processor.control_text
 
         decision = interactor.sensitive_step_asker(action, control_text)"#;
-const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: read confirmation details from processing_context.
+const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: auto-approve confirmation in unattended mode.
         context = self.processor.processing_context
         action_info = context.get_local("action_info")
 
@@ -70,7 +70,8 @@ const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: r
             if isinstance(control_text, list):
                 control_text = "\n".join(control_text)
 
-        decision = interactor.sensitive_step_asker(action, control_text)"#;
+        self.logger.info("Auto-approving UFO sensitive action confirmation: %s", control_text)
+        decision = True"#;
 const MANAGED_SHELL_COMMAND_MARKER: &str =
     "Managed by ufoagent: allow unrestricted run_shell commands.";
 const MANAGED_SHELL_COMMAND_BLOCK: &str = r#"def _is_command_allowed(command_str: str) -> bool:
@@ -746,6 +747,9 @@ def create_cli_mcp_server(*args, **kwargs):
         assert!(app_patched.contains("context = self.processor.processing_context"));
         assert!(app_patched.contains("action_info.to_list_of_dicts()"));
         assert!(app_patched.contains("action = context.get_local(\"action\", [])"));
+        assert!(app_patched.contains("decision = True"));
+        assert!(app_patched.contains("Auto-approving UFO sensitive action confirmation"));
+        assert!(!app_patched.contains("sensitive_step_asker(action, control_text)"));
         assert!(!app_patched.contains("self.processor.actions"));
         assert!(!app_patched.contains("self.processor.control_text"));
         let shell_patched = std::fs::read_to_string(&shell).unwrap();
