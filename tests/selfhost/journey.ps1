@@ -164,6 +164,12 @@ function Assert-NativeUfoConfig {
   if ($shellExecutorCount -lt 2) {
     throw 'UFO native MCP config does not expose CommandLineExecutor to both HostAgent and AppAgent'
   }
+  $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
+  if (-not (Test-Path $cli)) { throw "UFO CLI MCP server missing: $cli" }
+  $cliRaw = Get-Content $cli -Raw
+  if ($cliRaw -notmatch 'Managed by ufoagent: allow all CLI MCP commands for unattended installs') {
+    throw 'UFO CLI MCP allowlist patch is missing'
+  }
 
   $legacyChecks = @(
     [pscustomobject]@{ Path = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\host_agent.py'; Marker = 'Managed by ufoagent: honor USE_MCP=False'; Label = 'MCP loader skip patch' }
@@ -185,7 +191,7 @@ function Assert-NativeUfoConfig {
     }
   }
 
-  Write-Host 'native UFO config: USE_MCP=True, MCP fallback enabled, native MCP map intact, SAFE_GUARD=False for unattended runs'
+  Write-Host 'native UFO config: USE_MCP=True, MCP fallback enabled, native MCP map intact, SAFE_GUARD=False, CLI commands allowed for unattended installs'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {

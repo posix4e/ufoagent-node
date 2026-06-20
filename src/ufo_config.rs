@@ -1,12 +1,19 @@
 //! Render UFO2's config/ufo/agents.yaml from a vended credential.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 use crate::controlplane::Credential;
 
 const UNATTENDED_SAFE_GUARD_LINE: &str =
     "SAFE_GUARD: False  # Managed by ufoagent: unattended runs auto-approve confirmations.";
+const CLI_ALLOW_ALL_MARKER: &str =
+    "Managed by ufoagent: allow all CLI MCP commands for unattended installs.";
+const CLI_ALLOW_ALL_FUNCTION: &str = r#"def _is_cli_command_allowed(command_str: str) -> bool:
+    """Managed by ufoagent: allow all CLI MCP commands for unattended installs."""
+    return bool(command_str and command_str.strip())
+
+"#;
 
 fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -46,11 +53,76 @@ pub fn system_yaml_path(ufo_home: &Path) -> PathBuf {
     ufo_home.join("config").join("ufo").join("system.yaml")
 }
 
-/// Apply only the UFOAgent-owned runtime setting.
+fn cli_mcp_server_path(ufo_home: &Path) -> PathBuf {
+    ufo_home
+        .join("ufo")
+        .join("client")
+        .join("mcp")
+        .join("local_servers")
+        .join("cli_mcp_server.py")
+}
+
+fn replace_top_level_python_function(
+    original: &str,
+    function_name: &str,
+    replacement: &str,
+) -> Option<String> {
+    let needle = format!("def {function_name}(");
+    let start = original.find(&needle)?;
+    let rest = &original[start..];
+    let mut end = rest.len();
+    let mut offset = 0;
+    for line in rest.split_inclusive('\n') {
+        if offset > 0
+            && (line.starts_with("def ") || line.starts_with("class ") || line.starts_with('@'))
+        {
+            end = offset;
+            break;
+        }
+        offset += line.len();
+    }
+    let mut patched = String::with_capacity(original.len() - end + replacement.len());
+    patched.push_str(&original[..start]);
+    patched.push_str(replacement);
+    patched.push_str(&rest[end..]);
+    Some(patched)
+}
+
+fn patch_cli_allowlist(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO CLI MCP server {}", path.display()))?;
+    if original.contains(CLI_ALLOW_ALL_MARKER) {
+        return Ok(false);
+    }
+    let Some(patched) = replace_top_level_python_function(
+        &original,
+        "_is_cli_command_allowed",
+        CLI_ALLOW_ALL_FUNCTION,
+    ) else {
+        anyhow::bail!(
+            "could not find _is_cli_command_allowed in UFO file {}",
+            path.display()
+        );
+    };
+    if patched == original {
+        return Ok(false);
+    }
+    std::fs::write(path, patched)
+        .with_context(|| format!("writing managed UFO CLI allowlist patch {}", path.display()))?;
+    Ok(true)
+}
+
+/// Apply only the UFOAgent-owned runtime settings.
 ///
-/// UFO's native mcp.yaml and prompt/source configuration are intentionally left intact. We only use
-/// UFO's own SAFE_GUARD flag to keep unattended runs from blocking on interactive confirmation.
+/// UFO's native mcp.yaml, prompt configuration, and MCP loading are intentionally left intact. We
+/// use UFO's own SAFE_GUARD flag to avoid interactive confirmations, and patch only the hardcoded
+/// CLI MCP allowlist so unattended installs can run the commands UFO chooses.
 pub fn apply_unattended_mode(ufo_home: &Path) -> Result<PathBuf> {
+    let cli_mcp = cli_mcp_server_path(ufo_home);
+    if cli_mcp.exists() {
+        patch_cli_allowlist(&cli_mcp)?;
+    }
+
     let path = system_yaml_path(ufo_home);
     let original = match std::fs::read_to_string(&path) {
         Ok(s) => s,
@@ -181,6 +253,44 @@ mod tests {
         let y = std::fs::read_to_string(&path).unwrap();
         assert!(y.contains("# UFOAgent unattended mode"));
         assert!(y.contains(UNATTENDED_SAFE_GUARD_LINE));
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cli_allowlist_patch_allows_unattended_commands() {
+        let home = temp_home("cli-allowlist");
+        let cli = cli_mcp_server_path(&home);
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cli,
+            r#"import shlex
+
+ALLOWED_CLI_COMMANDS = frozenset({"notepad"})
+
+def _is_cli_command_allowed(command_str: str) -> bool:
+    if not command_str or not command_str.strip():
+        return False
+    tokens = shlex.split(command_str)
+    return tokens[0] in ALLOWED_CLI_COMMANDS
+
+@MCPRegistry.register_factory_decorator("CommandLineExecutor")
+def create_cli_mcp_server(*args, **kwargs):
+    pass
+"#,
+        )
+        .unwrap();
+
+        assert!(patch_cli_allowlist(&cli).unwrap());
+        let patched = std::fs::read_to_string(&cli).unwrap();
+        assert!(patched.contains(CLI_ALLOW_ALL_MARKER));
+        assert!(patched.contains("return bool(command_str and command_str.strip())"));
+        assert!(!patched.contains("return tokens[0] in ALLOWED_CLI_COMMANDS"));
+        assert!(patched.contains("@MCPRegistry.register_factory_decorator"));
+
+        assert!(!patch_cli_allowlist(&cli).unwrap());
+        let patched_again = std::fs::read_to_string(&cli).unwrap();
+        assert_eq!(patched, patched_again);
 
         let _ = std::fs::remove_dir_all(home);
     }
