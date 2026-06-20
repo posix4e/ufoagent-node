@@ -217,7 +217,7 @@ if [ "$CREATE_PROVISIONED_SNAPSHOT" = "1" ]; then
   if [ "$status" != "PASS" ]; then
     echo "provisioned snapshot was not created because install/provision did not pass"
     echo "SELFHOST-E2E: $status"
-    [ "$status" = "PASS" ]
+    exit 1
   fi
   echo "=== create $PROVISIONED_SNAP snapshot ==="
   SSH 'Stop-Process -Name ufoagent,notepad,msedge,brave,BambuStudio,Bambu_Studio -Force -ErrorAction SilentlyContinue; Remove-Item C:\e2e\out\* -Recurse -Force -ErrorAction SilentlyContinue; shutdown /s /t 0 /f' >/dev/null 2>&1 || true

@@ -321,9 +321,11 @@ fn install_vc_redist(_scratch_dir: &Path) -> Result<()> {
 /// The real readiness verdict: pip succeeding isn't enough — UFO2's GUI stack must actually import
 /// and its native MCP servers must register. If these fail the env is NOT ready, so bootstrap returns
 /// Err and the marker becomes `broken` rather than a "ready" chip whose tasks crash.
-fn verify_ufo_imports(vpy: &Path) -> Result<()> {
+fn verify_ufo_imports(vpy: &Path, home: &Path) -> Result<()> {
     info!("verifying UFO2 imports and MCP registry (win32ui, pywinauto)…");
     let out = Command::new(vpy)
+        .current_dir(home)
+        .env("PYTHONPATH", home)
         .args([
             "-c",
             r#"import win32ui, pywinauto
@@ -410,7 +412,7 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
 
         phase("using provisioned UFO2 snapshot");
         phase("verifying UFO2 imports");
-        match verify_ufo_imports(&vpy) {
+        match verify_ufo_imports(&vpy, &home) {
             Ok(()) => {
                 info!(
                     "UFO2 already provisioned: ufo_home={} python={}",
@@ -516,7 +518,7 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
     // win32ui/MFC class of bug) returns Err → the marker becomes `broken`, not a ready chip whose
     // tasks crash on the first run.
     phase("verifying UFO2 imports");
-    verify_ufo_imports(&vpy)?;
+    verify_ufo_imports(&vpy, &home)?;
 
     info!(
         "UFO2 provisioned: ufo_home={} python={}",
