@@ -93,7 +93,7 @@ const MANAGED_CLI_COMMAND_BLOCK: &str = r#"def _is_cli_command_allowed(command_s
 
 "#;
 const MANAGED_CLI_RUN_SHELL_MARKER: &str =
-    "Managed by ufoagent: execute unrestricted commands through cmd.exe.";
+    "Managed by ufoagent: launch unrestricted commands without waiting for GUI apps.";
 const CLI_RUN_SHELL_SENTINEL: &str = r#"    @cli_mcp.tool()
     def run_shell(
         bash_command: str,
@@ -128,9 +128,9 @@ const MANAGED_CLI_RUN_SHELL_BLOCK: &str = r#"    @cli_mcp.tool()
         bash_command: str,
     ) -> dict:
         """
-        Managed by ufoagent: execute unrestricted commands through cmd.exe.
+        Managed by ufoagent: launch unrestricted commands without waiting for GUI apps.
         :param bash_command: The command to execute.
-        :return: stdout, stderr, return_code, and command.
+        :return: started, pid, and command.
         """
 
         if not bash_command:
@@ -143,32 +143,20 @@ const MANAGED_CLI_RUN_SHELL_BLOCK: &str = r#"    @cli_mcp.tool()
             )
 
         try:
-            completed = subprocess.run(
-                ["cmd.exe", "/d", "/s", "/c", bash_command],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+            args = shlex.split(bash_command)
+            process = subprocess.Popen(
+                args,
                 stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 shell=False,
-                text=True,
-                timeout=600,
             )
-            result = {
-                "stdout": completed.stdout[-12000:],
-                "stderr": completed.stderr[-12000:],
-                "return_code": completed.returncode,
+            time.sleep(5)  # Wait for GUI applications to create their first window.
+            return {
+                "started": True,
+                "pid": process.pid,
                 "command": bash_command,
             }
-            if completed.returncode != 0:
-                raise ToolError(f"Command exited {completed.returncode}: {result}")
-            return result
-        except subprocess.TimeoutExpired as e:
-            stdout = e.stdout or ""
-            stderr = e.stderr or ""
-            raise ToolError(
-                "Command timed out after 600 seconds: "
-                f"{{'stdout': {stdout[-12000:]!r}, 'stderr': {stderr[-12000:]!r}, "
-                f"'command': {bash_command!r}}}"
-            )
         except ToolError:
             raise
         except Exception as e:
@@ -359,7 +347,18 @@ fn patch_cli_command_executor(path: &Path) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO CLI MCP server {}", path.display()))?;
     if !original.contains(MANAGED_CLI_RUN_SHELL_MARKER) {
-        let patched = original.replacen(CLI_RUN_SHELL_SENTINEL, MANAGED_CLI_RUN_SHELL_BLOCK, 1);
+        let patched = if original.contains(CLI_RUN_SHELL_SENTINEL) {
+            original.replacen(CLI_RUN_SHELL_SENTINEL, MANAGED_CLI_RUN_SHELL_BLOCK, 1)
+        } else {
+            replace_cli_run_shell_block(&original, MANAGED_CLI_RUN_SHELL_BLOCK).ok_or_else(
+                || {
+                    anyhow::anyhow!(
+                        "could not find CommandLineExecutor run_shell block in UFO file {}",
+                        path.display()
+                    )
+                },
+            )?
+        };
         if patched == original {
             anyhow::bail!(
                 "could not find CommandLineExecutor run_shell sentinel in UFO file {}",
@@ -372,6 +371,17 @@ fn patch_cli_command_executor(path: &Path) -> Result<bool> {
         changed = true;
     }
     Ok(changed)
+}
+
+fn replace_cli_run_shell_block(original: &str, replacement: &str) -> Option<String> {
+    let start = original.find("    @cli_mcp.tool()\n    def run_shell(")?;
+    let end_marker = "\n    return cli_mcp";
+    let end = start + original[start..].find(end_marker)?;
+    let mut patched = String::with_capacity(original.len() - (end - start) + replacement.len());
+    patched.push_str(&original[..start]);
+    patched.push_str(replacement);
+    patched.push_str(&original[end..]);
+    Some(patched)
 }
 
 fn patch_runtime_remediation_prompt(path: &Path, heading: &str) -> Result<bool> {
@@ -762,10 +772,18 @@ def create_cli_mcp_server(*args, **kwargs):
         assert!(cli_patched.contains(MANAGED_CLI_COMMAND_MARKER));
         assert!(cli_patched.contains(MANAGED_CLI_RUN_SHELL_MARKER));
         assert!(cli_patched.contains("return bool(command_str and command_str.strip())"));
-        assert!(cli_patched.contains("[\"cmd.exe\", \"/d\", \"/s\", \"/c\", bash_command]"));
+        assert!(cli_patched.contains("args = shlex.split(bash_command)"));
+        assert!(cli_patched.contains("process = subprocess.Popen("));
+        assert!(cli_patched.contains("stdout=subprocess.DEVNULL"));
+        assert!(cli_patched.contains("stderr=subprocess.DEVNULL"));
         assert!(cli_patched.contains("stdin=subprocess.DEVNULL"));
-        assert!(cli_patched.contains("Command exited"));
+        assert!(cli_patched.contains("time.sleep(5)"));
+        assert!(cli_patched.contains("\"started\": True"));
+        assert!(cli_patched.contains("\"pid\": process.pid"));
         assert!(cli_patched.contains("@MCPRegistry.register_factory_decorator"));
+        assert!(!cli_patched.contains("timeout=600"));
+        assert!(!cli_patched.contains("subprocess.run("));
+        assert!(!cli_patched.contains("[\"cmd.exe\", \"/d\", \"/s\", \"/c\", bash_command]"));
         assert!(!cli_patched.contains("subprocess.Popen(args, shell=False)"));
         for path in [&host_prompt, &app_prompt] {
             let prompt = std::fs::read_to_string(path).unwrap();
@@ -803,5 +821,34 @@ def create_cli_mcp_server(*args, **kwargs):
         }
 
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cli_launcher_patch_replaces_previous_managed_block() {
+        let original = r#"def create_cli_mcp_server(*args, **kwargs):
+    cli_mcp = FastMCP("UFO CLI MCP Server")
+
+    @cli_mcp.tool()
+    def run_shell(
+        bash_command: str,
+    ) -> dict:
+        """Managed by ufoagent: execute unrestricted commands through cmd.exe."""
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/s", "/c", bash_command],
+            timeout=600,
+        )
+        return {"return_code": completed.returncode}
+
+    return cli_mcp
+"#;
+
+        let patched = replace_cli_run_shell_block(original, MANAGED_CLI_RUN_SHELL_BLOCK).unwrap();
+
+        assert!(patched.contains(MANAGED_CLI_RUN_SHELL_MARKER));
+        assert!(patched.contains("process = subprocess.Popen("));
+        assert!(patched.contains("\"started\": True"));
+        assert!(!patched.contains("execute unrestricted commands through cmd.exe"));
+        assert!(!patched.contains("[\"cmd.exe\", \"/d\", \"/s\", \"/c\", bash_command]"));
+        assert!(!patched.contains("timeout=600"));
     }
 }
