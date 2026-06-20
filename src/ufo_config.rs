@@ -454,16 +454,14 @@ fn replace_python_function(
     let rest = &original[start..];
     let mut end = rest.len();
     let mut offset = 0;
-    let nested_indent = format!("{indent}    ");
+    let body_indent = format!("{indent}    ");
     for line in rest.split_inclusive('\n') {
-        if offset > 0
-            && !line.starts_with(&nested_indent)
-            && (line.starts_with(&format!("{indent}def "))
-                || line.starts_with(&format!("{indent}class "))
-                || line.starts_with(&format!("{indent}@")))
-        {
-            end = offset;
-            break;
+        if offset > 0 {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !line.starts_with(&body_indent) {
+                end = offset;
+                break;
+            }
         }
         offset += line.len();
     }
@@ -778,6 +776,8 @@ def create_host_action_mcp_server(*args, **kwargs) -> FastMCP:
         window.set_focus()
         return {"window_info": _window2window_info(window).model_dump()}
 
+    return action_mcp
+
 @MCPRegistry.register_factory_decorator("AppUIExecutor")
 def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
     def _execute_action(action: ActionCommandInfo) -> str:
@@ -800,6 +800,8 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         control_focus: Annotated[bool, Field(description="focus")] = True,
     ) -> Annotated[str, Field(description="result")]:
         return _execute_action(action)
+
+    return action_mcp
 
 @MCPRegistry.register_factory_decorator("UICollector")
 def create_data_mcp_server(*args, **kwargs) -> FastMCP:
@@ -829,6 +831,9 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains("name: Annotated[\n            Optional[str],"));
         assert!(patched.contains("def capture_window_screenshot() -> str:"));
         assert!(patched.contains("App window screenshot too small, treating as invalid"));
+        assert!(patched.contains("@MCPRegistry.register_factory_decorator(\"AppUIExecutor\")"));
+        assert!(patched.contains("def create_app_action_mcp_server"));
+        assert!(patched.contains("    return action_mcp"));
 
         assert!(!patch_ui_action_primitives(&ui).unwrap());
         let patched_again = std::fs::read_to_string(&ui).unwrap();
