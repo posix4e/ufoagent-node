@@ -70,7 +70,8 @@ const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: r
             if isinstance(control_text, list):
                 control_text = "\n".join(control_text)
 
-        decision = interactor.sensitive_step_asker(action, control_text)"#;
+        # Managed by ufoagent: unattended GUI tasks must not prompt on stdin; overseer is the safety layer.
+        decision = True"#;
 #[cfg(test)]
 const MANAGED_CLI_ALLOWLIST_MARKER: &str =
     "Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.";
@@ -88,7 +89,7 @@ fn yaml_escape(s: &str) -> String {
 
 fn agent_section(c: &Credential) -> String {
     format!(
-        "  VISUAL_MODE: true\n  API_TYPE: \"openai\"\n  API_BASE: \"{}\"\n  API_KEY: \"{}\"\n  API_MODEL: \"{}\"\n",
+        "  VISUAL_MODE: true\n  SAFE_GUARD: False\n  API_TYPE: \"openai\"\n  API_BASE: \"{}\"\n  API_KEY: \"{}\"\n  API_MODEL: \"{}\"\n",
         yaml_escape(&c.base_url),
         yaml_escape(&c.api_key),
         yaml_escape(&c.model),
@@ -335,6 +336,7 @@ mod tests {
         assert_eq!(y.matches("API_KEY: \"sk-secret\"").count(), 4);
         assert!(y.contains("API_TYPE: \"openai\""));
         assert!(y.contains("VISUAL_MODE: true"));
+        assert_eq!(y.matches("SAFE_GUARD: False").count(), 4);
     }
 
     #[test]
@@ -443,6 +445,9 @@ mod tests {
         assert!(app_patched.contains("context = self.processor.processing_context"));
         assert!(app_patched.contains("action_info.to_list_of_dicts()"));
         assert!(app_patched.contains("action = context.get_local(\"action\", [])"));
+        assert!(app_patched.contains("decision = True"));
+        assert!(!app_patched.contains("interactor.sensitive_step_asker"));
+        assert!(!app_patched.contains("input("));
         assert!(!app_patched.contains("self.processor.actions"));
         assert!(!app_patched.contains("self.processor.control_text"));
 
