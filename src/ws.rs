@@ -20,7 +20,7 @@ use crate::controlplane::{ControlPlane, USER_AGENT};
 use crate::{agent, repair, runtime, store};
 
 /// Max time we wait for the login-session executor to finish a run_task before reporting a timeout.
-const RUN_TASK_TIMEOUT_SECS: u64 = 2400;
+const RUN_TASK_TIMEOUT_SECS: u64 = 900;
 const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(RUN_TASK_TIMEOUT_SECS);
 /// Screenshots are a quick GDI grab + PNG encode in the login session.
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(60);

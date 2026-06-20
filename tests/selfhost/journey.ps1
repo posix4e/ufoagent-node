@@ -182,10 +182,19 @@ function Assert-NativeUfoConfig {
   if ($uiRaw -notmatch 'Managed by ufoagent: send keyboard input directly to focused windows when no control target exists') {
     throw 'UFO UI direct keyboard input patch is missing'
   }
+  if ($uiRaw -notmatch 'Managed by ufoagent: treat keyboard_input text key tokens as keystrokes') {
+    throw 'UFO UI key-token keyboard patch is missing'
+  }
+  if ($uiRaw -notmatch 'Managed by ufoagent: click relative coordinates with a direct mouse fallback') {
+    throw 'UFO UI coordinate-click fallback patch is missing'
+  }
   if ($uiRaw -notmatch 'Managed by ufoagent: keep AppAgent perception on the foreground top-level window') {
     throw 'UFO UI foreground-window awareness patch is missing'
   }
-  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', 'pyperclip.copy(keys)', '_ufoagent_sync_selected_window_to_foreground(ui_state)', 'Desktop(backend=backend).active()')) {
+  if ($uiRaw -notmatch 'Managed by ufoagent: ignore console shells as foreground AppAgent targets') {
+    throw 'UFO UI foreground console-filter patch is missing'
+  }
+  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', '_ufoagent_text_contains_key_tokens', 'pyperclip.copy(keys)', '_ufoagent_click_relative_coordinates', '_ufoagent_pyautogui.click', '_ufoagent_sync_selected_window_to_foreground(ui_state)', 'Desktop(backend=backend).active()', 'ConsoleWindowClass')) {
     if ($uiRaw -notmatch [regex]::Escape($required)) {
       throw "UFO UI action primitive patch missing expected behavior: $required"
     }
@@ -237,6 +246,31 @@ function Write-CommandResultProgress([string]$phase, $command) {
   $summary = Get-CommandResultSummary $command
   if (-not $summary) { return }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
+}
+
+function Invoke-UfoRunTask([string]$label, [string]$request, [int]$TimeoutSec = 900, [int]$PollSec = 5) {
+  $resp = Send-NodeCommand 'run_task' $request
+  Write-Host "sent ${label} run_task: id=$($resp.id) status=$($resp.status)"
+  Write-ProgressEvent 'phase_update' $label "command queued: $($resp.id)"
+  $id = $resp.id
+  $script:lastRunTaskStatus = $null
+  $done = Wait-For -TimeoutSec $TimeoutSec -PollSec $PollSec -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $id
+    if ($c -and $c.status -and $c.status -ne $script:lastRunTaskStatus) {
+      Write-ProgressEvent 'phase_update' $label "command status: $($c.status)"
+      $script:lastRunTaskStatus = $c.status
+    }
+    if ($c -and $c.status -eq 'failed') { throw "${label} run_task failed: $($c.result)" }
+    $c -and $c.status -eq 'done'
+  }
+  $final = if ($id) { Get-NodeCommand $id } else { $null }
+  if (-not $done -or -not $final) {
+    if ($final) { Write-Host "${label} run_task result: status=$($final.status) result=$($final.result)" }
+    Show-FileTail 'agent log' $AgentLog 120
+    throw "${label} run_task did not finish cleanly"
+  }
+  Write-CommandResultProgress $label $final
+  [pscustomobject]@{ Id = $id; Result = $final }
 }
 
 function Export-UfoTrajectory([string]$label, [string]$id, [string]$request = '') {
@@ -292,6 +326,25 @@ function Get-BraveExe {
       if (Test-Path $path) { return $path }
     }
   }
+}
+
+function Get-BambuStudioInstaller([datetime]$Since) {
+  $roots = @(
+    "$env:USERPROFILE\Downloads",
+    "$env:PUBLIC\Downloads",
+    "$env:TEMP",
+    (Join-Path $ROOT 'Downloads')
+  ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+  $candidates = foreach ($root in $roots) {
+    Get-ChildItem -Path $root -File -ErrorAction SilentlyContinue |
+      Where-Object {
+        $_.Length -gt 1000000 -and
+        $_.LastWriteTime -ge $Since -and
+        $_.Extension -match '^\.(exe|msi)$' -and
+        $_.Name -match '(?i)bambu'
+      }
+  }
+  $candidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 }
 
 function Get-UninstallEntries([string]$displayName) {
@@ -654,54 +707,73 @@ hello from ufoagent
   }
 }
 
-# 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
-# Studio. The harness does not pre-download either installer or supply commands; it only asserts outcomes.
-$script:thirdPartyId = $null
+# 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to download
+# and install Bambu Studio. The harness does not pre-download either installer or supply commands;
+# it only asserts outcomes after each objective-sized task.
+$script:thirdPartyIds = @{}
 Phase 'thirdparty' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping third-party app task'; return 'SKIP' }
   Stop-UfoWindows
   Stop-Brave
   Stop-BambuStudio
   Minimize-OwnConsole
+  $thirdPartyStarted = (Get-Date).AddMinutes(-2)
+  $thirdPartyTaskTimeoutSec = 900
 
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending generic Brave+Bambu install run_task'
-  $thirdPartyPrompt = @"
-Install Brave Browser. Then use Brave Browser to download and install the latest Windows Bambu Studio for Windows.
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Brave install run_task'
+  $bravePrompt = @"
+Install Brave Browser on this Windows desktop.
 
-Use the desktop normally and prefer visible GUI interactions: use an installed browser if one is available to download Brave Browser, launch Brave Browser after it is installed, then use Brave Browser to find, download, and run the Windows Bambu Studio installer. Follow installer windows and Windows prompts through completion. If a launch fails because a required runtime, library, driver, system capability, or executable is missing, diagnose the visible error, resolve the missing capability with available tools or installer UI, retry the launch, and continue only after the app runs without the error.
-
-Finish only after Brave Browser is installed, Bambu Studio is installed, and Bambu Studio is running in a normal usable window with no error dialog visible.
+Finish only after Brave Browser is installed and can be launched normally.
 "@
-  $resp = Send-NodeCommand 'run_task' $thirdPartyPrompt
-  Write-Host "sent third-party install run_task: id=$($resp.id) status=$($resp.status)"
-  Write-ProgressEvent 'phase_update' 'thirdparty' "third-party command queued: $($resp.id)"
-  $script:thirdPartyId = $resp.id
-
-  $done = Wait-For -TimeoutSec 2400 -PollSec 10 -StreamAgentLog -Condition {
-    $c = Get-NodeCommand $script:thirdPartyId
-    if ($c -and $c.status -and $c.status -ne $script:lastThirdPartyStatus) {
-      Write-ProgressEvent 'phase_update' 'thirdparty' "third-party command status: $($c.status)"
-      $script:lastThirdPartyStatus = $c.status
-    }
-    if ($c -and $c.status -eq 'failed') { throw "third-party install run_task failed: $($c.result)" }
-    $c -and $c.status -eq 'done'
-  }
-  $final = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
-  if (-not $done -or -not $final) {
-    if ($final) { Write-Host "third-party run_task result: status=$($final.status) result=$($final.result)" }
-    Show-FileTail 'agent log' $AgentLog 120
-    throw 'third-party run_task did not finish cleanly'
-  }
-  Write-CommandResultProgress 'thirdparty' $final
-  Export-UfoTrajectory 'thirdparty' $script:thirdPartyId $thirdPartyPrompt
+  $braveRun = Invoke-UfoRunTask 'thirdparty-brave-install' $bravePrompt $thirdPartyTaskTimeoutSec
+  $script:thirdPartyIds['brave-install'] = $braveRun.Id
+  Export-UfoTrajectory 'thirdparty-brave-install' $braveRun.Id $bravePrompt
 
   $brave = Get-BraveExe
-  if (-not $brave) { throw 'third-party run_task finished but Brave Browser was not installed' }
+  if (-not $brave) { throw 'Brave install run_task finished but Brave Browser was not installed' }
   Write-ProgressEvent 'phase_update' 'thirdparty' "Brave ready: $brave"
 
-  if (-not (Test-BambuStudioInstalled)) { throw 'third-party run_task finished but Bambu Studio was not installed' }
+  Minimize-OwnConsole
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu installer download run_task'
+  $bambuDownloadPrompt = @"
+Use Brave Browser to download the latest Windows Bambu Studio installer for Windows.
+
+Finish only after the installer file is downloaded and ready to run.
+"@
+  $downloadRun = Invoke-UfoRunTask 'thirdparty-bambu-download' $bambuDownloadPrompt $thirdPartyTaskTimeoutSec
+  $script:thirdPartyIds['bambu-download'] = $downloadRun.Id
+  Export-UfoTrajectory 'thirdparty-bambu-download' $downloadRun.Id $bambuDownloadPrompt
+  $bambuInstaller = Get-BambuStudioInstaller $thirdPartyStarted
+  if (-not $bambuInstaller) { throw 'Bambu download run_task finished but no fresh Bambu Studio installer was found' }
+  Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu installer ready: $($bambuInstaller.FullName)"
+
+  Minimize-OwnConsole
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu install run_task'
+  $bambuInstallPrompt = @"
+Install Bambu Studio from the downloaded Windows installer.
+
+Finish only after Bambu Studio is installed on this desktop.
+"@
+  $installRun = Invoke-UfoRunTask 'thirdparty-bambu-install' $bambuInstallPrompt $thirdPartyTaskTimeoutSec
+  $script:thirdPartyIds['bambu-install'] = $installRun.Id
+  Export-UfoTrajectory 'thirdparty-bambu-install' $installRun.Id $bambuInstallPrompt
+  if (-not (Test-BambuStudioInstalled)) { throw 'Bambu install run_task finished but Bambu Studio was not installed' }
   $bambuExe = Get-BambuStudioExe
   if ($bambuExe) { Write-Host "Bambu Studio installed: $bambuExe" } else { Write-Host 'Bambu Studio installed: uninstall entry or shortcut detected' }
+
+  Minimize-OwnConsole
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu clean-launch run_task'
+  $bambuLaunchPrompt = @"
+Launch Bambu Studio.
+
+If a graphics or OpenGL error appears, diagnose and resolve the missing capability, then retry.
+
+Finish only after Bambu Studio is running in a normal usable window with no error dialog visible.
+"@
+  $launchRun = Invoke-UfoRunTask 'thirdparty-bambu-launch' $bambuLaunchPrompt $thirdPartyTaskTimeoutSec
+  $script:thirdPartyIds['bambu-launch'] = $launchRun.Id
+  Export-UfoTrajectory 'thirdparty-bambu-launch' $launchRun.Id $bambuLaunchPrompt
   Assert-BambuStudioLaunchesClean
   Start-Sleep 4
 }

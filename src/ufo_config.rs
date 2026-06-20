@@ -46,8 +46,14 @@ const GUI_ACTIONS_MARKER: &str =
     "Managed by ufoagent: make GUI action primitives tolerant and on-screen.";
 const KEYBOARD_DIRECT_INPUT_MARKER: &str =
     "Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.";
+const KEYBOARD_KEY_TOKENS_MARKER: &str =
+    "Managed by ufoagent: treat keyboard_input text key tokens as keystrokes.";
+const COORDINATE_CLICK_FALLBACK_MARKER: &str =
+    "Managed by ufoagent: click relative coordinates with a direct mouse fallback.";
 const FOREGROUND_WINDOW_AWARENESS_MARKER: &str =
     "Managed by ufoagent: keep AppAgent perception on the foreground top-level window.";
+const FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER: &str =
+    "Managed by ufoagent: ignore console shells as foreground AppAgent targets.";
 const GUI_ACTIONS_HELPERS: &str = r#"
 # Managed by ufoagent: make GUI action primitives tolerant and on-screen.
 def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
@@ -139,13 +145,195 @@ def _ufoagent_current_controls(ui_state: "UIServerState") -> Dict[str, UIAWrappe
     return {str(i + 1): control for i, control in enumerate(usable_controls)}
 
 "#;
+const COORDINATE_CLICK_HELPERS: &str = r#"
+# Managed by ufoagent: click relative coordinates with a direct mouse fallback.
+def _ufoagent_click_relative_coordinates(
+    ui_state: "UIServerState",
+    x: float,
+    y: float,
+    button: str = "left",
+    double: bool = False,
+) -> str:
+    if not ui_state.selected_app_window:
+        raise ToolError("No window is selected, please select a window first.")
+
+    _ufoagent_restore_window_for_actions(ui_state.selected_app_window)
+    rect = ui_state.selected_app_window.rectangle()
+    width = max(1, rect.width())
+    height = max(1, rect.height())
+
+    clamped_x = min(1.0, max(0.0, float(x)))
+    clamped_y = min(1.0, max(0.0, float(y)))
+    absolute_x = int(rect.left + (width * clamped_x))
+    absolute_y = int(rect.top + (height * clamped_y))
+    absolute_x = min(max(absolute_x, rect.left + 1), rect.right - 1)
+    absolute_y = min(max(absolute_y, rect.top + 1), rect.bottom - 1)
+
+    clicks = 2 if double else 1
+    try:
+        import pyautogui as _ufoagent_pyautogui
+
+        _ufoagent_pyautogui.FAILSAFE = False
+        _ufoagent_pyautogui.click(
+            absolute_x, absolute_y, clicks=clicks, interval=0.05, button=button
+        )
+        time.sleep(0.15)
+        return (
+            f"Clicked relative coordinates ({clamped_x:.3f}, {clamped_y:.3f}) "
+            f"at screen point ({absolute_x}, {absolute_y})."
+        )
+    except Exception as pyautogui_error:
+        logger.warning(f"pyautogui coordinate click failed: {pyautogui_error}")
+
+    try:
+        from pywinauto import mouse as _ufoagent_mouse
+
+        for _ in range(clicks):
+            _ufoagent_mouse.click(button=button, coords=(absolute_x, absolute_y))
+            time.sleep(0.05)
+        time.sleep(0.15)
+        return (
+            f"Clicked relative coordinates ({clamped_x:.3f}, {clamped_y:.3f}) "
+            f"at screen point ({absolute_x}, {absolute_y})."
+        )
+    except Exception as mouse_error:
+        raise ToolError(f"Coordinate click failed: {mouse_error}")
+
+"#;
 const KEYBOARD_DIRECT_INPUT_HELPERS: &str = r#"
 # Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.
+# Managed by ufoagent: treat keyboard_input text key tokens as keystrokes.
+def _ufoagent_text_contains_key_tokens(keys: str) -> bool:
+    if not keys:
+        return False
+    try:
+        import re as _ufoagent_re
+
+        return bool(_ufoagent_re.search(r"\{[^{}]+\}", keys))
+    except Exception:
+        return "{" in keys and "}" in keys
+
+
+def _ufoagent_normalize_key_sequence(keys: str) -> str:
+    if not keys:
+        return keys
+    try:
+        import re as _ufoagent_re
+
+        keys = _ufoagent_re.sub(
+            r"\{(?:CTRL|CONTROL)\}([A-Za-z0-9])",
+            r"^\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+        keys = _ufoagent_re.sub(
+            r"\{ALT\}([A-Za-z0-9])",
+            r"%\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+        keys = _ufoagent_re.sub(
+            r"\{SHIFT\}([A-Za-z0-9])",
+            r"+\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+    except Exception:
+        pass
+    return keys
+
+
+def _ufoagent_pyautogui_send_key_sequence(
+    pyautogui_module, keys: str, pause: float = 0.02
+) -> None:
+    token_map = {
+        "ENTER": "enter",
+        "RETURN": "enter",
+        "VK_RETURN": "enter",
+        "TAB": "tab",
+        "VK_TAB": "tab",
+        "ESC": "esc",
+        "ESCAPE": "esc",
+        "VK_ESCAPE": "esc",
+        "BACKSPACE": "backspace",
+        "BS": "backspace",
+        "VK_BACK": "backspace",
+        "DELETE": "delete",
+        "DEL": "delete",
+        "VK_DELETE": "delete",
+        "SPACE": "space",
+        "VK_SPACE": "space",
+        "UP": "up",
+        "DOWN": "down",
+        "LEFT": "left",
+        "RIGHT": "right",
+        "HOME": "home",
+        "END": "end",
+        "PGUP": "pageup",
+        "PAGEUP": "pageup",
+        "PGDN": "pagedown",
+        "PAGEDOWN": "pagedown",
+    }
+    i = 0
+    while i < len(keys):
+        ch = keys[i]
+        if ch == "^" and i + 1 < len(keys):
+            pyautogui_module.hotkey("ctrl", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "%" and i + 1 < len(keys):
+            pyautogui_module.hotkey("alt", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "+" and i + 1 < len(keys):
+            pyautogui_module.hotkey("shift", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "{":
+            end = keys.find("}", i + 1)
+            if end != -1:
+                token = keys[i + 1 : end].strip()
+                parts = token.split()
+                name = parts[0].upper() if parts else ""
+                repeat = 1
+                if len(parts) > 1:
+                    try:
+                        repeat = max(1, int(parts[1]))
+                    except Exception:
+                        repeat = 1
+                key_name = token_map.get(name)
+                if key_name:
+                    for _ in range(repeat):
+                        pyautogui_module.press(key_name)
+                        time.sleep(pause)
+                    i = end + 1
+                    continue
+                if len(name) == 1:
+                    for _ in range(repeat):
+                        pyautogui_module.press(name.lower())
+                        time.sleep(pause)
+                    i = end + 1
+                    continue
+        j = i
+        while j < len(keys) and keys[j] not in "{^%+":
+            j += 1
+        if j > i:
+            pyautogui_module.write(keys[i:j], interval=pause)
+            i = j
+        else:
+            pyautogui_module.write(ch, interval=pause)
+            i += 1
+
+
 def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False) -> str:
     if not keys:
         raise ToolError("keyboard_input requires keys or text")
 
     pause = 0.02
+    normalized_keys = _ufoagent_normalize_key_sequence(keys)
     try:
         from pywinauto import keyboard as _ufoagent_keyboard
     except Exception:
@@ -183,7 +371,7 @@ def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False
 
     if _ufoagent_keyboard is not None:
         try:
-            _ufoagent_keyboard.send_keys(keys, pause=pause)
+            _ufoagent_keyboard.send_keys(normalized_keys, pause=pause)
             time.sleep(0.1)
             return f"Sent keys to focused window: {keys}"
         except Exception as send_error:
@@ -191,9 +379,210 @@ def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False
 
     if _ufoagent_pyautogui is not None:
         try:
-            _ufoagent_pyautogui.write(keys, interval=pause)
+            if _ufoagent_text_contains_key_tokens(keys) or normalized_keys != keys:
+                _ufoagent_pyautogui_send_key_sequence(
+                    _ufoagent_pyautogui, normalized_keys, pause=pause
+                )
+                time.sleep(0.1)
+                return f"Sent keys to focused window: {keys}"
+            else:
+                _ufoagent_pyautogui.write(keys, interval=pause)
+                time.sleep(0.1)
+                return f"Typed text into focused window: {keys}"
+        except Exception as type_error:
+            logger.warning(f"pyautogui keyboard write failed: {type_error}")
+
+    raise ToolError("No keyboard backend could send input to the focused window.")
+
+"#;
+const KEYBOARD_KEY_TOKEN_HELPERS: &str = r#"
+# Managed by ufoagent: treat keyboard_input text key tokens as keystrokes.
+def _ufoagent_text_contains_key_tokens(keys: str) -> bool:
+    if not keys:
+        return False
+    try:
+        import re as _ufoagent_re
+
+        return bool(_ufoagent_re.search(r"\{[^{}]+\}", keys))
+    except Exception:
+        return "{" in keys and "}" in keys
+
+
+def _ufoagent_normalize_key_sequence(keys: str) -> str:
+    if not keys:
+        return keys
+    try:
+        import re as _ufoagent_re
+
+        keys = _ufoagent_re.sub(
+            r"\{(?:CTRL|CONTROL)\}([A-Za-z0-9])",
+            r"^\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+        keys = _ufoagent_re.sub(
+            r"\{ALT\}([A-Za-z0-9])",
+            r"%\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+        keys = _ufoagent_re.sub(
+            r"\{SHIFT\}([A-Za-z0-9])",
+            r"+\1",
+            keys,
+            flags=_ufoagent_re.IGNORECASE,
+        )
+    except Exception:
+        pass
+    return keys
+
+
+def _ufoagent_pyautogui_send_key_sequence(
+    pyautogui_module, keys: str, pause: float = 0.02
+) -> None:
+    token_map = {
+        "ENTER": "enter",
+        "RETURN": "enter",
+        "VK_RETURN": "enter",
+        "TAB": "tab",
+        "VK_TAB": "tab",
+        "ESC": "esc",
+        "ESCAPE": "esc",
+        "VK_ESCAPE": "esc",
+        "BACKSPACE": "backspace",
+        "BS": "backspace",
+        "VK_BACK": "backspace",
+        "DELETE": "delete",
+        "DEL": "delete",
+        "VK_DELETE": "delete",
+        "SPACE": "space",
+        "VK_SPACE": "space",
+        "UP": "up",
+        "DOWN": "down",
+        "LEFT": "left",
+        "RIGHT": "right",
+        "HOME": "home",
+        "END": "end",
+        "PGUP": "pageup",
+        "PAGEUP": "pageup",
+        "PGDN": "pagedown",
+        "PAGEDOWN": "pagedown",
+    }
+    i = 0
+    while i < len(keys):
+        ch = keys[i]
+        if ch == "^" and i + 1 < len(keys):
+            pyautogui_module.hotkey("ctrl", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "%" and i + 1 < len(keys):
+            pyautogui_module.hotkey("alt", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "+" and i + 1 < len(keys):
+            pyautogui_module.hotkey("shift", keys[i + 1].lower())
+            time.sleep(pause)
+            i += 2
+            continue
+        if ch == "{":
+            end = keys.find("}", i + 1)
+            if end != -1:
+                token = keys[i + 1 : end].strip()
+                parts = token.split()
+                name = parts[0].upper() if parts else ""
+                repeat = 1
+                if len(parts) > 1:
+                    try:
+                        repeat = max(1, int(parts[1]))
+                    except Exception:
+                        repeat = 1
+                key_name = token_map.get(name)
+                if key_name:
+                    for _ in range(repeat):
+                        pyautogui_module.press(key_name)
+                        time.sleep(pause)
+                    i = end + 1
+                    continue
+                if len(name) == 1:
+                    for _ in range(repeat):
+                        pyautogui_module.press(name.lower())
+                        time.sleep(pause)
+                    i = end + 1
+                    continue
+        j = i
+        while j < len(keys) and keys[j] not in "{^%+":
+            j += 1
+        if j > i:
+            pyautogui_module.write(keys[i:j], interval=pause)
+            i = j
+        else:
+            pyautogui_module.write(ch, interval=pause)
+            i += 1
+
+"#;
+const KEYBOARD_INPUT_TO_FOREGROUND_FUNCTION: &str = r#"def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False) -> str:
+    if not keys:
+        raise ToolError("keyboard_input requires keys or text")
+
+    pause = 0.02
+    normalized_keys = _ufoagent_normalize_key_sequence(keys)
+    try:
+        from pywinauto import keyboard as _ufoagent_keyboard
+    except Exception:
+        _ufoagent_keyboard = None
+
+    try:
+        import pyautogui as _ufoagent_pyautogui
+
+        _ufoagent_pyautogui.FAILSAFE = False
+    except Exception:
+        _ufoagent_pyautogui = None
+
+    if literal_text:
+        try:
+            import pyperclip as _ufoagent_pyperclip
+
+            _ufoagent_pyperclip.copy(keys)
+            if _ufoagent_keyboard is not None:
+                _ufoagent_keyboard.send_keys("^v", pause=pause)
+            elif _ufoagent_pyautogui is not None:
+                _ufoagent_pyautogui.hotkey("ctrl", "v")
+            else:
+                raise RuntimeError("no keyboard backend available for paste")
             time.sleep(0.1)
             return f"Typed text into focused window: {keys}"
+        except Exception as paste_error:
+            logger.warning(f"Clipboard paste keyboard fallback failed: {paste_error}")
+            if _ufoagent_pyautogui is not None:
+                try:
+                    _ufoagent_pyautogui.write(keys, interval=pause)
+                    time.sleep(0.1)
+                    return f"Typed text into focused window: {keys}"
+                except Exception as type_error:
+                    logger.warning(f"pyautogui text keyboard fallback failed: {type_error}")
+
+    if _ufoagent_keyboard is not None:
+        try:
+            _ufoagent_keyboard.send_keys(normalized_keys, pause=pause)
+            time.sleep(0.1)
+            return f"Sent keys to focused window: {keys}"
+        except Exception as send_error:
+            logger.warning(f"pywinauto keyboard send_keys failed: {send_error}")
+
+    if _ufoagent_pyautogui is not None:
+        try:
+            if _ufoagent_text_contains_key_tokens(keys) or normalized_keys != keys:
+                _ufoagent_pyautogui_send_key_sequence(
+                    _ufoagent_pyautogui, normalized_keys, pause=pause
+                )
+                time.sleep(0.1)
+                return f"Sent keys to focused window: {keys}"
+            else:
+                _ufoagent_pyautogui.write(keys, interval=pause)
+                time.sleep(0.1)
+                return f"Typed text into focused window: {keys}"
         except Exception as type_error:
             logger.warning(f"pyautogui keyboard write failed: {type_error}")
 
@@ -243,6 +632,7 @@ def _ufoagent_wrap_foreground_window(window: Any) -> Optional[UIAWrapper]:
 
 
 def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bool:
+    # Managed by ufoagent: ignore console shells as foreground AppAgent targets.
     if not window:
         return False
     try:
@@ -256,6 +646,8 @@ def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bo
         if not title:
             return False
         if class_name in {
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+            "ConsoleWindowClass",
             "Shell_TrayWnd",
             "Shell_SecondaryTrayWnd",
             "Progman",
@@ -313,6 +705,44 @@ def _ufoagent_sync_selected_window_to_foreground(ui_state: "UIServerState") -> N
         ui_state.control_dict = {}
     except Exception as switch_error:
         logger.warning(f"Could not switch AppAgent selected window to foreground: {switch_error}")
+
+"#;
+const FOREGROUND_WINDOW_CANDIDATE_FUNCTION: &str = r#"def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bool:
+    # Managed by ufoagent: ignore console shells as foreground AppAgent targets.
+    if not window:
+        return False
+    try:
+        if not window.is_visible():
+            return False
+    except Exception:
+        return False
+    try:
+        title = (window.window_text() or "").strip()
+        class_name = (window.class_name() or "").strip()
+        if not title:
+            return False
+        if class_name in {
+            "CASCADIA_HOSTING_WINDOW_CLASS",
+            "ConsoleWindowClass",
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "Progman",
+            "WorkerW",
+            "IME",
+            "MSCTFIME UI",
+        }:
+            return False
+    except Exception:
+        return False
+    try:
+        rect = window.rectangle()
+        if rect.width() < 80 or rect.height() < 60:
+            return False
+        if rect.right <= 0 or rect.bottom <= 0 or rect.left < -5000 or rect.top < -5000:
+            return False
+    except Exception:
+        return False
+    return True
 
 "#;
 const SELECT_APPLICATION_WINDOW_FUNCTION: &str = r#"    def select_application_window(
@@ -435,6 +865,36 @@ const CLICK_INPUT_FUNCTION: &str = r#"    def click_input(
             return f"Warning: The name of your chosen control id {id} is {true_name}, but the name argument is {name}. The action is performed on control {id}:{true_name}."
 
 "#;
+const CLICK_ON_COORDINATES_FUNCTION: &str = r#"    def click_on_coordinates(
+        x: Annotated[
+            float,
+            Field(
+                description="The relative fractional x-coordinate of the point to click on, ranging from 0.0 to 1.0. The origin is the top-left corner of the application window."
+            ),
+        ],
+        y: Annotated[
+            float,
+            Field(
+                description="The relative fractional y-coordinate of the point to click on, ranging from 0.0 to 1.0. The origin is the top-left corner of the application window."
+            ),
+        ],
+        button: Annotated[
+            str,
+            Field(description="Mouse button to use ('left', 'right', 'middle')"),
+        ] = "left",
+        double: Annotated[
+            bool, Field(description="Whether to perform a double click")
+        ] = False,
+    ) -> Annotated[str, Field(description="The result of the click action.")]:
+        """
+        Click on specific relative coordinates within the selected application window.
+        """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
+        return _ufoagent_click_relative_coordinates(
+            ui_state, x=x, y=y, button=button, double=double
+        )
+
+"#;
 const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
         id: Annotated[
             str,
@@ -476,7 +936,7 @@ const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
         - keyboard_input(keys="{TAB 2}") --> Press the Tab key twice.
         """
         actual_keys = keys if keys is not None else (text or "")
-        literal_text = keys is None and text is not None
+        literal_text = keys is None and text is not None and not _ufoagent_text_contains_key_tokens(actual_keys)
         if not actual_keys:
             raise ToolError("keyboard_input requires keys or text")
 
@@ -796,6 +1256,7 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
             ),
             ("_execute_action", EXECUTE_ACTION_FUNCTION),
             ("click_input", CLICK_INPUT_FUNCTION),
+            ("click_on_coordinates", CLICK_ON_COORDINATES_FUNCTION),
             ("keyboard_input", KEYBOARD_INPUT_FUNCTION),
             (
                 "get_app_window_controls_info",
@@ -843,6 +1304,69 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
         changed = true;
     }
 
+    if !patched.contains(KEYBOARD_KEY_TOKENS_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        patched.insert_str(logger_end, KEYBOARD_KEY_TOKEN_HELPERS);
+        let Some(next) = replace_top_level_python_function(
+            &patched,
+            "_ufoagent_keyboard_input_to_foreground",
+            KEYBOARD_INPUT_TO_FOREGROUND_FUNCTION,
+        ) else {
+            anyhow::bail!(
+                "could not find _ufoagent_keyboard_input_to_foreground in UFO file {}",
+                path.display()
+            );
+        };
+        patched = next;
+        let Some(next) =
+            replace_python_function(&patched, "    ", "keyboard_input", KEYBOARD_INPUT_FUNCTION)
+        else {
+            anyhow::bail!(
+                "could not find keyboard_input in UFO file {}",
+                path.display()
+            );
+        };
+        patched = next;
+        changed = true;
+    }
+
+    if !patched.contains(COORDINATE_CLICK_FALLBACK_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        if !patched.contains("def _ufoagent_click_relative_coordinates(") {
+            patched.insert_str(logger_end, COORDINATE_CLICK_HELPERS);
+        } else {
+            patched.insert_str(
+                logger_end,
+                &format!("\n# {COORDINATE_CLICK_FALLBACK_MARKER}\n"),
+            );
+        }
+        let Some(next) = replace_python_function(
+            &patched,
+            "    ",
+            "click_on_coordinates",
+            CLICK_ON_COORDINATES_FUNCTION,
+        ) else {
+            anyhow::bail!(
+                "could not find click_on_coordinates in UFO file {}",
+                path.display()
+            );
+        };
+        patched = next;
+        changed = true;
+    }
+
     if !patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER) {
         let logger_line = "logger = logging.getLogger(__name__)\n";
         let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
@@ -855,6 +1379,7 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
         for (function_name, replacement) in [
             ("_execute_action", EXECUTE_ACTION_FUNCTION),
             ("click_input", CLICK_INPUT_FUNCTION),
+            ("click_on_coordinates", CLICK_ON_COORDINATES_FUNCTION),
             ("keyboard_input", KEYBOARD_INPUT_FUNCTION),
             ("get_app_window_info", GET_APP_WINDOW_INFO_FUNCTION),
             (
@@ -879,6 +1404,23 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
             };
             patched = next;
         }
+        changed = true;
+    }
+
+    if !patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER)
+        && patched.contains("_ufoagent_window_is_foreground_candidate")
+    {
+        let Some(next) = replace_top_level_python_function(
+            &patched,
+            "_ufoagent_window_is_foreground_candidate",
+            FOREGROUND_WINDOW_CANDIDATE_FUNCTION,
+        ) else {
+            anyhow::bail!(
+                "could not find _ufoagent_window_is_foreground_candidate in UFO file {}",
+                path.display()
+            );
+        };
+        patched = next;
         changed = true;
     }
 
@@ -1172,6 +1714,14 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         control_verified = _verify_id(id, name, ui_state.control_dict)
         return _execute_action(action)
 
+    def click_on_coordinates(
+        x: Annotated[float, Field(description="x")],
+        y: Annotated[float, Field(description="y")],
+        button: Annotated[str, Field(description="button")] = "left",
+        double: Annotated[bool, Field(description="double")] = False,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
     def keyboard_input(
         id: Annotated[str, Field(description="id")],
         name: Annotated[str, Field(description="name")],
@@ -1207,17 +1757,26 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(GUI_ACTIONS_MARKER));
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
+        assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
+        assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
+        assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
         assert!(patched.contains("window.maximize()"));
         assert!(patched.contains("text: Annotated["));
         assert!(patched.contains("actual_keys = keys if keys is not None else (text or \"\")"));
-        assert!(patched.contains("literal_text = keys is None and text is not None"));
+        assert!(patched.contains(
+            "literal_text = keys is None and text is not None and not _ufoagent_text_contains_key_tokens(actual_keys)"
+        ));
+        assert!(patched.contains("_ufoagent_pyautogui_send_key_sequence"));
         assert!(patched.contains("if target is None:"));
         assert!(patched.contains("_ufoagent_keyboard_input_to_foreground"));
         assert!(patched.contains("_ufoagent_sync_selected_window_to_foreground"));
         assert!(patched.contains("Desktop(backend=backend).active()"));
+        assert!(patched.contains("\"ConsoleWindowClass\""));
         assert!(patched.contains("pyperclip.copy(keys)"));
         assert!(patched.contains("send_keys(\"^v\""));
+        assert!(patched.contains("_ufoagent_click_relative_coordinates("));
+        assert!(patched.contains("_ufoagent_pyautogui.click("));
         assert!(patched.contains("UIAElementInfo(handle_or_elem=window.handle)"));
         assert!(patched.contains("_ufoagent_current_controls(ui_state)"));
         assert_eq!(patched.matches("def select_application_window(").count(), 1);
@@ -1270,6 +1829,14 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
     ) -> Annotated[str, Field(description="result")]:
         return _execute_action(action)
 
+    def click_on_coordinates(
+        x: Annotated[float, Field(description="x")],
+        y: Annotated[float, Field(description="y")],
+        button: Annotated[str, Field(description="button")] = "left",
+        double: Annotated[bool, Field(description="double")] = False,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
     def keyboard_input(
         id: Annotated[str, Field(description="id")],
         name: Annotated[str, Field(description="name")],
@@ -1301,12 +1868,96 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(GUI_ACTIONS_MARKER));
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
+        assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
+        assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
-        assert!(patched.contains("literal_text = keys is None and text is not None"));
+        assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
+        assert!(patched.contains(
+            "literal_text = keys is None and text is not None and not _ufoagent_text_contains_key_tokens(actual_keys)"
+        ));
         assert!(patched.contains("if target is None:"));
         assert!(patched.contains("pyperclip.copy(keys)"));
+        assert!(patched.contains("_ufoagent_click_relative_coordinates("));
         assert!(patched.contains("_ufoagent_sync_selected_window_to_foreground(ui_state)"));
         assert!(patched.contains("return _ufoagent_keyboard_input_to_foreground("));
+        assert!(!patch_ui_action_primitives(&ui).unwrap());
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn ui_patch_updates_existing_provisioned_markers_with_action_regression_fixes() {
+        let home = temp_home("ui-provisioned-existing");
+        let ui = ui_mcp_server_path(&home);
+        std::fs::create_dir_all(ui.parent().unwrap()).unwrap();
+        std::fs::write(
+            &ui,
+            r#"import os
+import time
+from typing import Annotated, Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Managed by ufoagent: make GUI action primitives tolerant and on-screen.
+def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
+    pass
+
+
+def _ufoagent_current_controls(ui_state: "UIServerState") -> Dict[str, UIAWrapper]:
+    return {}
+
+
+# Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.
+def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False) -> str:
+    if literal_text:
+        return "typed"
+    return "sent"
+
+
+# Managed by ufoagent: keep AppAgent perception on the foreground top-level window.
+def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bool:
+    if not window:
+        return False
+    return True
+
+
+@MCPRegistry.register_factory_decorator("AppUIExecutor")
+def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
+    def click_on_coordinates(
+        x: Annotated[float, Field(description="x")],
+        y: Annotated[float, Field(description="y")],
+        button: Annotated[str, Field(description="button")] = "left",
+        double: Annotated[bool, Field(description="double")] = False,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
+    def keyboard_input(
+        id: Annotated[str, Field(description="id")],
+        keys: Annotated[str, Field(description="keys")] = None,
+        text: Annotated[str, Field(description="text")] = None,
+    ) -> Annotated[str, Field(description="result")]:
+        actual_keys = keys if keys is not None else (text or "")
+        literal_text = keys is None and text is not None
+        return _ufoagent_keyboard_input_to_foreground(actual_keys, literal_text=literal_text)
+
+    return action_mcp
+"#,
+        )
+        .unwrap();
+
+        assert!(patch_ui_action_primitives(&ui).unwrap());
+        let patched = std::fs::read_to_string(&ui).unwrap();
+        assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
+        assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
+        assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
+        assert!(patched.contains("_ufoagent_normalize_key_sequence"));
+        assert!(patched.contains(
+            "literal_text = keys is None and text is not None and not _ufoagent_text_contains_key_tokens(actual_keys)"
+        ));
+        assert!(patched.contains("_ufoagent_click_relative_coordinates("));
+        assert!(patched.contains("_ufoagent_pyautogui.click("));
+        assert!(patched.contains("\"ConsoleWindowClass\""));
+        assert!(!patched.contains("literal_text = keys is None and text is not None\n"));
         assert!(!patch_ui_action_primitives(&ui).unwrap());
 
         let _ = std::fs::remove_dir_all(home);
