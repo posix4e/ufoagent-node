@@ -4,6 +4,7 @@
 //! machine-wide config dir lets the connection loop report whether that desktop is usable.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -13,6 +14,7 @@ use crate::config::config_dir;
 /// Live text emitted by UFO2 while a remote task is running. The WebSocket layer maps this onto the
 /// dashboard's `current_task` field.
 pub type ProgressCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
+pub type AbortSignal = Arc<AtomicBool>;
 
 /// A remote job the login-session agent should execute.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,7 +28,7 @@ pub struct RemoteTaskRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteTaskResult {
     pub id: String,
-    pub status: String, // "done" | "failed"
+    pub status: String, // "done" | "failed" | "halted"
     pub result: String,
 }
 

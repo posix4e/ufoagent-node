@@ -4,6 +4,7 @@
 //! hello_ack. Runs on its own thread with reconnect/backoff.
 
 use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,6 +48,14 @@ pub struct WsState {
     connected: AtomicBool,
     min_version: Mutex<Option<String>>,
     outbound: Mutex<Vec<Value>>,
+    inflight: Mutex<HashMap<String, InflightTask>>,
+}
+
+#[derive(Clone)]
+struct InflightTask {
+    abort: Arc<AtomicBool>,
+    task: String,
+    request: Option<String>,
 }
 
 impl WsState {
@@ -70,6 +79,44 @@ impl WsState {
             .lock()
             .map(|mut q| std::mem::take(&mut *q))
             .unwrap_or_default()
+    }
+    fn register_run_task(
+        &self,
+        id: String,
+        task: String,
+        request: Option<String>,
+    ) -> Arc<AtomicBool> {
+        let abort = Arc::new(AtomicBool::new(false));
+        if let Ok(mut g) = self.inflight.lock() {
+            g.insert(
+                id,
+                InflightTask {
+                    abort: abort.clone(),
+                    task,
+                    request,
+                },
+            );
+        }
+        abort
+    }
+    fn remove_run_task(&self, id: &str) {
+        if let Ok(mut g) = self.inflight.lock() {
+            g.remove(id);
+        }
+    }
+    fn has_run_tasks(&self) -> bool {
+        self.inflight.lock().map(|g| !g.is_empty()).unwrap_or(false)
+    }
+    fn is_run_task_inflight(&self, id: &str) -> bool {
+        self.inflight
+            .lock()
+            .map(|g| g.contains_key(id))
+            .unwrap_or(false)
+    }
+    fn halt_run_task(&self, id: &str) -> Option<InflightTask> {
+        let info = self.inflight.lock().ok().and_then(|g| g.get(id).cloned())?;
+        info.abort.store(true, Ordering::Relaxed);
+        Some(info)
     }
     /// Drop queued transient state frames. The `hello` sent on (re)connect carries the authoritative
     /// current env + desktop state, so deltas queued while disconnected are stale — draining them
@@ -204,6 +251,14 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
         }
         return Ok(());
     }
+    if kind == Some("halt") {
+        handle_halt(state, &msg);
+        return Ok(());
+    }
+    if kind == Some("interject") {
+        handle_interject(state, cfg, &msg);
+        return Ok(());
+    }
     if kind != Some("command") {
         return Ok(());
     }
@@ -266,6 +321,84 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
     Ok(())
 }
 
+fn handle_halt(state: &Arc<WsState>, msg: &Value) {
+    let id = msg.get("cmd_id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return;
+    }
+    let reason = msg
+        .get("reason")
+        .and_then(Value::as_str)
+        .unwrap_or("overseer requested halt");
+    if state.halt_run_task(id).is_some() {
+        log::warn!("ws: halting run_task {id}: {reason}");
+        state.queue_send(json!({ "type": "status", "current_task": truncate(&format!("Halting: {reason}"), PROGRESS_MAX) }));
+    } else {
+        log::warn!("ws: halt requested for unknown run_task {id}: {reason}");
+    }
+}
+
+fn handle_interject(state: &Arc<WsState>, cfg: &Config, msg: &Value) {
+    let id = msg.get("cmd_id").and_then(Value::as_str).unwrap_or("");
+    if id.is_empty() {
+        return;
+    }
+    let instruction = msg
+        .get("instruction")
+        .and_then(Value::as_str)
+        .unwrap_or("overseer requested correction")
+        .to_string();
+    let Some(previous) = state.halt_run_task(id) else {
+        log::warn!("ws: interject requested for unknown run_task {id}: {instruction}");
+        if let Some(next_id) = msg.get("new_cmd_id").and_then(Value::as_str) {
+            state.queue_send(json!({
+                "type": "result",
+                "id": next_id,
+                "status": "failed",
+                "result": "overseer interject target was no longer running"
+            }));
+        }
+        return;
+    };
+
+    let args = msg.get("args").unwrap_or(&Value::Null);
+    let next_id = msg
+        .get("new_cmd_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{id}-interject"));
+    let task = args
+        .get("task")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or(previous.task);
+    let request = args
+        .get("request")
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            previous
+                .request
+                .map(|r| format!("{r}\n\nOverseer correction:\n{instruction}"))
+        });
+
+    log::warn!("ws: interjecting run_task {id}; starting corrected run_task {next_id}");
+    state.queue_send(json!({ "type": "status", "current_task": truncate(&format!("Interjecting: {instruction}"), PROGRESS_MAX) }));
+    let next_state = state.clone();
+    let control_plane = cfg.control_plane_url();
+    let previous_id = id.to_string();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while next_state.is_run_task_inflight(&previous_id) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        spawn_run_task(next_state, next_id, task, request, control_plane);
+    });
+}
+
 fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
     match kind {
         "refresh" => {
@@ -295,6 +428,7 @@ fn spawn_run_task(
     request: Option<String>,
     control_plane: String,
 ) {
+    let abort = state.register_run_task(id.clone(), task.clone(), request.clone());
     std::thread::spawn(move || {
         let label = request.clone().unwrap_or_else(|| task.clone());
         let req_log = request.clone();
@@ -313,8 +447,11 @@ fn spawn_run_task(
                 Some(&result),
             );
             state.queue_send(json!({ "type": "result", "id": id, "status": status, "result": truncate(&result, RESULT_MAX) }));
+            state.remove_run_task(&id);
             // Clear the "running" indicator on the dashboard.
-            state.queue_send(json!({ "type": "status", "current_task": Value::Null }));
+            if !state.has_run_tasks() {
+                state.queue_send(json!({ "type": "status", "current_task": Value::Null }));
+            }
         };
 
         // No live, usable desktop means the executor cannot drive UFO2 — fail fast and actionably.
@@ -339,16 +476,24 @@ fn spawn_run_task(
             trajectory_stop.clone(),
         );
         let (tx, rx) = std::sync::mpsc::channel();
+        let abort_for_worker = abort.clone();
         std::thread::spawn(move || {
-            let _ = tx.send(crate::tray::execute_remote(&req, progress));
+            let _ = tx.send(crate::tray::execute_remote(
+                &req,
+                progress,
+                abort_for_worker,
+            ));
         });
         match rx.recv_timeout(RUN_TASK_TIMEOUT) {
             Ok(res) => finish(&state, &res.status, res.result),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finish(
-                &state,
-                "failed",
-                "task timed out after 10 minutes".to_string(),
-            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                abort.store(true, Ordering::Relaxed);
+                finish(
+                    &state,
+                    "failed",
+                    "task timed out after 10 minutes".to_string(),
+                );
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 finish(&state, "failed", "task worker stopped".to_string());
             }
