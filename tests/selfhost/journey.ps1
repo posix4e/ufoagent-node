@@ -536,11 +536,15 @@ Phase 'install' {
   }
   Write-Host "installer: $((Get-Item $setup).Length) bytes"
   Write-ProgressEvent 'phase_update' 'install' "installer ready: $((Get-Item $setup).Length) bytes"
+  $installMarkerFreshAfter = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - 1
   Start-Process $setup -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL'
   Write-ProgressEvent 'phase_update' 'install' 'installer launched; waiting for UFO2 ready'
+  Write-ProgressEvent 'phase_update' 'install' 'waiting for fresh UFO2 provisioning marker'
   $ready = Wait-For -TimeoutSec 600 -PollSec 5 -StreamAgentLog -Condition {
     if (Test-Path $marker) {
       $m = Get-Content $marker -Raw | ConvertFrom-Json
+      $fresh = $m.updated_at -and ([int64]$m.updated_at -ge $installMarkerFreshAfter)
+      if (-not $fresh) { return $false }
       $detail = if ($m.detail) { "$($m.state): $($m.detail)" } else { "$($m.state)" }
       if ($detail -and $detail -ne $script:lastInstallDetail) {
         Write-ProgressEvent 'phase_update' 'install' $detail
