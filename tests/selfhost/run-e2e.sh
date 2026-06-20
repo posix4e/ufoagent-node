@@ -164,6 +164,9 @@ SSH 'Get-Content C:\e2e\out\progress.ndjson -Raw' > "$PROGRESS" 2>/dev/null || t
 # ships it next to the gifs. Absent if the dashboard phase skipped (old agent / no Edge).
 mkdir -p "$WORK/gifs"
 SCP "$GUSER@$IP:C:/e2e/out/node-desktop.png" "$WORK/gifs/node-desktop.png" 2>/dev/null || true
+rm -rf "$WORK/trajectory"; mkdir -p "$WORK/trajectory"
+SCP -r "$GUSER@$IP:C:/e2e/out/ufo-trajectories" "$WORK/trajectory/" 2>/dev/null || true
+SCP "$GUSER@$IP:C:/ProgramData/UFOAgent/ufo/config/ufo/agents.yaml" "$WORK/agents.yaml" 2>/dev/null || true
 SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/dev/null 2>&1 || true
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- progress ---"; cat "$PROGRESS" 2>/dev/null
@@ -193,6 +196,22 @@ echo "skew_ms=$skew"
 
 echo "=== slice ==="
 bash "$HERE/slice.sh" "$REC" "$WORK/phases.json" "$skew" "$WORK/gifs" || true
+
+echo "=== curate UFO trajectory artifact ==="
+if [ "$status" = "PASS" ]; then
+  if [ -d "$WORK/trajectory/ufo-trajectories" ] && [ -s "$WORK/agents.yaml" ]; then
+    if ! python3 "$HERE/curate_trajectory.py" --input "$WORK/trajectory/ufo-trajectories" --agents-yaml "$WORK/agents.yaml" --out "$WORK/gifs"; then
+      echo "UFO trajectory curation failed"
+      exit 1
+    fi
+  else
+    echo "UFO trajectory curation failed: harvested logs or vended agents.yaml missing"
+    exit 1
+  fi
+else
+  echo "UFO trajectory curation skipped: journey status=$status"
+fi
+
 ls -la "$WORK/gifs" 2>/dev/null
 
 echo "SELFHOST-E2E: $status"

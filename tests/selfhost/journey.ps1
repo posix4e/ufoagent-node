@@ -250,6 +250,47 @@ function Write-CommandResultProgress([string]$phase, $command) {
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
 }
 
+function Save-UfoTrajectorySnapshot([string]$phase, [string]$cmdId, $command = $null) {
+  if (-not $cmdId) { return }
+  $src = 'C:\ProgramData\UFOAgent\ufo\logs\adhoc'
+  $responseLog = Join-Path $src 'response.log'
+  if (-not (Test-Path $responseLog)) {
+    Write-ProgressEvent 'phase_update' $phase "no UFO response.log to harvest for $cmdId"
+    return
+  }
+  $safe = (($phase + '-' + $cmdId) -replace '[^A-Za-z0-9_.-]', '_')
+  $root = Join-Path $OUT 'ufo-trajectories'
+  $dst = Join-Path $root $safe
+  Remove-Item $dst -Recurse -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType Directory -Force $dst | Out-Null
+  Copy-Item (Join-Path $src '*') $dst -Recurse -Force -ErrorAction SilentlyContinue
+
+  $cmdStatus = $null
+  $cmdResult = $null
+  if ($command) {
+    $cmdStatus = $command.status
+    $cmdResult = $command.result
+  }
+  $meta = [ordered]@{
+    phase = $phase
+    cmd_id = $cmdId
+    captured_at = (Now)
+    status = $cmdStatus
+    result = $cmdResult
+  }
+  ([pscustomobject]$meta | ConvertTo-Json -Depth 5) | Set-Content (Join-Path $dst 'meta.json') -Encoding Ascii
+
+  if ($haveAdm) {
+    try {
+      $trajUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/trajectories/$cmdId"
+      Invoke-WebRequest -UseBasicParsing -Headers (Get-ApiHeaders) -Uri $trajUrl -OutFile (Join-Path $dst 'control-plane-trajectory.json')
+    } catch {
+      Write-Host "::warning::could not save control-plane trajectory for ${phase}/${cmdId}: $($_.Exception.Message)"
+    }
+  }
+  Write-ProgressEvent 'phase_update' $phase "harvested UFO trajectory for $cmdId"
+}
+
 function Quote-PsString([string]$value) {
   "'" + $value.Replace("'", "''") + "'"
 }
@@ -754,7 +795,8 @@ hello from ufoagent
   Set-Crop 'notepad'; Start-Sleep 1
 }
 if ($haveAdm -and $script:remoteId) {
-  $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
+  $remoteDone = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
+  Save-UfoTrajectorySnapshot 'remote' $script:remoteId $remoteDone
 }
 
 # 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
@@ -812,6 +854,7 @@ Wait until Brave Browser is installed and a Brave window is visible. Do not stop
     }
     $braveDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Brave install run_task' 'thirdparty' 120
     Write-CommandResultProgress 'thirdparty' $braveDone
+    Save-UfoTrajectorySnapshot 'brave' $script:thirdPartyId $braveDone
     Assert-LauncherEvent 'edge' 'thirdparty'
     Assert-LauncherEvent 'brave-setup' 'thirdparty'
     $brave = Get-BraveExe
@@ -861,6 +904,7 @@ Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish
     }
     $bambuDownloadDone = Wait-CommandTerminalAfterState $bambuDownloadId 'Bambu Studio download run_task' 'thirdparty' 60
     Write-CommandResultProgress 'thirdparty' $bambuDownloadDone
+    Save-UfoTrajectorySnapshot 'bambu-download' $bambuDownloadId $bambuDownloadDone
     Assert-LauncherEvent 'brave' 'thirdparty'
 
     $installer = Get-BambuInstallerDownload
@@ -901,6 +945,7 @@ Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or gr
     }
     $bambuSetupDone = Wait-CommandTerminalAfterState $bambuSetupId 'Bambu Studio setup run_task' 'thirdparty' 120
     Write-CommandResultProgress 'thirdparty' $bambuSetupDone
+    Save-UfoTrajectorySnapshot 'bambu-setup' $bambuSetupId $bambuSetupDone
     Assert-LauncherEvent 'bambu-setup' 'thirdparty'
   } else {
     Write-Host 'Bambu Studio already installed'
