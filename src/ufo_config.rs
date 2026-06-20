@@ -14,8 +14,38 @@ const CLI_ALLOW_ALL_FUNCTION: &str = r#"def _is_cli_command_allowed(command_str:
     return bool(command_str and command_str.strip())
 
 "#;
+const CLI_REAL_SHELL_MARKER: &str =
+    "Managed by ufoagent: run CLI MCP commands through cmd.exe for real shell semantics.";
+const CLI_RUN_SHELL_FUNCTION: &str = r#"    def run_shell(
+        bash_command: str,
+    ) -> None:
+        """
+        Launch an application or shell command using the provided command.
+        :param bash_command: The command to execute.
+        :return: None
+        """
+
+        if not bash_command:
+            raise ToolError("Bash command cannot be empty.")
+
+        if not _is_cli_command_allowed(bash_command):
+            raise ToolError("Command blocked by security policy.")
+
+        try:
+            # Managed by ufoagent: run CLI MCP commands through cmd.exe for real shell semantics.
+            # UFO's upstream shlex/shell=False path cannot execute Windows shell built-ins such as
+            # `start`, nor pipes, redirects, or command chaining. Keep the agent unrestricted while
+            # preserving a visible Windows shell execution model.
+            subprocess.Popen(["cmd.exe", "/d", "/c", bash_command], shell=False)
+            time.sleep(5)
+        except Exception as e:
+            raise ToolError(f"Failed to launch application: {str(e)}")
+
+"#;
 const GUI_ACTIONS_MARKER: &str =
     "Managed by ufoagent: make GUI action primitives tolerant and on-screen.";
+const KEYBOARD_DIRECT_INPUT_MARKER: &str =
+    "Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.";
 const GUI_ACTIONS_HELPERS: &str = r#"
 # Managed by ufoagent: make GUI action primitives tolerant and on-screen.
 def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
@@ -105,6 +135,67 @@ def _ufoagent_current_controls(ui_state: "UIServerState") -> Dict[str, UIAWrappe
         if _ufoagent_control_rect_usable(control, ui_state.selected_app_window)
     ]
     return {str(i + 1): control for i, control in enumerate(usable_controls)}
+
+"#;
+const KEYBOARD_DIRECT_INPUT_HELPERS: &str = r#"
+# Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.
+def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False) -> str:
+    if not keys:
+        raise ToolError("keyboard_input requires keys or text")
+
+    pause = 0.02
+    try:
+        from pywinauto import keyboard as _ufoagent_keyboard
+    except Exception:
+        _ufoagent_keyboard = None
+
+    try:
+        import pyautogui as _ufoagent_pyautogui
+
+        _ufoagent_pyautogui.FAILSAFE = False
+    except Exception:
+        _ufoagent_pyautogui = None
+
+    if literal_text:
+        try:
+            import pyperclip as _ufoagent_pyperclip
+
+            _ufoagent_pyperclip.copy(keys)
+            if _ufoagent_keyboard is not None:
+                _ufoagent_keyboard.send_keys("^v", pause=pause)
+            elif _ufoagent_pyautogui is not None:
+                _ufoagent_pyautogui.hotkey("ctrl", "v")
+            else:
+                raise RuntimeError("no keyboard backend available for paste")
+            time.sleep(0.1)
+            return f"Typed text into focused window: {keys}"
+        except Exception as paste_error:
+            logger.warning(f"Clipboard paste keyboard fallback failed: {paste_error}")
+            if _ufoagent_pyautogui is not None:
+                try:
+                    _ufoagent_pyautogui.write(keys, interval=pause)
+                    time.sleep(0.1)
+                    return f"Typed text into focused window: {keys}"
+                except Exception as type_error:
+                    logger.warning(f"pyautogui text keyboard fallback failed: {type_error}")
+
+    if _ufoagent_keyboard is not None:
+        try:
+            _ufoagent_keyboard.send_keys(keys, pause=pause)
+            time.sleep(0.1)
+            return f"Sent keys to focused window: {keys}"
+        except Exception as send_error:
+            logger.warning(f"pywinauto keyboard send_keys failed: {send_error}")
+
+    if _ufoagent_pyautogui is not None:
+        try:
+            _ufoagent_pyautogui.write(keys, interval=pause)
+            time.sleep(0.1)
+            return f"Typed text into focused window: {keys}"
+        except Exception as type_error:
+            logger.warning(f"pyautogui keyboard write failed: {type_error}")
+
+    raise ToolError("No keyboard backend could send input to the focused window.")
 
 "#;
 const SELECT_APPLICATION_WINDOW_FUNCTION: &str = r#"    def select_application_window(
@@ -265,6 +356,7 @@ const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
         - keyboard_input(keys="{TAB 2}") --> Press the Tab key twice.
         """
         actual_keys = keys if keys is not None else (text or "")
+        literal_text = keys is None and text is not None
         if not actual_keys:
             raise ToolError("keyboard_input requires keys or text")
 
@@ -276,6 +368,13 @@ const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
             target = TargetInfo(id=id, name=action_name, kind="control")
         else:
             control_focus = False
+
+        if target is None:
+            if ui_state.selected_app_window:
+                _ufoagent_restore_window_for_actions(ui_state.selected_app_window)
+            return _ufoagent_keyboard_input_to_foreground(
+                actual_keys, literal_text=literal_text
+            )
 
         action = ActionCommandInfo(
             function="keyboard_input",
@@ -488,82 +587,122 @@ fn replace_top_level_python_function(
 fn patch_cli_allowlist(path: &Path) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO CLI MCP server {}", path.display()))?;
-    if original.contains(CLI_ALLOW_ALL_MARKER) {
-        return Ok(false);
+
+    let mut patched = original.clone();
+    let mut changed = false;
+
+    if !patched.contains(CLI_ALLOW_ALL_MARKER) {
+        let Some(next) = replace_top_level_python_function(
+            &patched,
+            "_is_cli_command_allowed",
+            CLI_ALLOW_ALL_FUNCTION,
+        ) else {
+            anyhow::bail!(
+                "could not find _is_cli_command_allowed in UFO file {}",
+                path.display()
+            );
+        };
+        patched = next;
+        changed = true;
     }
-    let Some(patched) = replace_top_level_python_function(
-        &original,
-        "_is_cli_command_allowed",
-        CLI_ALLOW_ALL_FUNCTION,
-    ) else {
-        anyhow::bail!(
-            "could not find _is_cli_command_allowed in UFO file {}",
-            path.display()
-        );
-    };
-    if patched == original {
+
+    if !patched.contains(CLI_REAL_SHELL_MARKER) {
+        let Some(next) =
+            replace_python_function(&patched, "    ", "run_shell", CLI_RUN_SHELL_FUNCTION)
+        else {
+            anyhow::bail!("could not find run_shell in UFO file {}", path.display());
+        };
+        patched = next;
+        changed = true;
+    }
+
+    if !changed || patched == original {
         return Ok(false);
     }
     std::fs::write(path, patched)
-        .with_context(|| format!("writing managed UFO CLI allowlist patch {}", path.display()))?;
+        .with_context(|| format!("writing managed UFO CLI MCP patch {}", path.display()))?;
     Ok(true)
 }
 
 fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO UI MCP server {}", path.display()))?;
-    if original.contains(GUI_ACTIONS_MARKER) {
-        return Ok(false);
-    }
 
     let mut patched = original.clone();
+    let mut changed = false;
     if !patched.contains("import time\n") {
         let next = patched.replacen("import os\n", "import os\nimport time\n", 1);
         if next == patched {
             anyhow::bail!("could not add time import in UFO file {}", path.display());
         }
         patched = next;
+        changed = true;
     }
-    let logger_line = "logger = logging.getLogger(__name__)\n";
-    let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
-        anyhow::bail!(
-            "could not find logger initialization in UFO file {}",
-            path.display()
-        );
-    };
-    patched.insert_str(logger_end, GUI_ACTIONS_HELPERS);
-    for (function_name, replacement) in [
-        (
-            "select_application_window",
-            SELECT_APPLICATION_WINDOW_FUNCTION,
-        ),
-        ("_execute_action", EXECUTE_ACTION_FUNCTION),
-        ("click_input", CLICK_INPUT_FUNCTION),
-        ("keyboard_input", KEYBOARD_INPUT_FUNCTION),
-        (
-            "get_app_window_controls_info",
-            GET_APP_WINDOW_CONTROLS_INFO_FUNCTION,
-        ),
-        (
-            "get_app_window_controls_target_info",
-            GET_APP_WINDOW_CONTROLS_TARGET_INFO_FUNCTION,
-        ),
-        (
-            "capture_window_screenshot",
-            CAPTURE_WINDOW_SCREENSHOT_FUNCTION,
-        ),
-    ] {
-        let Some(next) = replace_python_function(&patched, "    ", function_name, replacement)
+
+    if !patched.contains(GUI_ACTIONS_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        patched.insert_str(logger_end, GUI_ACTIONS_HELPERS);
+        for (function_name, replacement) in [
+            (
+                "select_application_window",
+                SELECT_APPLICATION_WINDOW_FUNCTION,
+            ),
+            ("_execute_action", EXECUTE_ACTION_FUNCTION),
+            ("click_input", CLICK_INPUT_FUNCTION),
+            ("keyboard_input", KEYBOARD_INPUT_FUNCTION),
+            (
+                "get_app_window_controls_info",
+                GET_APP_WINDOW_CONTROLS_INFO_FUNCTION,
+            ),
+            (
+                "get_app_window_controls_target_info",
+                GET_APP_WINDOW_CONTROLS_TARGET_INFO_FUNCTION,
+            ),
+            (
+                "capture_window_screenshot",
+                CAPTURE_WINDOW_SCREENSHOT_FUNCTION,
+            ),
+        ] {
+            let Some(next) = replace_python_function(&patched, "    ", function_name, replacement)
+            else {
+                anyhow::bail!(
+                    "could not find {function_name} in UFO file {}",
+                    path.display()
+                );
+            };
+            patched = next;
+        }
+        changed = true;
+    }
+
+    if !patched.contains(KEYBOARD_DIRECT_INPUT_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        patched.insert_str(logger_end, KEYBOARD_DIRECT_INPUT_HELPERS);
+        let Some(next) =
+            replace_python_function(&patched, "    ", "keyboard_input", KEYBOARD_INPUT_FUNCTION)
         else {
             anyhow::bail!(
-                "could not find {function_name} in UFO file {}",
+                "could not find keyboard_input in UFO file {}",
                 path.display()
             );
         };
         patched = next;
+        changed = true;
     }
 
-    if patched == original {
+    if !changed || patched == original {
         return Ok(false);
     }
     std::fs::write(path, patched)
@@ -740,7 +879,16 @@ def _is_cli_command_allowed(command_str: str) -> bool:
 
 @MCPRegistry.register_factory_decorator("CommandLineExecutor")
 def create_cli_mcp_server(*args, **kwargs):
-    pass
+    def run_shell(
+        bash_command: str,
+    ) -> None:
+        if not _is_cli_command_allowed(bash_command):
+            raise ToolError("Command blocked by security policy.")
+        args = shlex.split(bash_command)
+        subprocess.Popen(args, shell=False)
+        time.sleep(5)
+
+    return cli_mcp
 "#,
         )
         .unwrap();
@@ -748,13 +896,59 @@ def create_cli_mcp_server(*args, **kwargs):
         assert!(patch_cli_allowlist(&cli).unwrap());
         let patched = std::fs::read_to_string(&cli).unwrap();
         assert!(patched.contains(CLI_ALLOW_ALL_MARKER));
+        assert!(patched.contains(CLI_REAL_SHELL_MARKER));
         assert!(patched.contains("return bool(command_str and command_str.strip())"));
+        assert!(patched
+            .contains(r#"subprocess.Popen(["cmd.exe", "/d", "/c", bash_command], shell=False)"#));
         assert!(!patched.contains("return tokens[0] in ALLOWED_CLI_COMMANDS"));
+        assert!(!patched.contains("args = shlex.split(bash_command)"));
+        assert!(!patched.contains("subprocess.Popen(args, shell=False)"));
         assert!(patched.contains("@MCPRegistry.register_factory_decorator"));
 
         assert!(!patch_cli_allowlist(&cli).unwrap());
         let patched_again = std::fs::read_to_string(&cli).unwrap();
         assert_eq!(patched, patched_again);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn cli_patch_updates_existing_allowlist_patch_with_real_shell() {
+        let home = temp_home("cli-real-shell");
+        let cli = cli_mcp_server_path(&home);
+        std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cli,
+            r#"import shlex
+import subprocess
+import time
+
+def _is_cli_command_allowed(command_str: str) -> bool:
+    """Managed by ufoagent: allow all CLI MCP commands for unattended installs."""
+    return bool(command_str and command_str.strip())
+
+@MCPRegistry.register_factory_decorator("CommandLineExecutor")
+def create_cli_mcp_server(*args, **kwargs):
+    def run_shell(
+        bash_command: str,
+    ) -> None:
+        args = shlex.split(bash_command)
+        subprocess.Popen(args, shell=False)
+        time.sleep(5)
+
+    return cli_mcp
+"#,
+        )
+        .unwrap();
+
+        assert!(patch_cli_allowlist(&cli).unwrap());
+        let patched = std::fs::read_to_string(&cli).unwrap();
+        assert!(patched.contains(CLI_ALLOW_ALL_MARKER));
+        assert!(patched.contains(CLI_REAL_SHELL_MARKER));
+        assert!(patched
+            .contains(r#"subprocess.Popen(["cmd.exe", "/d", "/c", bash_command], shell=False)"#));
+        assert!(!patched.contains("subprocess.Popen(args, shell=False)"));
+        assert!(!patch_cli_allowlist(&cli).unwrap());
 
         let _ = std::fs::remove_dir_all(home);
     }
@@ -829,9 +1023,15 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patch_ui_action_primitives(&ui).unwrap());
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(GUI_ACTIONS_MARKER));
+        assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
         assert!(patched.contains("window.maximize()"));
         assert!(patched.contains("text: Annotated["));
         assert!(patched.contains("actual_keys = keys if keys is not None else (text or \"\")"));
+        assert!(patched.contains("literal_text = keys is None and text is not None"));
+        assert!(patched.contains("if target is None:"));
+        assert!(patched.contains("_ufoagent_keyboard_input_to_foreground"));
+        assert!(patched.contains("pyperclip.copy(keys)"));
+        assert!(patched.contains("send_keys(\"^v\""));
         assert!(patched.contains("_ufoagent_current_controls(ui_state)"));
         assert_eq!(patched.matches("def select_application_window(").count(), 1);
         assert_eq!(patched.matches(") -> Dict[str, Any]:").count(), 1);
@@ -846,6 +1046,51 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(!patch_ui_action_primitives(&ui).unwrap());
         let patched_again = std::fs::read_to_string(&ui).unwrap();
         assert_eq!(patched, patched_again);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn ui_patch_updates_existing_gui_patch_with_direct_keyboard_input() {
+        let home = temp_home("ui-keyboard-existing");
+        let ui = ui_mcp_server_path(&home);
+        std::fs::create_dir_all(ui.parent().unwrap()).unwrap();
+        std::fs::write(
+            &ui,
+            r#"import os
+import time
+from typing import Annotated, Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
+
+# Managed by ufoagent: make GUI action primitives tolerant and on-screen.
+def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
+    pass
+
+@MCPRegistry.register_factory_decorator("AppUIExecutor")
+def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
+    def keyboard_input(
+        id: Annotated[str, Field(description="id")],
+        name: Annotated[str, Field(description="name")],
+        keys: Annotated[str, Field(description="keys")],
+        control_focus: Annotated[bool, Field(description="focus")] = True,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
+    return action_mcp
+"#,
+        )
+        .unwrap();
+
+        assert!(patch_ui_action_primitives(&ui).unwrap());
+        let patched = std::fs::read_to_string(&ui).unwrap();
+        assert!(patched.contains(GUI_ACTIONS_MARKER));
+        assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
+        assert!(patched.contains("literal_text = keys is None and text is not None"));
+        assert!(patched.contains("if target is None:"));
+        assert!(patched.contains("pyperclip.copy(keys)"));
+        assert!(patched.contains("return _ufoagent_keyboard_input_to_foreground("));
+        assert!(!patch_ui_action_primitives(&ui).unwrap());
 
         let _ = std::fs::remove_dir_all(home);
     }

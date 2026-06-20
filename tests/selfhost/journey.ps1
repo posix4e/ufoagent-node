@@ -170,13 +170,19 @@ function Assert-NativeUfoConfig {
   if ($cliRaw -notmatch 'Managed by ufoagent: allow all CLI MCP commands for unattended installs') {
     throw 'UFO CLI MCP allowlist patch is missing'
   }
+  if ($cliRaw -notmatch 'Managed by ufoagent: run CLI MCP commands through cmd.exe for real shell semantics') {
+    throw 'UFO CLI MCP real-shell patch is missing'
+  }
   $ui = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\ui_mcp_server.py'
   if (-not (Test-Path $ui)) { throw "UFO UI MCP server missing: $ui" }
   $uiRaw = Get-Content $ui -Raw
   if ($uiRaw -notmatch 'Managed by ufoagent: make GUI action primitives tolerant and on-screen') {
     throw 'UFO UI action primitive patch is missing'
   }
-  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid')) {
+  if ($uiRaw -notmatch 'Managed by ufoagent: send keyboard input directly to focused windows when no control target exists') {
+    throw 'UFO UI direct keyboard input patch is missing'
+  }
+  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', 'pyperclip.copy(keys)')) {
     if ($uiRaw -notmatch [regex]::Escape($required)) {
       throw "UFO UI action primitive patch missing expected behavior: $required"
     }
