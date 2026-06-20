@@ -125,12 +125,14 @@ jobs:
           g=/mnt/ram/e2e/gifs
           rm -rf pub && mkdir pub
           # The site uses install-screen.gif, link-screen.gif, mission-control.gif,
+          # ufo-trajectory.gif,
           # and still fallbacks. third-party-app.gif is published for CI diagnostics.
           # Publish gif + a still fallback for each; missing ones are skipped.
-          for f in install-screen link-screen remote-task third-party-app mission-control; do
+          for f in install-screen link-screen remote-task third-party-app mission-control ufo-trajectory; do
             cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
             cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
           done
+          cp "$g/ufo-trajectory.json" "pub/ufo-trajectory.json" 2>/dev/null || true
           # The raw captured desktop still powers dashboard previews and the website node image.
           cp "$g/node-desktop.png" "pub/node-desktop.png" 2>/dev/null || true
           ls -la pub
