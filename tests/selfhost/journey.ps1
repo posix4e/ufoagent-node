@@ -182,7 +182,10 @@ function Assert-NativeUfoConfig {
   if ($uiRaw -notmatch 'Managed by ufoagent: send keyboard input directly to focused windows when no control target exists') {
     throw 'UFO UI direct keyboard input patch is missing'
   }
-  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', 'pyperclip.copy(keys)')) {
+  if ($uiRaw -notmatch 'Managed by ufoagent: keep AppAgent perception on the foreground top-level window') {
+    throw 'UFO UI foreground-window awareness patch is missing'
+  }
+  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', 'pyperclip.copy(keys)', '_ufoagent_sync_selected_window_to_foreground(ui_state)', 'Desktop(backend=backend).active()')) {
     if ($uiRaw -notmatch [regex]::Escape($required)) {
       throw "UFO UI action primitive patch missing expected behavior: $required"
     }

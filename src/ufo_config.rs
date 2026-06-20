@@ -46,6 +46,8 @@ const GUI_ACTIONS_MARKER: &str =
     "Managed by ufoagent: make GUI action primitives tolerant and on-screen.";
 const KEYBOARD_DIRECT_INPUT_MARKER: &str =
     "Managed by ufoagent: send keyboard input directly to focused windows when no control target exists.";
+const FOREGROUND_WINDOW_AWARENESS_MARKER: &str =
+    "Managed by ufoagent: keep AppAgent perception on the foreground top-level window.";
 const GUI_ACTIONS_HELPERS: &str = r#"
 # Managed by ufoagent: make GUI action primitives tolerant and on-screen.
 def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
@@ -198,6 +200,121 @@ def _ufoagent_keyboard_input_to_foreground(keys: str, literal_text: bool = False
     raise ToolError("No keyboard backend could send input to the focused window.")
 
 "#;
+const FOREGROUND_WINDOW_AWARENESS_HELPERS: &str = r#"
+# Managed by ufoagent: keep AppAgent perception on the foreground top-level window.
+def _ufoagent_same_window(
+    left: Optional[UIAWrapper], right: Optional[UIAWrapper]
+) -> bool:
+    try:
+        return bool(left and right and int(left.handle) == int(right.handle))
+    except Exception:
+        return left is right
+
+
+def _ufoagent_window_description(window: Optional[UIAWrapper]) -> str:
+    if not window:
+        return "<none>"
+    try:
+        title = (window.window_text() or "").strip()
+    except Exception:
+        title = ""
+    try:
+        class_name = (window.class_name() or "").strip()
+    except Exception:
+        class_name = ""
+    try:
+        handle = str(window.handle)
+    except Exception:
+        handle = "?"
+    return f"{title or '<untitled>'} [{class_name}] hwnd={handle}"
+
+
+def _ufoagent_wrap_foreground_window(window: Any) -> Optional[UIAWrapper]:
+    if not window:
+        return None
+    if isinstance(window, UIAWrapper):
+        return window
+    try:
+        from pywinauto.uia_element_info import UIAElementInfo
+
+        return UIAWrapper(UIAElementInfo(handle_or_elem=window.handle))
+    except Exception:
+        return None
+
+
+def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bool:
+    if not window:
+        return False
+    try:
+        if not window.is_visible():
+            return False
+    except Exception:
+        return False
+    try:
+        title = (window.window_text() or "").strip()
+        class_name = (window.class_name() or "").strip()
+        if not title:
+            return False
+        if class_name in {
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "Progman",
+            "WorkerW",
+            "IME",
+            "MSCTFIME UI",
+        }:
+            return False
+    except Exception:
+        return False
+    try:
+        rect = window.rectangle()
+        if rect.width() < 80 or rect.height() < 60:
+            return False
+        if rect.right <= 0 or rect.bottom <= 0 or rect.left < -5000 or rect.top < -5000:
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _ufoagent_foreground_top_level_window() -> Optional[UIAWrapper]:
+    try:
+        from pywinauto import Desktop
+    except Exception as import_error:
+        logger.warning(f"Could not import pywinauto Desktop for foreground sync: {import_error}")
+        return None
+
+    for backend in ("win32", "uia"):
+        try:
+            active_window = Desktop(backend=backend).active()
+            candidate = _ufoagent_wrap_foreground_window(active_window)
+            if _ufoagent_window_is_foreground_candidate(candidate):
+                return candidate
+        except Exception as active_error:
+            logger.debug(f"Could not read active {backend} window: {active_error}")
+    return None
+
+
+def _ufoagent_sync_selected_window_to_foreground(ui_state: "UIServerState") -> None:
+    foreground = _ufoagent_foreground_top_level_window()
+    if not foreground:
+        return
+    if _ufoagent_same_window(foreground, ui_state.selected_app_window):
+        return
+
+    previous = _ufoagent_window_description(ui_state.selected_app_window)
+    current = _ufoagent_window_description(foreground)
+    logger.info(
+        f"Switching AppAgent selected window to foreground top-level window: {current}; previous selected window: {previous}"
+    )
+    try:
+        _ufoagent_restore_window_for_actions(foreground)
+        ui_state.initialize_for_window(foreground)
+        ui_state.control_dict = {}
+    except Exception as switch_error:
+        logger.warning(f"Could not switch AppAgent selected window to foreground: {switch_error}")
+
+"#;
 const SELECT_APPLICATION_WINDOW_FUNCTION: &str = r#"    def select_application_window(
         id: Annotated[
             str,
@@ -245,6 +362,8 @@ const EXECUTE_ACTION_FUNCTION: &str = r#"    def _execute_action(action: ActionC
         :param action: ActionCommandInfo object to execute.
         :return: Execution result as a dictionary.
         """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
+
         if not ui_state.puppeteer or not ui_state.selected_app_window:
             raise ValueError(
                 "UI state not initialized. Please select an application window first."
@@ -294,6 +413,7 @@ const CLICK_INPUT_FUNCTION: &str = r#"    def click_input(
         Click on a UI control element using the mouse. All type of controls elements are supported.
         """
 
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
         ui_state.control_dict = _ufoagent_current_controls(ui_state)
         selected = ui_state.control_dict.get(id) if ui_state.control_dict else None
         true_name = selected.element_info.name if selected else None
@@ -360,6 +480,7 @@ const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
         if not actual_keys:
             raise ToolError("keyboard_input requires keys or text")
 
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
         ui_state.control_dict = _ufoagent_current_controls(ui_state)
         selected = ui_state.control_dict.get(id) if id and ui_state.control_dict else None
         target = None
@@ -385,12 +506,30 @@ const KEYBOARD_INPUT_FUNCTION: &str = r#"    def keyboard_input(
         return _execute_action(action)
 
 "#;
+const GET_APP_WINDOW_INFO_FUNCTION: &str = r#"    def get_app_window_info(field_list: List[str]) -> Dict[str, Any]:
+        """
+        Get information about the currently selected application window.
+        :param field_list: List of fields to retrieve from the window info.
+        :return: Dictionary containing the requested window information.
+        """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
+        if not ui_state.selected_app_window:
+            raise ToolError("No window is selected， please select a window first.")
+
+        window_info = ui_state.control_inspector.get_control_info(
+            ui_state.selected_app_window, field_list=field_list
+        )
+
+        return window_info
+
+"#;
 const GET_APP_WINDOW_CONTROLS_INFO_FUNCTION: &str = r#"    def get_app_window_controls_info(field_list: List[str]) -> List:
         """
         Get information about controls in the currently selected application window.
         :param field_list: List of fields to retrieve from the control info.
         :return: Dictionary containing the requested control information.
         """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
         if not ui_state.selected_app_window:
             raise ToolError("No window is selected， please select a window first.")
 
@@ -411,6 +550,7 @@ const GET_APP_WINDOW_CONTROLS_TARGET_INFO_FUNCTION: &str = r#"    def get_app_wi
         :param field_list: List of fields to retrieve from the control info.
         :return: Dictionary containing the requested control information.
         """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
         if not ui_state.selected_app_window:
             raise ToolError("No window is selected， please select a window first.")
 
@@ -442,6 +582,7 @@ const CAPTURE_WINDOW_SCREENSHOT_FUNCTION: &str = r#"    def capture_window_scree
         Capture a screenshot of the currently selected application window.
         :return: Base64 encoded image data of the screenshot.
         """
+        _ufoagent_sync_selected_window_to_foreground(ui_state)
         if not ui_state.selected_app_window:
             return "Error: No window selected"
 
@@ -699,6 +840,45 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
             );
         };
         patched = next;
+        changed = true;
+    }
+
+    if !patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        patched.insert_str(logger_end, FOREGROUND_WINDOW_AWARENESS_HELPERS);
+        for (function_name, replacement) in [
+            ("_execute_action", EXECUTE_ACTION_FUNCTION),
+            ("click_input", CLICK_INPUT_FUNCTION),
+            ("keyboard_input", KEYBOARD_INPUT_FUNCTION),
+            ("get_app_window_info", GET_APP_WINDOW_INFO_FUNCTION),
+            (
+                "get_app_window_controls_info",
+                GET_APP_WINDOW_CONTROLS_INFO_FUNCTION,
+            ),
+            (
+                "get_app_window_controls_target_info",
+                GET_APP_WINDOW_CONTROLS_TARGET_INFO_FUNCTION,
+            ),
+            (
+                "capture_window_screenshot",
+                CAPTURE_WINDOW_SCREENSHOT_FUNCTION,
+            ),
+        ] {
+            let Some(next) = replace_python_function(&patched, "    ", function_name, replacement)
+            else {
+                anyhow::bail!(
+                    "could not find {function_name} in UFO file {}",
+                    path.display()
+                );
+            };
+            patched = next;
+        }
         changed = true;
     }
 
@@ -1004,6 +1184,9 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
 
 @MCPRegistry.register_factory_decorator("UICollector")
 def create_data_mcp_server(*args, **kwargs) -> FastMCP:
+    def get_app_window_info(field_list: List[str]) -> Dict[str, Any]:
+        return {}
+
     def get_app_window_controls_info(field_list: List[str]) -> List:
         controls_list = ui_state.control_inspector.find_control_elements_in_descendants(ui_state.selected_app_window)
         control_dict = {str(i + 1): control for i, control in enumerate(controls_list)}
@@ -1024,17 +1207,24 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(GUI_ACTIONS_MARKER));
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
+        assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
         assert!(patched.contains("window.maximize()"));
         assert!(patched.contains("text: Annotated["));
         assert!(patched.contains("actual_keys = keys if keys is not None else (text or \"\")"));
         assert!(patched.contains("literal_text = keys is None and text is not None"));
         assert!(patched.contains("if target is None:"));
         assert!(patched.contains("_ufoagent_keyboard_input_to_foreground"));
+        assert!(patched.contains("_ufoagent_sync_selected_window_to_foreground"));
+        assert!(patched.contains("Desktop(backend=backend).active()"));
         assert!(patched.contains("pyperclip.copy(keys)"));
         assert!(patched.contains("send_keys(\"^v\""));
+        assert!(patched.contains("UIAElementInfo(handle_or_elem=window.handle)"));
         assert!(patched.contains("_ufoagent_current_controls(ui_state)"));
         assert_eq!(patched.matches("def select_application_window(").count(), 1);
-        assert_eq!(patched.matches(") -> Dict[str, Any]:").count(), 1);
+        assert_eq!(patched.matches(") -> Dict[str, Any]:").count(), 2);
+        assert!(
+            patched.contains("def get_app_window_info(field_list: List[str]) -> Dict[str, Any]:")
+        );
         assert!(!patched.contains("window.set_focus()\n        return {\"window_info\""));
         assert!(patched.contains("name: Annotated[\n            Optional[str],"));
         assert!(patched.contains("def capture_window_screenshot() -> str:"));
@@ -1069,6 +1259,17 @@ def _ufoagent_restore_window_for_actions(window: Optional[UIAWrapper]) -> None:
 
 @MCPRegistry.register_factory_decorator("AppUIExecutor")
 def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
+    def _execute_action(action: ActionCommandInfo) -> str:
+        return "ok"
+
+    def click_input(
+        id: Annotated[str, Field(description="id")],
+        name: Annotated[str, Field(description="name")],
+        button: Annotated[str, Field(description="button")] = "left",
+        double: Annotated[bool, Field(description="double")] = False,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
     def keyboard_input(
         id: Annotated[str, Field(description="id")],
         name: Annotated[str, Field(description="name")],
@@ -1078,6 +1279,20 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         return _execute_action(action)
 
     return action_mcp
+
+@MCPRegistry.register_factory_decorator("UICollector")
+def create_data_mcp_server(*args, **kwargs) -> FastMCP:
+    def get_app_window_info(field_list: List[str]) -> Dict[str, Any]:
+        return {}
+
+    def get_app_window_controls_info(field_list: List[str]) -> List:
+        return []
+
+    def get_app_window_controls_target_info(field_list: List[str]) -> List:
+        return []
+
+    def capture_window_screenshot() -> str:
+        return ""
 "#,
         )
         .unwrap();
@@ -1086,9 +1301,11 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(GUI_ACTIONS_MARKER));
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
+        assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
         assert!(patched.contains("literal_text = keys is None and text is not None"));
         assert!(patched.contains("if target is None:"));
         assert!(patched.contains("pyperclip.copy(keys)"));
+        assert!(patched.contains("_ufoagent_sync_selected_window_to_foreground(ui_state)"));
         assert!(patched.contains("return _ufoagent_keyboard_input_to_foreground("));
         assert!(!patch_ui_action_primitives(&ui).unwrap());
 

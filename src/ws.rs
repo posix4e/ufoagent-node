@@ -20,7 +20,8 @@ use crate::controlplane::{ControlPlane, USER_AGENT};
 use crate::{agent, repair, runtime, store};
 
 /// Max time we wait for the login-session executor to finish a run_task before reporting a timeout.
-const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(600);
+const RUN_TASK_TIMEOUT_SECS: u64 = 2400;
+const RUN_TASK_TIMEOUT: Duration = Duration::from_secs(RUN_TASK_TIMEOUT_SECS);
 /// Screenshots are a quick GDI grab + PNG encode in the login session.
 const SCREENSHOT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Result strings are unbounded TEXT on the control plane; keep WS frames sane.
@@ -332,7 +333,10 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => finish(
                 &state,
                 "failed",
-                "task timed out after 10 minutes".to_string(),
+                format!(
+                    "task timed out after {} minutes",
+                    RUN_TASK_TIMEOUT_SECS / 60
+                ),
             ),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 finish(&state, "failed", "task worker stopped".to_string());
