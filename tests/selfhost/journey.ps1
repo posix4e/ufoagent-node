@@ -470,11 +470,33 @@ function Close-ActivityDialog($dlg) {
   } catch {}
 }
 
+function Add-SharedTextLine([string]$Path, [string]$Line) {
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes($Line + [Environment]::NewLine)
+  $last = $null
+  for ($i = 0; $i -lt 50; $i++) {
+    try {
+      $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write, [System.IO.FileShare]::ReadWrite)
+      try {
+        $fs.Write($bytes, 0, $bytes.Length)
+        return $true
+      } finally {
+        $fs.Dispose()
+      }
+    } catch [System.IO.IOException] {
+      $last = $_.Exception.Message
+      Start-Sleep -Milliseconds 100
+    }
+  }
+  Write-Host "progress write skipped after retries: $last"
+  $false
+}
+
 function Write-ProgressEvent([string]$kind, [string]$phase = '', [string]$detail = '') {
   $obj = [ordered]@{ ts = (Now); event = $kind }
   if ($phase) { $obj.phase = $phase }
   if ($detail) { $obj.detail = $detail }
-  ([pscustomobject]$obj | ConvertTo-Json -Compress) | Add-Content (Join-Path $OUT 'progress.ndjson') -Encoding Ascii
+  $line = ([pscustomobject]$obj | ConvertTo-Json -Compress)
+  [void](Add-SharedTextLine (Join-Path $OUT 'progress.ndjson') $line)
 }
 
 function Write-Result($status) {

@@ -67,9 +67,14 @@ emit_progress(){
   fi
 }
 
+read_guest_file(){
+  local path="$1"
+  SSH "\$p='$path'; if(Test-Path \$p){ \$fs=[IO.File]::Open(\$p,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite); try { \$sr=New-Object IO.StreamReader(\$fs); \$sr.ReadToEnd() } finally { if(\$sr){ \$sr.Dispose() } else { \$fs.Dispose() } } }"
+}
+
 report_progress(){
   local tmp="$WORK/progress.tmp" total line
-  SSH 'if(Test-Path C:\e2e\out\progress.ndjson){Get-Content C:\e2e\out\progress.ndjson}' > "$tmp" 2>/dev/null || true
+  read_guest_file 'C:\e2e\out\progress.ndjson' > "$tmp" 2>/dev/null || true
   [ -s "$tmp" ] || return 0
   tr -d '\r' < "$tmp" > "$PROGRESS"
   total=$(wc -l < "$PROGRESS" | tr -d ' ')
@@ -153,7 +158,9 @@ echo "=== poll result (<=75m) ==="
 status="PENDING"; d=$(( $(date +%s) + 75*60 ))
 while [ "$(date +%s)" -lt "$d" ]; do
   report_progress || true
-  status=$(SSH 'if(Test-Path C:\e2e\out\result.json){(Get-Content C:\e2e\out\result.json -Raw | ConvertFrom-Json).status}else{"PENDING"}' 2>/dev/null | tr -dc 'A-Za-z')
+  result_json=$(read_guest_file 'C:\e2e\out\result.json' 2>/dev/null || true)
+  status=$(printf '%s' "$result_json" | tr -d '\r\n' | sed -n 's/.*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+  [ -n "$status" ] || status="PENDING"
   echo "  $(date +%T) status=$status"
   case "$status" in PASS|FAIL) break;; esac
   sleep 10
@@ -161,10 +168,10 @@ done
 report_progress || true
 
 echo "=== collect ==="
-SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
-SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
-SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
-SSH 'Get-Content C:\e2e\out\progress.ndjson -Raw' > "$PROGRESS" 2>/dev/null || true
+read_guest_file 'C:\e2e\out\result.json' > "$WORK/result.json" 2>/dev/null || true
+read_guest_file 'C:\e2e\out\phases.json' > "$WORK/phases.json" 2>/dev/null || true
+read_guest_file 'C:\e2e\out\journey.log' > "$WORK/journey.log" 2>/dev/null || true
+read_guest_file 'C:\e2e\out\progress.ndjson' > "$PROGRESS" 2>/dev/null || true
 # UFO trajectories and real captured dashboard stills (binary -> SCP, not Get-Content).
 SCP -r "$GUSER@$IP:C:/e2e/out/ufo" "$WORK/ufo" 2>/dev/null || true
 SCP "$GUSER@$IP:C:/e2e/out/node-desktop.png" "$WORK/gifs/node-desktop.png" 2>/dev/null || true
