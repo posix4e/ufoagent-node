@@ -178,6 +178,12 @@ function Assert-ManagedUfoConfig {
   if ($appPyRaw -match 'sensitive_step_asker\(action, control_text\)') {
     throw 'UFO AppAgent confirmation handler still prompts interactively'
   }
+  $ui = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\ui_mcp_server.py'
+  if (-not (Test-Path $ui)) { throw "UFO UI MCP server missing: $ui" }
+  $uiRaw = Get-Content $ui -Raw
+  if ($uiRaw -notmatch 'Managed by ufoagent: allow focused-app keyboard input') {
+    throw 'UFO AppAgent keyboard input patch is missing'
+  }
   $shell = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'
   if (-not (Test-Path $shell)) { throw "UFO shell client missing: $shell" }
   $shellRaw = Get-Content $shell -Raw
@@ -205,7 +211,7 @@ function Assert-ManagedUfoConfig {
       throw "UFO runtime remediation prompt patch is missing: $prompt"
     }
   }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, unattended confirmation, permissive shell patches, remediation prompt'
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, unattended confirmation, keyboard input fallback, permissive shell patches, remediation prompt'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -427,21 +433,6 @@ function Test-UfoTranscriptTyped([string]$id, [string]$want) {
   if (-not (Test-Path $path)) { return $false }
   $raw = Get-Content $path -Raw -ErrorAction SilentlyContinue
   [bool]($raw -and $raw.Contains($want) -and $raw.Contains('set_edit_text') -and $raw.Contains('SUCCESS'))
-}
-
-function Assert-AgentUsedGeneralRunShell([string]$id, [string]$context) {
-  if (-not $id) { throw "$context has no command id for transcript verification" }
-  $path = "C:\ProgramData\UFOAgent\tasks\logs\$id.txt"
-  if (-not (Test-Path $path)) { throw "$context transcript missing: $path" }
-  $raw = Get-Content $path -Raw -ErrorAction Stop
-  if ($raw -notmatch '(?i)run_shell') {
-    throw "$context transcript did not show UFO using run_shell"
-  }
-  if ($raw -match '(?i)ufoagent-launch') {
-    throw "$context transcript still used the removed ufoagent-launch path"
-  }
-  $count = ([regex]::Matches($raw, '(?i)run_shell')).Count
-  Write-ProgressEvent 'phase_update' 'thirdparty' "transcript used general run_shell ($count mentions)"
 }
 
 function Open-TrayActivitySummary {
@@ -668,7 +659,7 @@ Phase 'thirdparty' {
   $thirdPartyPrompt = @"
 Install Brave Browser. Then use Brave Browser to download and install the latest Windows Bambu Studio for Windows.
 
-Use the desktop normally. Use available shell tools when that is the most direct way to download, install, configure, or verify software. If a launch fails because a required runtime, library, driver, system capability, or executable is missing, diagnose the visible error, resolve the missing capability with available tools, retry the launch, and continue only after the app runs without the error.
+Use the desktop normally and prefer visible GUI interactions: use an installed browser if one is available to download Brave Browser, launch Brave Browser after it is installed, then use Brave Browser to find, download, and run the Windows Bambu Studio installer. Follow installer windows and Windows prompts through completion. If a launch fails because a required runtime, library, driver, system capability, or executable is missing, diagnose the visible error, resolve the missing capability with available tools or installer UI, retry the launch, and continue only after the app runs without the error.
 
 Finish only after Brave Browser is installed, Bambu Studio is installed, and Bambu Studio is running in a normal usable window with no error dialog visible.
 "@
@@ -694,7 +685,6 @@ Finish only after Brave Browser is installed, Bambu Studio is installed, and Bam
   }
   Write-CommandResultProgress 'thirdparty' $final
   Export-UfoTrajectory 'thirdparty' $script:thirdPartyId $thirdPartyPrompt
-  Assert-AgentUsedGeneralRunShell $script:thirdPartyId 'third-party run_task'
 
   $brave = Get-BraveExe
   if (-not $brave) { throw 'third-party run_task finished but Brave Browser was not installed' }

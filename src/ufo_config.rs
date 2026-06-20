@@ -166,6 +166,103 @@ const MANAGED_CLI_RUN_SHELL_BLOCK: &str = r#"    @cli_mcp.tool()
         except Exception as e:
             raise ToolError(f"Command execution failed: {str(e)}")
 "#;
+const MANAGED_UI_KEYBOARD_INPUT_MARKER: &str =
+    "Managed by ufoagent: allow focused-app keyboard input.";
+const UI_KEYBOARD_INPUT_START: &str =
+    "    @action_mcp.tool(tags={\"AppAgent\"}, exclude_args=[])\n    def keyboard_input(";
+const MANAGED_UI_KEYBOARD_INPUT_BLOCK: &str = r#"    @action_mcp.tool(tags={"AppAgent"}, exclude_args=[])
+    def keyboard_input(
+        keys: Annotated[
+            str,
+            Field(
+                description="Key sequence to send. It can be any key on the keyboard, with special keys represented by their virtual key codes, for example, '{VK_CONTROL}c' for Ctrl+C."
+            ),
+        ],
+        id: Annotated[
+            Optional[str],
+            Field(
+                description="Optional annotated ID of the selected control item. Managed by ufoagent: omit this to send keys to the focused application window."
+            ),
+        ] = None,
+        name: Annotated[
+            Optional[str],
+            Field(
+                description="Optional name of the selected control item. Managed by ufoagent: when id is provided without name, the name is resolved from the current control list."
+            ),
+        ] = None,
+        control_focus: Annotated[
+            bool,
+            Field(
+                description="Whether to focus the selected control id before sending keys. If False, the hotkeys will operate on the application window."
+            ),
+        ] = True,
+    ) -> Annotated[
+        str, Field(description="The key of the control item to send keyboard input to.")
+    ]:
+        """
+        Managed by ufoagent: allow focused-app keyboard input.
+        Simulate keyboard input to a control or the focused application.
+        """
+        normalized_keys = {
+            "enter": "{ENTER}",
+            "return": "{ENTER}",
+            "tab": "{TAB}",
+            "escape": "{ESC}",
+            "esc": "{ESC}",
+            "space": "{SPACE}",
+            "backspace": "{BACKSPACE}",
+            "delete": "{DELETE}",
+        }
+        if isinstance(keys, str):
+            keys = normalized_keys.get(keys.strip().lower(), keys)
+
+        target = None
+        warning = None
+
+        if id:
+            if not ui_state.control_dict:
+                raise ToolError(
+                    "No controls available. Please refresh the application state before targeting a control."
+                )
+            control = ui_state.control_dict.get(id)
+            if not control:
+                raise ToolError(
+                    f"Control with id '{id}' not found. Available control ids: {list(ui_state.control_dict.keys())}"
+                )
+            true_name = control.element_info.name if hasattr(control, "element_info") else ""
+            if name is None:
+                name = true_name
+            elif true_name != name:
+                warning = f"Warning: The name of your chosen control id {id} is {true_name}, but the name argument is {name}. The action is performed on control {id}:{true_name}."
+            target = TargetInfo(id=id, name=name or "", kind="control")
+        elif name and ui_state.control_dict:
+            matches = [
+                (control_id, control)
+                for control_id, control in ui_state.control_dict.items()
+                if hasattr(control, "element_info")
+                and control.element_info.name == name
+            ]
+            if len(matches) == 1:
+                id, control = matches[0]
+                target = TargetInfo(id=id, name=name, kind="control")
+            else:
+                control_focus = False
+        else:
+            control_focus = False
+
+        action = ActionCommandInfo(
+            function="keyboard_input",
+            arguments={"keys": keys, "control_focus": control_focus},
+            target=target,
+        )
+
+        result = _execute_action(action)
+
+        if warning:
+            return f"{warning} {result}"
+        return result
+
+"#;
 const MANAGED_RUNTIME_REMEDIATION_MARKER: &str =
     "Managed by ufoagent: generic runtime remediation.";
 const MANAGED_RUNTIME_REMEDIATION_LINE: &str = "  - Managed by ufoagent: generic runtime remediation. If an action fails because a required runtime, library, driver, system capability, or executable is missing, diagnose the visible error, use available tools to install or configure the missing component or a software fallback, retry the original action, and verify the application runs without the error before finishing. When using shell tools or package managers, use noninteractive flags when available and treat non-zero exit codes, prompts, or error output as failures to resolve before continuing.";
@@ -388,6 +485,42 @@ fn replace_cli_run_shell_block(original: &str, replacement: &str) -> Option<Stri
     Some(patched)
 }
 
+fn patch_ui_keyboard_input(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO UI MCP server {}", path.display()))?;
+    if original.contains(MANAGED_UI_KEYBOARD_INPUT_MARKER) {
+        return Ok(false);
+    }
+    let Some(patched) = replace_ui_keyboard_input_block(&original, MANAGED_UI_KEYBOARD_INPUT_BLOCK)
+    else {
+        anyhow::bail!(
+            "could not find AppUIExecutor keyboard_input block in UFO file {}",
+            path.display()
+        );
+    };
+    if patched == original {
+        return Ok(false);
+    }
+    std::fs::write(path, patched)
+        .with_context(|| format!("writing managed UFO UI keyboard patch {}", path.display()))?;
+    Ok(true)
+}
+
+fn replace_ui_keyboard_input_block(original: &str, replacement: &str) -> Option<String> {
+    let start = original.find(UI_KEYBOARD_INPUT_START)?;
+    let rest_after_start = &original[start + UI_KEYBOARD_INPUT_START.len()..];
+    let end = if let Some(next_tool) = rest_after_start.find("\n    @action_mcp.tool(") {
+        start + UI_KEYBOARD_INPUT_START.len() + next_tool
+    } else {
+        start + original[start..].find("\n    return action_mcp")?
+    };
+    let mut patched = String::with_capacity(original.len() - (end - start) + replacement.len());
+    patched.push_str(&original[..start]);
+    patched.push_str(replacement);
+    patched.push_str(&original[end..]);
+    Some(patched)
+}
+
 fn patch_runtime_remediation_prompt(path: &Path, heading: &str) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO prompt {}", path.display()))?;
@@ -437,6 +570,12 @@ fn apply_managed_ufo_source_patches(ufo_home: &Path) -> Result<()> {
         .fold(ufo_home.to_path_buf(), |p, c| p.join(c));
     if cli.exists() {
         patch_cli_command_executor(&cli)?;
+    }
+    let ui = ["ufo", "client", "mcp", "local_servers", "ui_mcp_server.py"]
+        .iter()
+        .fold(ufo_home.to_path_buf(), |p, c| p.join(c));
+    if ui.exists() {
+        patch_ui_keyboard_input(&ui)?;
     }
     for (rel, heading) in [
         (
@@ -635,6 +774,12 @@ mod tests {
             .join("app_apis")
             .join("shell")
             .join("shell_client.py");
+        let ui = home
+            .join("ufo")
+            .join("client")
+            .join("mcp")
+            .join("local_servers")
+            .join("ui_mcp_server.py");
         let cli = home
             .join("ufo")
             .join("client")
@@ -655,6 +800,7 @@ mod tests {
             .join("app_agent.yaml");
         std::fs::create_dir_all(host.parent().unwrap()).unwrap();
         std::fs::create_dir_all(shell.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(ui.parent().unwrap()).unwrap();
         std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
         std::fs::create_dir_all(host_prompt.parent().unwrap()).unwrap();
         std::fs::write(
@@ -687,6 +833,66 @@ def _validate_command_paths(command_str: str, base_directory: str) -> Optional[s
 
 class ShellReceiver:
     pass
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &ui,
+            r#"from typing import Annotated, Optional
+from pydantic import Field
+
+def create_app_action_mcp_server(*args, **kwargs):
+    action_mcp = FastMCP("UFO UI AppAgent Action MCP Server")
+
+    @action_mcp.tool(tags={"AppAgent"}, exclude_args=[])
+    def set_edit_text(id, name, text, clear_current_text=False):
+        pass
+
+    @action_mcp.tool(tags={"AppAgent"}, exclude_args=[])
+    def keyboard_input(
+        id: Annotated[
+            str,
+            Field(
+                description="The precise annotated ID of the selected control item to send keyboard input to, adhering strictly to the provided options in the field of 'id' in the control information."
+            ),
+        ],
+        name: Annotated[
+            str,
+            Field(
+                description="The precise name of the selected control item to send keyboard input to, adhering strictly to the provided options in the field of 'name' in the control information."
+            ),
+        ],
+        keys: Annotated[
+            str,
+            Field(
+                description="Key sequence to send. It can be any key on the keyboard, with special keys represented by their virtual key codes, for example, '{VK_CONTROL}c' for Ctrl+C."
+            ),
+        ],
+        control_focus: Annotated[
+            bool,
+            Field(
+                description="Whether to focus the selected control id before sending keys. If False, the hotkeys will operate on the application window."
+            ),
+        ] = True,
+    ) -> Annotated[
+        str, Field(description="The key of the control item to send keyboard input to.")
+    ]:
+        """
+        Simulate keyboard input to a control or the focused application, such as sending key presses or shortcuts.
+        """
+        action = ActionCommandInfo(
+            function="keyboard_input",
+            arguments={"keys": keys, "control_focus": control_focus},
+            target=TargetInfo(id=id, name=name, kind="control"),
+        )
+
+        return _execute_action(action)
+
+    @action_mcp.tool(tags={"AppAgent"}, exclude_args=[])
+    def wheel_mouse_input(id, name, wheel_dist):
+        pass
+
+    return action_mcp
 "#,
         )
         .unwrap();
@@ -790,6 +996,15 @@ def create_cli_mcp_server(*args, **kwargs):
         assert!(!cli_patched.contains("subprocess.run("));
         assert!(!cli_patched.contains("[\"cmd.exe\", \"/d\", \"/s\", \"/c\", bash_command]"));
         assert!(!cli_patched.contains("subprocess.Popen(args, shell=False)"));
+        let ui_patched = std::fs::read_to_string(&ui).unwrap();
+        assert!(ui_patched.contains(MANAGED_UI_KEYBOARD_INPUT_MARKER));
+        assert!(ui_patched.contains("keys: Annotated["));
+        assert!(ui_patched.contains("id: Annotated["));
+        assert!(ui_patched.contains("Optional[str]"));
+        assert!(ui_patched.contains("\"enter\": \"{ENTER}\""));
+        assert!(ui_patched.contains("control_focus = False"));
+        assert!(ui_patched.contains("target=target"));
+        assert!(!ui_patched.contains("target=TargetInfo(id=id, name=name, kind=\"control\")"));
         for path in [&host_prompt, &app_prompt] {
             let prompt = std::fs::read_to_string(path).unwrap();
             assert!(prompt.contains(MANAGED_RUNTIME_REMEDIATION_MARKER));
@@ -817,6 +1032,11 @@ def create_cli_mcp_server(*args, **kwargs):
         let cli_patched = std::fs::read_to_string(&cli).unwrap();
         assert_eq!(cli_patched.matches(MANAGED_CLI_COMMAND_MARKER).count(), 1);
         assert_eq!(cli_patched.matches(MANAGED_CLI_RUN_SHELL_MARKER).count(), 1);
+        let ui_patched = std::fs::read_to_string(&ui).unwrap();
+        assert_eq!(
+            ui_patched.matches(MANAGED_UI_KEYBOARD_INPUT_MARKER).count(),
+            1
+        );
         for path in [&host_prompt, &app_prompt] {
             let prompt = std::fs::read_to_string(path).unwrap();
             assert_eq!(
