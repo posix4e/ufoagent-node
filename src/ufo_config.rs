@@ -455,8 +455,13 @@ fn replace_python_function(
     let mut end = rest.len();
     let mut offset = 0;
     let body_indent = format!("{indent}    ");
+    let mut in_signature = true;
     for line in rest.split_inclusive('\n') {
-        if offset > 0 {
+        if in_signature {
+            if line.trim_end().ends_with(':') {
+                in_signature = false;
+            }
+        } else if offset > 0 {
             let trimmed = line.trim();
             if !trimmed.is_empty() && !line.starts_with(&body_indent) {
                 end = offset;
@@ -828,6 +833,9 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains("text: Annotated["));
         assert!(patched.contains("actual_keys = keys if keys is not None else (text or \"\")"));
         assert!(patched.contains("_ufoagent_current_controls(ui_state)"));
+        assert_eq!(patched.matches("def select_application_window(").count(), 1);
+        assert_eq!(patched.matches(") -> Dict[str, Any]:").count(), 1);
+        assert!(!patched.contains("window.set_focus()\n        return {\"window_info\""));
         assert!(patched.contains("name: Annotated[\n            Optional[str],"));
         assert!(patched.contains("def capture_window_screenshot() -> str:"));
         assert!(patched.contains("App window screenshot too small, treating as invalid"));
