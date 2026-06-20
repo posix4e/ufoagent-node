@@ -319,13 +319,23 @@ fn install_vc_redist(_scratch_dir: &Path) -> Result<()> {
 }
 
 /// The real readiness verdict: pip succeeding isn't enough — UFO2's GUI stack must actually import
-/// (this is where the win32ui/MFC failure surfaces). If these imports fail the env is NOT ready, so
-/// bootstrap returns Err and the marker becomes `broken` (with the failing line) rather than a
-/// "ready" chip whose tasks crash. Returns the concise failure line for the marker detail.
+/// and its native MCP servers must register. If these fail the env is NOT ready, so bootstrap returns
+/// Err and the marker becomes `broken` rather than a "ready" chip whose tasks crash.
 fn verify_ufo_imports(vpy: &Path) -> Result<()> {
-    info!("verifying UFO2 imports (win32ui, pywinauto)…");
+    info!("verifying UFO2 imports and MCP registry (win32ui, pywinauto)…");
     let out = Command::new(vpy)
-        .args(["-c", "import win32ui, pywinauto"])
+        .args([
+            "-c",
+            r#"import win32ui, pywinauto
+import ufo.client.mcp.local_servers.ui_mcp_server
+import ufo.client.mcp.local_servers.cli_mcp_server
+from ufo.client.mcp.mcp_registry import MCPRegistry
+required = {"HostUIExecutor", "AppUIExecutor", "UICollector", "CommandLineExecutor"}
+registered = set(MCPRegistry.list())
+missing = sorted(required - registered)
+assert not missing, f"missing MCP server registrations: {missing}; registered={sorted(registered)}"
+"#,
+        ])
         .output()
         .with_context(|| "running UFO2 import check")?;
     if out.status.success() {
@@ -391,6 +401,30 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
     phase("configuring UFO2 unattended mode");
     ufo_config::apply_unattended_mode(&home)?;
 
+    let vpy = venv_python(&home);
+    if vpy.exists() {
+        let mut cfg = Config::load();
+        cfg.ufo_home = Some(home.to_string_lossy().to_string());
+        cfg.python = Some(vpy.to_string_lossy().to_string());
+        cfg.save()?;
+
+        phase("using provisioned UFO2 snapshot");
+        phase("verifying UFO2 imports");
+        match verify_ufo_imports(&vpy) {
+            Ok(()) => {
+                info!(
+                    "UFO2 already provisioned: ufo_home={} python={}",
+                    home.display(),
+                    vpy.display()
+                );
+                return Ok((home, vpy));
+            }
+            Err(e) => {
+                log::warn!("existing UFO2 install failed readiness check; repairing deps: {e:#}");
+            }
+        }
+    }
+
     let scratch = home
         .parent()
         .unwrap_or_else(|| Path::new("."))
@@ -405,7 +439,6 @@ fn bootstrap_inner(ufo_home: Option<String>, git_ref: &str) -> Result<(PathBuf, 
     #[cfg(not(windows))]
     let uv: Option<PathBuf> = None;
 
-    let vpy = venv_python(&home);
     if !vpy.exists() {
         phase("creating virtualenv");
         let base = base_python(&scratch)?;

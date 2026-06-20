@@ -4,11 +4,13 @@ name: ci
 # publish the exact installer to the rolling `beta` prerelease, then verify that beta on the headful
 # self-hosted Windows VM. Production stays on v* tags -> `latest` (release.yml).
 #
-# The full end-to-end installs and cold-provisions on a BARE Windows VM with auto-logon, then proves
+# The full end-to-end installs on a BARE Windows VM with auto-logon, then proves
 # run_task GUI automation, screenshot capture, dashboard preview, and the marketing screenshots. It runs
 # only for trusted main/manual events on a real headful VM. A GitHub runner can't represent a bare customer
 # box (it preinstalls VC++/MFC, Python, .NET) nor reboot into an auto-logon session, which is how the
-# win32ui/MFC + login-agent bugs shipped "green" here before.
+# win32ui/MFC + login-agent bugs shipped "green" here before. Manual/main runs default to the
+# provisioned VM snapshot so they still install the fresh node build and reapply managed UFO config, but
+# skip the large UFO2 dependency install. Use snapshot=cold for full first-principles provisioning.
 on:
   push:
     branches: [main]
@@ -19,6 +21,10 @@ on:
         description: "Override the beta installer URL for the self-hosted e2e (optional)"
         required: false
         default: ""
+      snapshot:
+        description: "Self-hosted VM snapshot to revert before e2e: provisioned (fast) or cold (full)"
+        required: false
+        default: "provisioned"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -114,6 +120,7 @@ jobs:
           CI_ADMIN_TOKEN: ${{ secrets.CI_ADMIN_TOKEN }}
           UFOAGENT_BETA_URL: ${{ github.event.inputs.beta_url || '' }}
           UFOAGENT_INSTALLER_PATH: ${{ github.workspace }}/selfhost-installer/ufoagent-setup.exe
+          SNAP: ${{ github.event.inputs.snapshot || 'provisioned' }}
         run: bash tests/selfhost/run-e2e.sh
 
       - name: Publish the marketing gifs to the screenshots branch

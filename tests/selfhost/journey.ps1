@@ -554,6 +554,11 @@ Phase 'install' {
   Assert-NativeUfoConfig
   Write-Host 'install + provision: UFO2 ready'
 }
+if ($env:UFOAGENT_E2E_STOP_AFTER_INSTALL -eq '1') {
+  Write-ProgressEvent 'journey_done' '' 'provisioned snapshot ready'
+  Write-Result 'PASS'
+  exit 0
+}
 
 # 2) TRAY - the installer launched the tray in this session; confirm it is alive.
 Phase 'tray' {

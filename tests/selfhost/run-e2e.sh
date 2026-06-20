@@ -1,11 +1,23 @@
 #!/usr/bin/env bash
-# Runs ON the self-hosted KVM host. The WHOLE self-hosted e2e, first-principles:
-#   revert the `cold` snapshot -> start the VM -> run the ONE in-guest journey in the interactive desktop
-#   session -> collect its result and UFO's own trajectories -> build website assets from UFO artifacts.
+# Runs ON the self-hosted KVM host. The normal path reverts the `provisioned` snapshot, installs the
+# freshly built UFOAgent node, reapplies managed UFO config, then runs the ONE in-guest journey in the
+# interactive desktop session. Set SNAP=cold for an occasional full cold UFO2 provisioning run.
+#
+# Create or refresh the fast snapshot with:
+#   CREATE_PROVISIONED_SNAPSHOT=1 UFOAGENT_INSTALLER_PATH=/path/to/ufoagent-setup.exe \
+#     bash tests/selfhost/run-e2e.sh
+# That reverts `cold`, installs/provisions UFO2 once, stops after install, powers down the VM, and
+# writes a fresh `provisioned` snapshot. Normal e2e runs then skip the torch/requirements install.
 # No Session-0/1 split and no external display recorder.
 # Run it from its own directory (journey.ps1 + harvest_ufo.py live alongside).
 set -uo pipefail
-VM=${VM:-ufo-ws2025-base}; SNAP=${SNAP:-cold}; PW=${VM_PW:-'Ufo!Spike2026'}; GUSER=${VM_USER:-ufoadmin}
+VM=${VM:-ufo-ws2025-base}; SNAP=${SNAP:-provisioned}; PW=${VM_PW:-'Ufo!Spike2026'}; GUSER=${VM_USER:-ufoadmin}
+BASE_SNAP=${BASE_SNAP:-cold}
+PROVISIONED_SNAP=${PROVISIONED_SNAP:-provisioned}
+CREATE_PROVISIONED_SNAPSHOT=${CREATE_PROVISIONED_SNAPSHOT:-0}
+if [ "$CREATE_PROVISIONED_SNAPSHOT" = "1" ]; then
+  SNAP="$BASE_SNAP"
+fi
 WORK=${WORK:-/mnt/ram/e2e}
 HERE="$(cd "$(dirname "$0")" && pwd)"
 IP=""
@@ -87,7 +99,13 @@ report_progress(){
 }
 
 echo "=== revert $SNAP + start $VM ==="
-sudo virsh snapshot-revert "$VM" "$SNAP" 2>&1 | tail -1 || true
+if ! sudo virsh snapshot-revert "$VM" "$SNAP"; then
+  echo "could not revert $VM to snapshot '$SNAP'"
+  if [ "$SNAP" = "$PROVISIONED_SNAP" ]; then
+    echo "create it with: CREATE_PROVISIONED_SNAPSHOT=1 UFOAGENT_INSTALLER_PATH=/path/to/ufoagent-setup.exe bash tests/selfhost/run-e2e.sh"
+  fi
+  exit 1
+fi
 sudo virsh start "$VM" 2>&1 | tail -1 || true
 for i in $(seq 1 60); do
   mac=$(sudo virsh domiflist "$VM" 2>/dev/null | awk '/default/{print $5}' | head -1)
@@ -127,7 +145,7 @@ fi
 # Stage tokens via base64: token values can contain chars that break naive quoting through
 # ssh -> powershell -> Set-Content (the first CI run crashed with a token parsed as a command). Each
 # value is base64 so env.ps1 holds no raw token chars, and the whole file is base64 for safe transport.
-if [ -n "${CI_AGENT_TOKEN:-}" ] || [ -n "${UFOAGENT_BETA_URL:-}" ] || [ "$staged_installer" = 1 ]; then
+if [ -n "${CI_AGENT_TOKEN:-}" ] || [ -n "${UFOAGENT_BETA_URL:-}" ] || [ "$staged_installer" = 1 ] || [ "$CREATE_PROVISIONED_SNAPSHOT" = "1" ]; then
   b64() { printf '%s' "${1:-}" | base64 -w0; }
   guest_installer=""
   [ "$staged_installer" = 1 ] && guest_installer='C:\e2e\dl\ufoagent-setup.exe'
@@ -135,7 +153,8 @@ if [ -n "${CI_AGENT_TOKEN:-}" ] || [ -n "${UFOAGENT_BETA_URL:-}" ] || [ "$staged
 \$env:CI_AGENT_ID=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${CI_AGENT_ID:-}")'))
 \$env:CI_ADMIN_TOKEN=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${CI_ADMIN_TOKEN:-}")'))
 \$env:UFOAGENT_BETA_URL=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "${UFOAGENT_BETA_URL:-}")'))
-\$env:UFOAGENT_INSTALLER_PATH=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "$guest_installer")'))"
+\$env:UFOAGENT_INSTALLER_PATH=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "$guest_installer")'))
+\$env:UFOAGENT_E2E_STOP_AFTER_INSTALL=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$(b64 "$CREATE_PROVISIONED_SNAPSHOT")'))"
   ENV_B64=$(printf '%s' "$ENV_PS1" | base64 -w0)
   SSH "[IO.File]::WriteAllText('C:\\e2e\\env.ps1',[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ENV_B64')))"
 fi
@@ -193,6 +212,33 @@ Get-WinEvent -FilterHashtable @{LogName="System"; ProviderName="Service Control 
   Select-Object TimeCreated, Id, LevelDisplayName, @{n="Msg";e={($_.Message -split "`r?`n")[0]}} | Format-Table -AutoSize | Out-String -Width 200
 ' > "$WORK/service-errors.txt" 2>/dev/null || true
 echo "--- service-errors (head) ---"; head -50 "$WORK/service-errors.txt" 2>/dev/null
+
+if [ "$CREATE_PROVISIONED_SNAPSHOT" = "1" ]; then
+  if [ "$status" != "PASS" ]; then
+    echo "provisioned snapshot was not created because install/provision did not pass"
+    echo "SELFHOST-E2E: $status"
+    [ "$status" = "PASS" ]
+  fi
+  echo "=== create $PROVISIONED_SNAP snapshot ==="
+  SSH 'Stop-Process -Name ufoagent,notepad,msedge,brave,BambuStudio,Bambu_Studio -Force -ErrorAction SilentlyContinue; Remove-Item C:\e2e\out\* -Recurse -Force -ErrorAction SilentlyContinue; shutdown /s /t 0 /f' >/dev/null 2>&1 || true
+  for i in $(seq 1 60); do
+    state=$(sudo virsh domstate "$VM" 2>/dev/null || true)
+    if [ "$state" = "shut off" ]; then
+      break
+    fi
+    echo "  waiting for guest shutdown (state=${state:-unknown})"
+    sleep 5
+  done
+  state=$(sudo virsh domstate "$VM" 2>/dev/null || true)
+  [ "$state" = "shut off" ] || { echo "guest did not shut down cleanly; state=$state"; exit 1; }
+  if sudo virsh snapshot-list "$VM" --name | grep -Fxq "$PROVISIONED_SNAP"; then
+    sudo virsh snapshot-delete "$VM" "$PROVISIONED_SNAP"
+  fi
+  sudo virsh snapshot-create-as "$VM" "$PROVISIONED_SNAP" "UFO2 provisioned; e2e fast path reapplies fresh node config"
+  echo "created snapshot $PROVISIONED_SNAP from $BASE_SNAP"
+  echo "SELFHOST-E2E: PASS"
+  exit 0
+fi
 
 if [ "$status" = "PASS" ]; then
   echo "=== build UFO marketing assets ==="
