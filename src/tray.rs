@@ -12,7 +12,15 @@ pub fn run(_version: &str) -> Result<()> {
 pub fn execute_remote(
     req: &crate::runtime::RemoteTaskRequest,
     _progress: crate::runtime::ProgressCallback,
+    abort: crate::runtime::AbortSignal,
 ) -> crate::runtime::RemoteTaskResult {
+    if abort.load(std::sync::atomic::Ordering::Relaxed) {
+        return crate::runtime::RemoteTaskResult {
+            id: req.id.clone(),
+            status: "halted".into(),
+            result: "halted before GUI task launch".into(),
+        };
+    }
     crate::runtime::RemoteTaskResult {
         id: req.id.clone(),
         status: "failed".into(),
@@ -34,8 +42,9 @@ pub fn run(version: &str) -> Result<()> {
 pub fn execute_remote(
     req: &crate::runtime::RemoteTaskRequest,
     progress: crate::runtime::ProgressCallback,
+    abort: crate::runtime::AbortSignal,
 ) -> crate::runtime::RemoteTaskResult {
-    imp::run_one(req, progress)
+    imp::run_one(req, progress, abort)
 }
 
 #[cfg(windows)]
@@ -48,6 +57,7 @@ mod imp {
     use anyhow::Result;
     use std::io::BufRead;
     use std::process::Stdio;
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tao::event::Event;
@@ -198,6 +208,7 @@ mod imp {
     pub(super) fn run_one(
         req: &runtime::RemoteTaskRequest,
         progress: runtime::ProgressCallback,
+        abort: runtime::AbortSignal,
     ) -> runtime::RemoteTaskResult {
         log::info!("tray: running task {} ({})", req.id, req.task);
         use std::os::windows::process::CommandExt;
@@ -266,13 +277,34 @@ mod imp {
         }
         drop(reader_done_tx);
 
-        let status = match child.wait() {
-            Ok(s) => s,
-            Err(e) => {
-                return runtime::RemoteTaskResult {
-                    id: req.id.clone(),
-                    status: "failed".into(),
-                    result: format!("could not wait for UFO2: {e}"),
+        let mut halted = false;
+        let status = loop {
+            if abort.load(Ordering::Relaxed) {
+                halted = true;
+                if let Ok(mut t) = transcript.lock() {
+                    t.push_str("[ufoagent] halted by overseer\n");
+                }
+                let _ = child.kill();
+                match child.wait() {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        return runtime::RemoteTaskResult {
+                            id: req.id.clone(),
+                            status: "failed".into(),
+                            result: format!("could not wait for halted UFO2: {e}"),
+                        }
+                    }
+                }
+            }
+            match child.try_wait() {
+                Ok(Some(s)) => break s,
+                Ok(None) => std::thread::sleep(Duration::from_millis(200)),
+                Err(e) => {
+                    return runtime::RemoteTaskResult {
+                        id: req.id.clone(),
+                        status: "failed".into(),
+                        result: format!("could not wait for UFO2: {e}"),
+                    }
                 }
             }
         };
@@ -315,12 +347,18 @@ mod imp {
             .join("\n");
         runtime::RemoteTaskResult {
             id: req.id.clone(),
-            status: if status.success() {
+            status: if halted {
+                "halted".into()
+            } else if status.success() {
                 "done".into()
             } else {
                 "failed".into()
             },
-            result: if tail.is_empty() {
+            result: if halted && tail.is_empty() {
+                "halted by overseer".to_string()
+            } else if halted {
+                format!("halted by overseer\n{tail}")
+            } else if tail.is_empty() {
                 format!("exit {:?}", status.code())
             } else {
                 format!("exit {:?}\n{tail}", status.code())
