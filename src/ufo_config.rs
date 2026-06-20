@@ -50,6 +50,8 @@ const KEYBOARD_KEY_TOKENS_MARKER: &str =
     "Managed by ufoagent: treat keyboard_input text key tokens as keystrokes.";
 const COORDINATE_CLICK_FALLBACK_MARKER: &str =
     "Managed by ufoagent: click relative coordinates with a direct mouse fallback.";
+const CONTROL_DOUBLE_CLICK_DIRECT_MARKER: &str =
+    "Managed by ufoagent: double-click controls with direct mouse coordinates.";
 const FOREGROUND_WINDOW_AWARENESS_MARKER: &str =
     "Managed by ufoagent: keep AppAgent perception on the foreground top-level window.";
 const FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER: &str =
@@ -143,6 +145,119 @@ def _ufoagent_current_controls(ui_state: "UIServerState") -> Dict[str, UIAWrappe
         if _ufoagent_control_rect_usable(control, ui_state.selected_app_window)
     ]
     return {str(i + 1): control for i, control in enumerate(usable_controls)}
+
+
+# Managed by ufoagent: double-click controls with direct mouse coordinates.
+def _ufoagent_click_control_direct(
+    control: UIAWrapper,
+    window: Optional[UIAWrapper] = None,
+    button: str = "left",
+    double: bool = False,
+) -> str:
+    if not control:
+        raise ToolError("No control is selected to click.")
+
+    _ufoagent_restore_window_for_actions(window)
+    if not _ufoagent_control_rect_usable(control, window):
+        raise ToolError("Selected control has no usable on-screen rectangle.")
+
+    try:
+        control.set_focus()
+        time.sleep(0.05)
+    except Exception:
+        pass
+
+    rect = control.rectangle()
+    absolute_x = int(rect.left + (rect.width() / 2))
+    absolute_y = int(rect.top + (rect.height() / 2))
+    clicks = 2 if double else 1
+
+    try:
+        import pyautogui as _ufoagent_pyautogui
+
+        _ufoagent_pyautogui.FAILSAFE = False
+        _ufoagent_pyautogui.click(
+            absolute_x, absolute_y, clicks=clicks, interval=0.05, button=button
+        )
+        time.sleep(0.15)
+        return (
+            f"Directly clicked control at screen point ({absolute_x}, {absolute_y}) "
+            f"with {clicks} click(s)."
+        )
+    except Exception as pyautogui_error:
+        logger.warning(f"pyautogui control click failed: {pyautogui_error}")
+
+    try:
+        from pywinauto import mouse as _ufoagent_mouse
+
+        if double:
+            _ufoagent_mouse.double_click(button=button, coords=(absolute_x, absolute_y))
+        else:
+            _ufoagent_mouse.click(button=button, coords=(absolute_x, absolute_y))
+        time.sleep(0.15)
+        return (
+            f"Directly clicked control at screen point ({absolute_x}, {absolute_y}) "
+            f"with {clicks} click(s)."
+        )
+    except Exception as mouse_error:
+        raise ToolError(f"Direct control click failed: {mouse_error}")
+
+"#;
+const CONTROL_DOUBLE_CLICK_HELPERS: &str = r#"
+# Managed by ufoagent: double-click controls with direct mouse coordinates.
+def _ufoagent_click_control_direct(
+    control: UIAWrapper,
+    window: Optional[UIAWrapper] = None,
+    button: str = "left",
+    double: bool = False,
+) -> str:
+    if not control:
+        raise ToolError("No control is selected to click.")
+
+    _ufoagent_restore_window_for_actions(window)
+    if not _ufoagent_control_rect_usable(control, window):
+        raise ToolError("Selected control has no usable on-screen rectangle.")
+
+    try:
+        control.set_focus()
+        time.sleep(0.05)
+    except Exception:
+        pass
+
+    rect = control.rectangle()
+    absolute_x = int(rect.left + (rect.width() / 2))
+    absolute_y = int(rect.top + (rect.height() / 2))
+    clicks = 2 if double else 1
+
+    try:
+        import pyautogui as _ufoagent_pyautogui
+
+        _ufoagent_pyautogui.FAILSAFE = False
+        _ufoagent_pyautogui.click(
+            absolute_x, absolute_y, clicks=clicks, interval=0.05, button=button
+        )
+        time.sleep(0.15)
+        return (
+            f"Directly clicked control at screen point ({absolute_x}, {absolute_y}) "
+            f"with {clicks} click(s)."
+        )
+    except Exception as pyautogui_error:
+        logger.warning(f"pyautogui control click failed: {pyautogui_error}")
+
+    try:
+        from pywinauto import mouse as _ufoagent_mouse
+
+        if double:
+            _ufoagent_mouse.double_click(button=button, coords=(absolute_x, absolute_y))
+        else:
+            _ufoagent_mouse.click(button=button, coords=(absolute_x, absolute_y))
+        time.sleep(0.15)
+        return (
+            f"Directly clicked control at screen point ({absolute_x}, {absolute_y}) "
+            f"with {clicks} click(s)."
+        )
+    except Exception as mouse_error:
+        raise ToolError(f"Direct control click failed: {mouse_error}")
 
 "#;
 const COORDINATE_CLICK_HELPERS: &str = r#"
@@ -856,7 +971,19 @@ const CLICK_INPUT_FUNCTION: &str = r#"    def click_input(
             target=TargetInfo(id=id, name=action_name, kind="control"),
         )
 
-        result = _execute_action(action)
+        if double and selected:
+            try:
+                result = _ufoagent_click_control_direct(
+                    selected,
+                    ui_state.selected_app_window,
+                    button=button,
+                    double=double,
+                )
+            except Exception as direct_error:
+                logger.warning(f"Direct control double-click failed: {direct_error}")
+                result = _execute_action(action)
+        else:
+            result = _execute_action(action)
 
         if control_verified or name is None:
             return result
@@ -1367,6 +1494,31 @@ fn patch_ui_action_primitives(path: &Path) -> Result<bool> {
         changed = true;
     }
 
+    if !patched.contains(CONTROL_DOUBLE_CLICK_DIRECT_MARKER) {
+        let logger_line = "logger = logging.getLogger(__name__)\n";
+        let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
+            anyhow::bail!(
+                "could not find logger initialization in UFO file {}",
+                path.display()
+            );
+        };
+        if !patched.contains("def _ufoagent_click_control_direct(") {
+            patched.insert_str(logger_end, CONTROL_DOUBLE_CLICK_HELPERS);
+        } else {
+            patched.insert_str(
+                logger_end,
+                &format!("\n# {CONTROL_DOUBLE_CLICK_DIRECT_MARKER}\n"),
+            );
+        }
+        let Some(next) =
+            replace_python_function(&patched, "    ", "click_input", CLICK_INPUT_FUNCTION)
+        else {
+            anyhow::bail!("could not find click_input in UFO file {}", path.display());
+        };
+        patched = next;
+        changed = true;
+    }
+
     if !patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER) {
         let logger_line = "logger = logging.getLogger(__name__)\n";
         let Some(logger_end) = patched.find(logger_line).map(|idx| idx + logger_line.len()) else {
@@ -1759,6 +1911,7 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
         assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
         assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
+        assert!(patched.contains(CONTROL_DOUBLE_CLICK_DIRECT_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
         assert!(patched.contains("window.maximize()"));
@@ -1776,6 +1929,8 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains("pyperclip.copy(keys)"));
         assert!(patched.contains("send_keys(\"^v\""));
         assert!(patched.contains("_ufoagent_click_relative_coordinates("));
+        assert!(patched.contains("_ufoagent_click_control_direct("));
+        assert!(patched.contains("if double and selected:"));
         assert!(patched.contains("_ufoagent_pyautogui.click("));
         assert!(patched.contains("UIAElementInfo(handle_or_elem=window.handle)"));
         assert!(patched.contains("_ufoagent_current_controls(ui_state)"));
@@ -1870,6 +2025,7 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains(KEYBOARD_DIRECT_INPUT_MARKER));
         assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
         assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
+        assert!(patched.contains(CONTROL_DOUBLE_CLICK_DIRECT_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_AWARENESS_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
         assert!(patched.contains(
@@ -1878,6 +2034,8 @@ def create_data_mcp_server(*args, **kwargs) -> FastMCP:
         assert!(patched.contains("if target is None:"));
         assert!(patched.contains("pyperclip.copy(keys)"));
         assert!(patched.contains("_ufoagent_click_relative_coordinates("));
+        assert!(patched.contains("_ufoagent_click_control_direct("));
+        assert!(patched.contains("if double and selected:"));
         assert!(patched.contains("_ufoagent_sync_selected_window_to_foreground(ui_state)"));
         assert!(patched.contains("return _ufoagent_keyboard_input_to_foreground("));
         assert!(!patch_ui_action_primitives(&ui).unwrap());
@@ -1923,6 +2081,14 @@ def _ufoagent_window_is_foreground_candidate(window: Optional[UIAWrapper]) -> bo
 
 @MCPRegistry.register_factory_decorator("AppUIExecutor")
 def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
+    def click_input(
+        id: Annotated[str, Field(description="id")],
+        name: Annotated[str, Field(description="name")],
+        button: Annotated[str, Field(description="button")] = "left",
+        double: Annotated[bool, Field(description="double")] = False,
+    ) -> Annotated[str, Field(description="result")]:
+        return _execute_action(action)
+
     def click_on_coordinates(
         x: Annotated[float, Field(description="x")],
         y: Annotated[float, Field(description="y")],
@@ -1949,6 +2115,7 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         let patched = std::fs::read_to_string(&ui).unwrap();
         assert!(patched.contains(KEYBOARD_KEY_TOKENS_MARKER));
         assert!(patched.contains(COORDINATE_CLICK_FALLBACK_MARKER));
+        assert!(patched.contains(CONTROL_DOUBLE_CLICK_DIRECT_MARKER));
         assert!(patched.contains(FOREGROUND_WINDOW_CONSOLE_FILTER_MARKER));
         assert!(patched.contains("_ufoagent_normalize_key_sequence"));
         assert!(patched.contains(
@@ -1956,6 +2123,8 @@ def create_app_action_mcp_server(*args, **kwargs) -> FastMCP:
         ));
         assert!(patched.contains("_ufoagent_click_relative_coordinates("));
         assert!(patched.contains("_ufoagent_pyautogui.click("));
+        assert!(patched.contains("_ufoagent_click_control_direct("));
+        assert!(patched.contains("if double and selected:"));
         assert!(patched.contains("\"ConsoleWindowClass\""));
         assert!(!patched.contains("literal_text = keys is None and text is not None\n"));
         assert!(!patch_ui_action_primitives(&ui).unwrap());

@@ -188,13 +188,16 @@ function Assert-NativeUfoConfig {
   if ($uiRaw -notmatch 'Managed by ufoagent: click relative coordinates with a direct mouse fallback') {
     throw 'UFO UI coordinate-click fallback patch is missing'
   }
+  if ($uiRaw -notmatch 'Managed by ufoagent: double-click controls with direct mouse coordinates') {
+    throw 'UFO UI direct control double-click patch is missing'
+  }
   if ($uiRaw -notmatch 'Managed by ufoagent: keep AppAgent perception on the foreground top-level window') {
     throw 'UFO UI foreground-window awareness patch is missing'
   }
   if ($uiRaw -notmatch 'Managed by ufoagent: ignore console shells as foreground AppAgent targets') {
     throw 'UFO UI foreground console-filter patch is missing'
   }
-  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', '_ufoagent_text_contains_key_tokens', 'pyperclip.copy(keys)', '_ufoagent_click_relative_coordinates', '_ufoagent_pyautogui.click', '_ufoagent_sync_selected_window_to_foreground(ui_state)', 'Desktop(backend=backend).active()', 'ConsoleWindowClass')) {
+  foreach ($required in @('text: Annotated[', '_ufoagent_restore_window_for_actions(ui_state.selected_app_window)', 'window.maximize()', 'App window screenshot too small, treating as invalid', '_ufoagent_keyboard_input_to_foreground', '_ufoagent_text_contains_key_tokens', 'pyperclip.copy(keys)', '_ufoagent_click_relative_coordinates', '_ufoagent_click_control_direct', 'if double and selected:', '_ufoagent_pyautogui.click', '_ufoagent_sync_selected_window_to_foreground(ui_state)', 'Desktop(backend=backend).active()', 'ConsoleWindowClass')) {
     if ($uiRaw -notmatch [regex]::Escape($required)) {
       throw "UFO UI action primitive patch missing expected behavior: $required"
     }
