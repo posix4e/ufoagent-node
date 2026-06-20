@@ -246,7 +246,7 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
             .and_then(|a| a.get("request"))
             .and_then(Value::as_str)
             .map(str::to_string);
-        spawn_run_task(state.clone(), id, task, request);
+        spawn_run_task(state.clone(), id, task, request, cfg.control_plane_url());
         return Ok(());
     }
 
@@ -288,7 +288,13 @@ fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {
 
 /// Hand a run_task to the login-session executor and report the result asynchronously. The executor
 /// runs UFO2 on the logged-in desktop and returns the result.
-fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option<String>) {
+fn spawn_run_task(
+    state: Arc<WsState>,
+    id: String,
+    task: String,
+    request: Option<String>,
+    control_plane: String,
+) {
     std::thread::spawn(move || {
         let label = request.clone().unwrap_or_else(|| task.clone());
         let req_log = request.clone();
@@ -317,12 +323,21 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             return;
         }
 
+        let task_for_watcher = task.clone();
         let req = runtime::RemoteTaskRequest {
             id: id.clone(),
             task,
             request,
         };
         let progress = progress_callback(state.clone());
+        let trajectory_stop = Arc::new(AtomicBool::new(false));
+        let trajectory_watcher = crate::trajectory::spawn_watcher(
+            state.clone(),
+            control_plane,
+            id.clone(),
+            task_for_watcher,
+            trajectory_stop.clone(),
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(crate::tray::execute_remote(&req, progress));
@@ -337,7 +352,9 @@ fn spawn_run_task(state: Arc<WsState>, id: String, task: String, request: Option
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 finish(&state, "failed", "task worker stopped".to_string());
             }
-        }
+        };
+        trajectory_stop.store(true, Ordering::Relaxed);
+        let _ = trajectory_watcher.join();
     });
 }
 

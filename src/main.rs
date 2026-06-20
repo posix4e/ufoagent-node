@@ -19,6 +19,7 @@ mod runtime;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod status;
 mod store;
+mod trajectory;
 mod tray;
 mod ufo_config;
 mod update;
