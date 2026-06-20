@@ -2,7 +2,8 @@
 # Runs ON the self-hosted KVM host. The WHOLE self-hosted e2e, first-principles:
 #   revert the `cold` snapshot -> start the VM -> continuously screen-record the display from OUTSIDE
 #   (virsh screenshot) -> run the ONE in-guest journey in the interactive desktop session -> collect its
-#   result -> slice the one recording into per-phase gifs. No Session-0/1 split, no per-step capture.
+#   result -> slice the one recording into marker-based website assets. No Session-0/1 split, no
+#   per-step capture.
 # Run it from its own directory (journey.ps1 + slice.sh live alongside).
 set -uo pipefail
 VM=${VM:-ufo-ws2025-base}; SNAP=${SNAP:-cold}; PW=${VM_PW:-'Ufo!Spike2026'}; GUSER=${VM_USER:-ufoadmin}
@@ -35,11 +36,26 @@ progress_message(){
       phase_done) echo "phase done: $phase${detail:+ ($detail)}";;
       phase_skipped) echo "phase skipped: $phase${detail:+ ($detail)}";;
       phase_failed) echo "phase failed: $phase${detail:+ - $detail}";;
+      capture) echo "capture: $phase${detail:+ - $detail}";;
       *) echo "$event${phase:+: $phase}${detail:+ - $detail}";;
     esac
   else
     echo "$line"
   fi
+}
+
+gray_average(){
+  local png="$1"
+  ffmpeg -v error -i "$png" -vf 'scale=1:1,format=gray' -frames:v 1 -f rawvideo - 2>/dev/null |
+    od -An -tu1 | tr -d '[:space:]'
+}
+
+assert_nonblack_png(){
+  local png="$1" avg
+  [ -s "$png" ] || return 1
+  avg=$(gray_average "$png" || true)
+  [[ "$avg" =~ ^[0-9]+$ ]] || return 1
+  [ "$avg" -gt 5 ]
 }
 
 emit_progress(){
@@ -125,7 +141,7 @@ fi
 SSH 'Get-ChildItem C:\e2e -Recurse -Filter *.ps1 | ForEach-Object { $c=[IO.File]::ReadAllText($_.FullName); [IO.File]::WriteAllText($_.FullName, $c, (New-Object System.Text.UTF8Encoding $true)) }; "reencoded utf8-bom"'
 
 echo "=== start recorder (virsh screenshot loop) ==="
-rm -rf "$REC" "$WORK/gifs" "$WORK/stop" "$WORK/result.json" "$WORK/phases.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp"
+rm -rf "$REC" "$WORK/gifs" "$WORK/stop" "$WORK/result.json" "$WORK/phases.json" "$WORK/markers.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp"
 mkdir -p "$REC"   # clear stale frames+gifs/logs so a failed run can't publish or report old ones
 ( while [ ! -f "$WORK/stop" ]; do
     sudo virsh screenshot "$VM" "$REC/frame-$(( $(date +%s%N) / 1000000 )).png" >/dev/null 2>&1 || true
@@ -158,6 +174,7 @@ echo "frames=$(ls "$REC" 2>/dev/null | wc -l)"
 echo "=== collect ==="
 SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
+SSH 'Get-Content C:\e2e\out\markers.json -Raw' > "$WORK/markers.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\progress.ndjson -Raw' > "$PROGRESS" 2>/dev/null || true
 # The real captured desktop still (binary -> SCP, not Get-Content). Lands in gifs/ so the publish step
@@ -168,6 +185,7 @@ SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/de
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- progress ---"; cat "$PROGRESS" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
+echo "--- markers ---"; cat "$WORK/markers.json" 2>/dev/null
 
 # Capture the Windows service health the box's Server Manager flags (the red "Services" count), so we can
 # analyze them across runs. Diagnostic only - never fails the run.
@@ -192,7 +210,9 @@ skew=$(( host_ms - guest_ms ))
 echo "skew_ms=$skew"
 
 echo "=== slice ==="
-bash "$HERE/slice.sh" "$REC" "$WORK/phases.json" "$skew" "$WORK/gifs" || true
+bash "$HERE/slice.sh" "$REC" "$WORK/markers.json" "$skew" "$WORK/gifs"
+[ -s "$WORK/gifs/node-desktop.png" ] || { echo "missing required capture asset: node-desktop.png"; exit 1; }
+assert_nonblack_png "$WORK/gifs/node-desktop.png" || { echo "required capture asset appears black: node-desktop.png"; exit 1; }
 ls -la "$WORK/gifs" 2>/dev/null
 
 echo "SELFHOST-E2E: $status"

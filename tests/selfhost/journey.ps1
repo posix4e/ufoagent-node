@@ -1,8 +1,8 @@
 # The ONE end-to-end journey, run inside the VM's interactive desktop session while the HOST screen-records
 # the display. Walks the whole user story linearly, asserting each step; the recording is sliced into the
-# per-phase marketing gifs by phase boundaries. Emits:
-#   out\phases.json  - [{label,start,end,ok,error,crop:{x,y,w,h}}] guest epoch-ms boundaries + the window
-#                      rect to crop each gif to (host slices + crops by these)
+# website capture assets by capture markers. Emits:
+#   out\markers.json - [{label,ts,fg_rect:{x,y,w,h}}] guest epoch-ms capture points + foreground crop rect
+#   out\phases.json  - [{label,start,end,ok,error}] guest epoch-ms phase boundaries for diagnosis
 #   out\result.json  - {status: RUNNING|PASS|FAIL, phases}
 # Reuses the proven assertion logic from tests\e2e (staged alongside as .\e2e). The host records, so this
 # does NOT start any in-guest frame recorder. Kept ASCII so Windows PowerShell 5.1 parses it cleanly.
@@ -16,8 +16,8 @@ if (Test-Path (Join-Path $ROOT 'env.ps1')) { . (Join-Path $ROOT 'env.ps1') }   #
 . (Join-Path $E2E 'helpers.ps1')
 Add-Type -AssemblyName System.Windows.Forms, System.Drawing
 
-# Win32 for per-phase window cropping: capture the target window's rect so the host crops each gif to it
-# (the full 1280x800 desktop buries the real content). SW_RESTORE+SetForeground brings it to the front first.
+# Win32 helpers for capture markers and foreground-window checks. SW_RESTORE+SetForeground brings
+# target windows to the front before a marker records the foreground crop.
 Add-Type @"
 using System; using System.Runtime.InteropServices;
 public struct RECT { public int Left, Top, Right, Bottom; }
@@ -43,12 +43,10 @@ $haveTok  = [bool]$env:CI_AGENT_TOKEN
 $haveAdm  = [bool]($env:CI_ADMIN_TOKEN -and $env:CI_AGENT_ID)
 
 $phases = New-Object System.Collections.ArrayList
-$script:curCrop = $null
+$markers = New-Object System.Collections.ArrayList
 $script:lastInstallDetail = ''
 $script:lastRemoteStatus = ''
-$script:lastBraveStatus = ''
-$script:lastBambuStatus = ''
-$script:BraveDownloadUrl = 'https://github.com/brave/brave-browser/releases/latest/download/BraveBrowserStandaloneSilentSetup.exe'
+$script:lastThirdPartyStatus = ''
 function Now { [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() }
 function Get-FgRect {
   $h = [Win32]::GetForegroundWindow(); $r = New-Object RECT
@@ -69,8 +67,6 @@ function Minimize-OwnConsole {
     Start-Sleep -Milliseconds 800
   }
 }
-# Capture the crop for the current phase: focus $proc (if given), then record the foreground window rect.
-function Set-Crop([string]$proc = $null) { if ($proc) { Focus-Proc $proc }; $script:curCrop = Get-FgRect }
 
 function Get-UiaRect($el) {
   if (-not $el) { return $null }
@@ -81,6 +77,20 @@ function Get-UiaRect($el) {
     }
   } catch {}
   $null
+}
+
+function Write-Markers {
+  ($markers | ConvertTo-Json -Depth 5) | Set-Content (Join-Path $OUT 'markers.json') -Encoding Ascii
+}
+
+function Capture([string]$label, $rect = $null) {
+  if (-not $rect) { $rect = Get-FgRect }
+  $obj = [ordered]@{ label = $label; ts = (Now) }
+  if ($rect) { $obj.fg_rect = $rect }
+  [void]$markers.Add([pscustomobject]$obj)
+  Write-Markers
+  $detail = if ($rect) { "capture marker: $label crop=$($rect.x),$($rect.y),$($rect.w),$($rect.h)" } else { "capture marker: $label full frame" }
+  Write-ProgressEvent 'capture' $label $detail
 }
 
 function Get-UiaElements($root) {
@@ -120,7 +130,6 @@ function Dismiss-UfoSetupConsole {
   Write-ProgressEvent 'phase_update' 'install' 'closing installer setup prompt'
   $win = Find-UiaByName 'UFOAgent setup' 'Window' -ChildrenOnly
   if ($win) {
-    if (-not $script:curCrop) { $script:curCrop = Get-UiaRect $win }
     try {
       [Win32]::SetForegroundWindow([IntPtr]$win.Current.NativeWindowHandle) | Out-Null
       Start-Sleep -Milliseconds 500
@@ -183,25 +192,39 @@ function Assert-ManagedUfoConfig {
       throw "UFO MCP loader was not patched to honor USE_MCP=False: $py"
     }
   }
+  $appPy = 'C:\ProgramData\UFOAgent\ufo\ufo\agents\agent\app_agent.py'
+  $appPyRaw = Get-Content $appPy -Raw
+  if ($appPyRaw -notmatch 'Managed by ufoagent: read confirmation details from processing_context') {
+    throw 'UFO AppAgent confirmation handler patch is missing'
+  }
+  $shell = 'C:\ProgramData\UFOAgent\ufo\ufo\automator\app_apis\shell\shell_client.py'
+  if (-not (Test-Path $shell)) { throw "UFO shell client missing: $shell" }
+  $shellRaw = Get-Content $shell -Raw
+  foreach ($marker in @(
+      'Managed by ufoagent: allow unrestricted run_shell commands',
+      'Managed by ufoagent: allow unrestricted run_shell paths'
+    )) {
+    if ($shellRaw -notmatch [regex]::Escape($marker)) {
+      throw "UFO shell client permissive patch is missing: $marker"
+    }
+  }
   $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
   if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
   $cliRaw = Get-Content $cli -Raw
-  $allow = [regex]::Match($cliRaw, 'ALLOWED_CLI_COMMANDS[^\n]*=\s*frozenset\(\s*\{(?<body>[\s\S]*?)\n\s*\}\s*\)')
-  if (-not $allow.Success) {
-    throw 'UFO CLI launcher allow-list block was not found'
+  if ($cliRaw -notmatch 'Managed by ufoagent: allow unrestricted CLI launcher commands') {
+    throw 'UFO CLI launcher permissive patch is missing'
   }
-  $allowRaw = $allow.Groups['body'].Value
-  foreach ($allowed in @('"ufoagent-launch.cmd"')) {
-    if ($allowRaw -notmatch [regex]::Escape($allowed)) {
-      throw "UFO CLI launcher allow-list missing: $allowed"
+  foreach ($prompt in @(
+      'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\host_agent.yaml',
+      'C:\ProgramData\UFOAgent\ufo\ufo\prompts\share\base\app_agent.yaml'
+    )) {
+    if (-not (Test-Path $prompt)) { throw "UFO prompt missing: $prompt" }
+    $promptRaw = Get-Content $prompt -Raw
+    if ($promptRaw -notmatch 'Managed by ufoagent: generic runtime remediation') {
+      throw "UFO runtime remediation prompt patch is missing: $prompt"
     }
   }
-  foreach ($blocked in @('"notepad"', '"notepad.exe"', '"notepad-plus-plus.cmd"', '"notepad++.exe"', '"brave.exe"', '"msedge.exe"', '"bambu-studio.exe"', '"bambustudio.exe"')) {
-    if ($allowRaw -match [regex]::Escape($blocked)) {
-      throw "UFO CLI launcher still exposes per-app command: $blocked"
-    }
-  }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, generic launcher allowed'
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, permissive shell patches, remediation prompt'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -216,27 +239,6 @@ function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 30
   $c
 }
 
-function Wait-CommandTerminalAfterState([string]$id, [string]$label, [string]$phase, [int]$TimeoutSec = 120) {
-  $done = Wait-For -TimeoutSec $TimeoutSec -PollSec 5 -StreamAgentLog -Condition {
-    $c = Get-NodeCommand $id
-    $c -and ($c.status -eq 'done' -or $c.status -eq 'failed')
-  }
-  $c = if ($id) { Get-NodeCommand $id } else { $null }
-  if ($done -and $c) {
-    Write-Host "$label result after state verified: status=$($c.status)"
-    if ($c.status -ne 'done') {
-      $summary = Get-CommandResultSummary $c
-      if ($summary) { Write-ProgressEvent 'phase_update' $phase "$label failed after state verified: $summary" }
-      throw "$label failed: $($c.result)"
-    }
-    return $c
-  }
-  $status = if ($c -and $c.status) { $c.status } else { 'missing' }
-  Write-Host "::warning::$label still $status after state verified"
-  Write-ProgressEvent 'phase_update' $phase "$label still $status after state verified"
-  $c
-}
-
 function Get-CommandResultSummary($command, [int]$MaxLen = 220) {
   if (-not $command -or -not $command.result) { return }
   $summary = (($command.result + '') -replace '[^\x09\x0A\x0D\x20-\x7E]', ' ' -replace '\s+', ' ').Trim()
@@ -248,118 +250,6 @@ function Write-CommandResultProgress([string]$phase, $command) {
   $summary = Get-CommandResultSummary $command
   if (-not $summary) { return }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
-}
-
-function Quote-PsString([string]$value) {
-  "'" + $value.Replace("'", "''") + "'"
-}
-
-function Install-UfoAgentLauncher {
-  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
-  New-Item -ItemType Directory -Force $dir | Out-Null
-  $ps1 = Join-Path $env:ProgramData 'UFOAgent\ufoagent-launch.ps1'
-  $psBody = @(
-    'param(',
-    '  [Parameter(Mandatory=$true, Position=0)][string]$AppId,',
-    '  [Parameter(ValueFromRemainingArguments=$true)][string[]]$AppArgs',
-    ')',
-    'if ($AppId -notmatch ''^[A-Za-z0-9_.-]+$'') { Write-Error "ufoagent-launch: invalid app id: $AppId"; exit 2 }',
-    '$script = Join-Path $env:ProgramData ("UFOAgent\launchers\" + $AppId + ".ps1")',
-    'if (-not (Test-Path $script)) { Write-Error "ufoagent-launch: unknown app: $AppId"; exit 2 }',
-    '$eventPath = Join-Path $env:ProgramData ''UFOAgent\launcher-events.ndjson''',
-    '$event = [ordered]@{ ts = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds(); app = $AppId; args = $AppArgs }',
-    '([pscustomobject]$event | ConvertTo-Json -Compress) | Add-Content -Path $eventPath -Encoding Ascii',
-    '& $script @AppArgs',
-    'if ($LASTEXITCODE -ne $null) { exit $LASTEXITCODE }',
-    'exit 0'
-  )
-  Set-Content -Path $ps1 -Value $psBody -Encoding Ascii
-
-  $cmd = Join-Path $env:WINDIR 'ufoagent-launch.cmd'
-  $body = @(
-    '@echo off',
-    'powershell -NoProfile -ExecutionPolicy Bypass -File "%ProgramData%\UFOAgent\ufoagent-launch.ps1" %*',
-    'exit /b %ERRORLEVEL%'
-  )
-  Set-Content -Path $cmd -Value $body -Encoding Ascii
-}
-
-function Register-UfoAgentLaunchApp([string]$id, [string]$exe) {
-  Install-UfoAgentLauncher
-  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
-  New-Item -ItemType Directory -Force $dir | Out-Null
-  $script = Join-Path $dir "$id.ps1"
-  $exeQ = Quote-PsString $exe
-  $dirQ = Quote-PsString (Split-Path $exe)
-  $body = @(
-    'param([Parameter(ValueFromRemainingArguments=$true)][string[]]$AppArgs)',
-    ('$exe = ' + $exeQ),
-    ('$dir = ' + $dirQ),
-    'if ($AppArgs -and $AppArgs.Count -gt 0) {',
-    '  Start-Process -FilePath $exe -WorkingDirectory $dir -ArgumentList $AppArgs',
-    '} else {',
-    '  Start-Process -FilePath $exe -WorkingDirectory $dir',
-    '}',
-    'exit 0'
-  )
-  Set-Content -Path $script -Value $body -Encoding Ascii
-}
-
-function Register-UfoAgentLaunchScript([string]$id, [string[]]$body) {
-  Install-UfoAgentLauncher
-  $dir = Join-Path $env:ProgramData 'UFOAgent\launchers'
-  New-Item -ItemType Directory -Force $dir | Out-Null
-  Set-Content -Path (Join-Path $dir "$id.ps1") -Value $body -Encoding Ascii
-}
-
-function Clear-LauncherEvents {
-  Remove-Item (Join-Path $env:ProgramData 'UFOAgent\launcher-events.ndjson') -Force -ErrorAction SilentlyContinue
-}
-
-function Get-LauncherEvents {
-  $path = Join-Path $env:ProgramData 'UFOAgent\launcher-events.ndjson'
-  if (-not (Test-Path $path)) { return @() }
-  $events = @()
-  foreach ($line in (Get-Content $path -ErrorAction SilentlyContinue)) {
-    if (-not $line) { continue }
-    try { $events += ($line | ConvertFrom-Json) } catch {}
-  }
-  $events
-}
-
-function Test-LauncherEvent([string]$id) {
-  foreach ($event in (Get-LauncherEvents)) {
-    if (($event.app + '') -eq $id) { return $true }
-  }
-  $false
-}
-
-function Assert-LauncherEvent([string]$id, [string]$context) {
-  if (Test-LauncherEvent $id) {
-    Write-ProgressEvent 'phase_update' $context "launcher used: $id"
-    return
-  }
-  $seen = ((Get-LauncherEvents | ForEach-Object { $_.app }) -join ', ')
-  if (-not $seen) { $seen = 'none' }
-  throw "$context did not invoke generic launcher id '$id' (seen: $seen)"
-}
-
-function Get-EdgeExe {
-  @(
-    "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe",
-    "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe"
-  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
-
-function Get-NotepadExe {
-  @(
-    "$env:WINDIR\System32\notepad.exe",
-    "$env:WINDIR\SysWOW64\notepad.exe"
-  ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-}
-
-function Get-DownloadsDir {
-  Join-Path $env:USERPROFILE 'Downloads'
 }
 
 function Get-BraveExe {
@@ -438,87 +328,9 @@ function Test-BambuStudioInstalled {
   $false
 }
 
-function Get-BraveProcess {
-  Get-Process 'brave' -ErrorAction SilentlyContinue
-}
-
-function Register-BraveInstallerLauncher {
-  $downloadsQ = Quote-PsString (Get-DownloadsDir)
-  $body = @(
-    '$ErrorActionPreference = ''Stop''',
-    ('$downloads = ' + $downloadsQ),
-    'if (-not (Test-Path $downloads)) { Write-Error "Brave installer launcher: downloads folder missing: $downloads"; exit 3 }',
-    '$installer = Get-ChildItem -Path $downloads -File -Filter ''BraveBrowserStandalone*Setup*.exe'' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1',
-    'if (-not $installer) { Write-Error "Brave installer launcher: Brave setup exe was not found in $downloads"; exit 3 }',
-    'Write-Host "Brave installer launcher: running $($installer.FullName)"',
-    '$p = Start-Process -FilePath $installer.FullName -WorkingDirectory $installer.DirectoryName -Wait -PassThru',
-    '$candidates = @("$env:ProgramFiles\BraveSoftware\Brave-Browser\Application\brave.exe", "${env:ProgramFiles(x86)}\BraveSoftware\Brave-Browser\Application\brave.exe", "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\Application\brave.exe")',
-    '$brave = $null',
-    'for ($i = 0; $i -lt 60 -and -not $brave; $i++) { $brave = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $brave) { Start-Sleep -Seconds 2 } }',
-    'if ($p.ExitCode -ne 0 -and -not $brave) { Write-Error "Brave installer exited $($p.ExitCode)"; exit $p.ExitCode }',
-    'if (-not $brave) { Write-Error "Brave installer completed but brave.exe was not found"; exit 4 }',
-    'Start-Process -FilePath $brave -ArgumentList @(''--no-first-run'', ''--no-default-browser-check'', ''about:blank'')',
-    'exit 0'
-  )
-  Register-UfoAgentLaunchScript 'brave-setup' $body
-}
-
 function Stop-Brave {
   Get-Process 'brave', 'BraveBrowserStandaloneSetup', 'BraveBrowserStandaloneSilentSetup' -ErrorAction SilentlyContinue |
     Stop-Process -Force -ErrorAction SilentlyContinue
-}
-
-function Resolve-BambuStudioInstallerUrl {
-  [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  Write-ProgressEvent 'phase_update' 'thirdparty' 'resolving latest Bambu Studio release'
-  $rel = Invoke-RestMethod -UseBasicParsing -Headers @{ 'User-Agent' = 'ufoagent-e2e' } -Uri 'https://api.github.com/repos/bambulab/BambuStudio/releases/latest'
-  $asset = $rel.assets | Where-Object { $_.name -match '^Bambu_Studio_win-.*\.exe$' } | Select-Object -First 1
-  if (-not $asset) { throw 'latest Bambu Studio release has no Windows exe asset' }
-  Write-Host "Bambu Studio installer asset: $($asset.name) $($asset.size) bytes"
-  Write-ProgressEvent 'phase_update' 'thirdparty' "latest Bambu installer: $($asset.name) ($([math]::Round($asset.size / 1MB)) MB)"
-  $asset.browser_download_url
-}
-
-function Get-BambuInstallerDownload {
-  $downloads = Get-DownloadsDir
-  if (-not (Test-Path $downloads)) { return $null }
-  Get-ChildItem -Path $downloads -File -Filter 'Bambu_Studio_win-*.exe' -ErrorAction SilentlyContinue |
-    Where-Object { $_.Length -gt 100MB } |
-    Sort-Object LastWriteTime -Descending |
-    Select-Object -First 1
-}
-
-function Test-StableDownload($file) {
-  if (-not $file -or -not (Test-Path $file.FullName)) { return $false }
-  $len = $file.Length
-  $mtime = $file.LastWriteTimeUtc
-  Start-Sleep -Seconds 2
-  $again = Get-Item $file.FullName -ErrorAction SilentlyContinue
-  [bool]($again -and $again.Length -eq $len -and $again.LastWriteTimeUtc -eq $mtime)
-}
-
-function Register-BambuInstallerLauncher {
-  $downloadsQ = Quote-PsString (Get-DownloadsDir)
-  $body = @(
-    '$ErrorActionPreference = ''Stop''',
-    ('$downloads = ' + $downloadsQ),
-    'if (-not (Test-Path $downloads)) { Write-Error "Bambu installer launcher: downloads folder missing: $downloads"; exit 3 }',
-    '$installer = Get-ChildItem -Path $downloads -File -Filter ''Bambu_Studio_win-*.exe'' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 1',
-    'if (-not $installer) { Write-Error "Bambu installer launcher: Bambu Studio Windows installer was not found in $downloads"; exit 3 }',
-    'Write-Host "Bambu installer launcher: running $($installer.FullName)"',
-    '$p = Start-Process -FilePath $installer.FullName -WorkingDirectory $installer.DirectoryName -ArgumentList ''/S'' -PassThru',
-    'if (-not $p.WaitForExit(900000)) { try { $p.Kill() } catch {}; Write-Error "Bambu installer timed out"; exit 5 }',
-    'if ($p.ExitCode -ne 0) { Write-Error "Bambu installer exited $($p.ExitCode)"; exit $p.ExitCode }',
-    '$candidates = @("$env:ProgramFiles\Bambu Studio\bambu-studio.exe", "$env:ProgramFiles\Bambu Studio\BambuStudio.exe", "$env:ProgramFiles\Bambu Studio\Bambu Studio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\bambu-studio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\BambuStudio.exe", "${env:ProgramFiles(x86)}\Bambu Studio\Bambu Studio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\bambu-studio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\BambuStudio.exe", "$env:LOCALAPPDATA\Programs\Bambu Studio\Bambu Studio.exe")',
-    '$bambu = $null',
-    'for ($i = 0; $i -lt 90 -and -not $bambu; $i++) { $bambu = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1; if (-not $bambu) { Start-Sleep -Seconds 2 } }',
-    'if ($bambu) { Start-Process -FilePath $bambu; exit 0 }',
-    '$roots = @(''HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'', ''HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'', ''HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'')',
-    '$entry = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue | Where-Object { ($_.DisplayName + "") -like "*Bambu Studio*" } | Select-Object -First 1',
-    'if ($entry) { exit 0 }',
-    'Write-Error "Bambu installer completed but Bambu Studio was not found"; exit 4'
-  )
-  Register-UfoAgentLaunchScript 'bambu-setup' $body
 }
 
 function Stop-BambuStudio {
@@ -527,18 +339,68 @@ function Stop-BambuStudio {
     Stop-Process -Force -ErrorAction SilentlyContinue
 }
 
-function Set-CropAnyProcess([string[]]$names) {
-  foreach ($name in $names) {
-    $p = Get-Process $name -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+function Get-BambuStudioProcess {
+  Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.MainWindowHandle -ne 0 -and $_.ProcessName -match '(?i)bambu' -and $_.ProcessName -notmatch '(?i)setup|unins|crash' } |
+    Select-Object -First 1
+}
+
+function Get-UiaText($el, [int]$MaxItems = 160) {
+  $names = New-Object System.Collections.Generic.List[string]
+  if (-not $el) { return '' }
+  try {
+    if ($el.Current.Name) { $names.Add($el.Current.Name) }
+    foreach ($child in (Get-UiaElements $el)) {
+      if ($names.Count -ge $MaxItems) { break }
+      try {
+        $name = $child.Current.Name + ''
+        if ($name.Trim()) { $names.Add($name.Trim()) }
+      } catch {}
+    }
+  } catch {}
+  ($names | Select-Object -Unique) -join ' '
+}
+
+function Find-BambuStudioGraphicsError {
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $wins = try { $root.FindAll([System.Windows.Automation.TreeScope]::Children, [System.Windows.Automation.Condition]::TrueCondition) } catch { @() }
+  foreach ($win in $wins) {
+    $text = Get-UiaText $win
+    if (-not $text) { continue }
+    if ($text -match '(?i)(bambu|studio|opengl|graphics|graphic|gpu|driver)' -and $text -match '(?i)(opengl|graphics|graphic|gpu|driver)' -and $text -match '(?i)(error|failed|unable|unsupported|not supported|problem)') {
+      return $text
+    }
+  }
+  $null
+}
+
+function Assert-BambuStudioLaunchesClean([int]$TimeoutSec = 240) {
+  $exe = Get-BambuStudioExe
+  if (-not $exe) { throw 'Bambu Studio executable was not found after install' }
+  Stop-BambuStudio
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'verifying Bambu Studio clean launch'
+  Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe)
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+  while ((Get-Date) -lt $deadline) {
+    $err = Find-BambuStudioGraphicsError
+    if ($err) {
+      throw "Bambu Studio showed an OpenGL/graphics error dialog: $err"
+    }
+    $p = Get-BambuStudioProcess
     if ($p) {
       [Win32]::ShowWindow($p.MainWindowHandle, 9) | Out-Null
       [Win32]::SetForegroundWindow($p.MainWindowHandle) | Out-Null
-      Start-Sleep -Milliseconds 500
-      $script:curCrop = Get-FgRect
-      if ($script:curCrop) { return }
+      Start-Sleep -Milliseconds 800
+      $err = Find-BambuStudioGraphicsError
+      if ($err) {
+        throw "Bambu Studio showed an OpenGL/graphics error dialog: $err"
+      }
+      Write-ProgressEvent 'phase_update' 'thirdparty' 'Bambu Studio launched without graphics error dialog'
+      return $true
     }
+    Start-Sleep -Seconds 5
   }
-  $script:curCrop = Get-FgRect
+  throw 'Bambu Studio did not open a usable window during clean-launch verification'
 }
 
 function Test-UfoTranscriptTyped([string]$id, [string]$want) {
@@ -547,6 +409,21 @@ function Test-UfoTranscriptTyped([string]$id, [string]$want) {
   if (-not (Test-Path $path)) { return $false }
   $raw = Get-Content $path -Raw -ErrorAction SilentlyContinue
   [bool]($raw -and $raw.Contains($want) -and $raw.Contains('set_edit_text') -and $raw.Contains('SUCCESS'))
+}
+
+function Assert-AgentUsedGeneralRunShell([string]$id, [string]$context) {
+  if (-not $id) { throw "$context has no command id for transcript verification" }
+  $path = "C:\ProgramData\UFOAgent\tasks\logs\$id.txt"
+  if (-not (Test-Path $path)) { throw "$context transcript missing: $path" }
+  $raw = Get-Content $path -Raw -ErrorAction Stop
+  if ($raw -notmatch '(?i)run_shell') {
+    throw "$context transcript did not show UFO using run_shell"
+  }
+  if ($raw -match '(?i)ufoagent-launch') {
+    throw "$context transcript still used the removed ufoagent-launch path"
+  }
+  $count = ([regex]::Matches($raw, '(?i)run_shell')).Count
+  Write-ProgressEvent 'phase_update' 'thirdparty' "transcript used general run_shell ($count mentions)"
 }
 
 function Open-TrayActivitySummary {
@@ -568,8 +445,6 @@ function Open-TrayActivitySummary {
   if (-not $dlg) { throw 'activity summary dialog never appeared' }
   try { [Win32]::SetForegroundWindow([IntPtr]$dlg.Current.NativeWindowHandle) | Out-Null } catch {}
   Start-Sleep -Milliseconds 800
-  $script:curCrop = Get-UiaRect $dlg
-  if (-not $script:curCrop) { $script:curCrop = Get-FgRect }
   $dlg
 }
 
@@ -598,13 +473,11 @@ function Write-Result($status) {
 function Phase([string]$name, [scriptblock]$body) {
   Write-Host "=== phase: $name ==="
   Write-ProgressEvent 'phase_start' $name
-  $script:curCrop = $null
   $s = Now; $ok = $true; $err = ''; $skip = $false
   try { $skip = (& $body) -eq 'SKIP' } catch { $ok = $false; $err = "$($_.Exception.Message)" }
   $e = Now
   $dur = '{0:n1}s' -f (($e - $s) / 1000.0)
   $obj = [ordered]@{ label = $name; start = $s; end = $e; ok = $ok; skipped = $skip; error = $err }
-  if ($script:curCrop) { $obj.crop = $script:curCrop }
   [void]$phases.Add([pscustomobject]$obj)
   ($phases | ConvertTo-Json -Depth 4) | Set-Content (Join-Path $OUT 'phases.json') -Encoding Ascii
   if ($ok -and $skip) {
@@ -637,6 +510,17 @@ Phase 'install' {
   Write-ProgressEvent 'phase_update' 'install' "installer ready: $((Get-Item $setup).Length) bytes"
   Start-Process $setup -ArgumentList '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/NOCANCEL'
   Write-ProgressEvent 'phase_update' 'install' 'installer launched; waiting for UFO2 ready'
+  $setupWin = $null
+  for ($i = 0; $i -lt 30 -and -not $setupWin; $i++) {
+    Start-Sleep -Seconds 1
+    $setupWin = Find-UiaByName 'UFOAgent setup' 'Window' -ChildrenOnly
+  }
+  if ($setupWin) {
+    try { [Win32]::SetForegroundWindow([IntPtr]$setupWin.Current.NativeWindowHandle) | Out-Null } catch {}
+    Capture 'install-screen' (Get-UiaRect $setupWin)
+  } else {
+    Capture 'install-screen'
+  }
   $ready = Wait-For -TimeoutSec 600 -PollSec 5 -StreamAgentLog -Condition {
     if (Test-Path $marker) {
       $m = Get-Content $marker -Raw | ConvertFrom-Json
@@ -657,7 +541,6 @@ Phase 'install' {
   if ($state -ne 'ready') { throw "provisioning state=$state (expected ready)" }
   Write-ProgressEvent 'phase_update' 'install' 'validating managed UFO config'
   Assert-ManagedUfoConfig
-  if (-not $script:curCrop) { Set-Crop }
   Write-Host 'install + provision: UFO2 ready'
 }
 
@@ -676,7 +559,7 @@ $script:linkProc = $null
 Phase 'link' {
   $script:linkProc = Start-Process $Exe -ArgumentList 'link', '--force' -PassThru -WindowStyle Normal
   Start-Sleep -Seconds 9
-  Set-Crop   # the link/QR console is foreground
+  Capture 'link-screen'   # the link/QR console is foreground
   if ($haveTok) {
     & $Exe configure --agent-token $env:CI_AGENT_TOKEN
     $connected = Wait-For -TimeoutSec 180 -StreamAgentLog -Condition {
@@ -694,20 +577,9 @@ Stop-Process -Id $script:linkProc.Id -Force -ErrorAction SilentlyContinue
 Phase 'remote' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping remote task'; return 'SKIP' }
   Stop-UfoWindows
-  $notepad = Get-NotepadExe
-  if (-not $notepad) { throw 'Notepad executable not found' }
-  Register-UfoAgentLaunchApp 'notepad' $notepad
-  Clear-LauncherEvents
   Minimize-OwnConsole
   $remotePrompt = @"
-Open Notepad through the shell launcher, then type text.
-
-Use the CommandLineExecutor run_shell tool directly. Do not use AppUIExecutor to type the command into Command Prompt, PowerShell, Run, or any terminal window.
-
-The run_shell bash_command must be exactly:
-ufoagent-launch.cmd notepad
-
-After Notepad is visible, type exactly:
+Open Notepad and type exactly:
 hello from ufoagent
 "@
   $resp = Send-NodeCommand 'run_task' $remotePrompt
@@ -722,10 +594,7 @@ hello from ufoagent
     }
     if ($c -and $c.status -eq 'failed') { throw "run_task command failed: $($c.result)" }
     $notepadOpen = [bool](Get-Process notepad -ErrorAction SilentlyContinue)
-    if ($notepadOpen -and (Test-LauncherEvent 'notepad')) { return $true }
-    if ($notepadOpen -and $c -and $c.status -eq 'done') {
-      throw "remote run_task opened Notepad without invoking generic launcher id 'notepad'"
-    }
+    if ($notepadOpen) { return $true }
     if ($c -and $c.status -eq 'done') {
       $summary = Get-CommandResultSummary $c 420
       if ($summary) {
@@ -742,7 +611,6 @@ hello from ufoagent
     Show-FileTail 'agent log' $AgentLog 40
     throw 'remote run_task did not open Notepad'
   }
-  Assert-LauncherEvent 'notepad' 'remote'
   $typed = Wait-NotepadTyped -StreamAgentLog
   if ($typed.Typed) {
     Assert-TypedVerdict $typed 'remote run_task'
@@ -751,163 +619,62 @@ hello from ufoagent
   } else {
     Assert-TypedVerdict $typed 'remote run_task'
   }
-  Set-Crop 'notepad'; Start-Sleep 1
+  Start-Sleep 1
 }
 if ($haveAdm -and $script:remoteId) {
   $null = Wait-CommandTerminal $script:remoteId 'remote run_task' 300
 }
 
 # 5) THIRD-PARTY APP CHAIN - UFO uses the desktop to install Brave, then uses Brave to install Bambu
-# Studio. The harness does not pre-download either installer; it only asserts the resulting apps exist.
+# Studio. The harness does not pre-download either installer or supply commands; it only asserts outcomes.
 $script:thirdPartyId = $null
 Phase 'thirdparty' {
   if (-not $haveAdm) { Write-Host 'no CI admin token: skipping third-party app task'; return 'SKIP' }
   Stop-UfoWindows
   Stop-Brave
   Stop-BambuStudio
-  Clear-LauncherEvents
-  $edge = Get-EdgeExe
-  if (-not $edge) { throw 'Microsoft Edge not found; cannot have UFO download Brave' }
-  Register-UfoAgentLaunchApp 'edge' $edge
-  Register-BraveInstallerLauncher
   Minimize-OwnConsole
 
-  $brave = Get-BraveExe
-  $braveWasInstalled = [bool]$brave
-  if (-not $braveWasInstalled) {
-    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Brave install run_task'
-    $bravePrompt = @"
-Install Brave Browser.
+  Write-ProgressEvent 'phase_update' 'thirdparty' 'sending generic Brave+Bambu install run_task'
+  $thirdPartyPrompt = @"
+Install Brave Browser. Then use Brave Browser to download and install the latest Windows Bambu Studio for Windows.
 
-When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type these commands into Command Prompt, PowerShell, Run, or any terminal window.
+Use the desktop normally. Use available shell tools when that is the most direct way to download, install, configure, or verify software. If a launch fails because a required runtime, library, driver, system capability, or executable is missing, diagnose the visible error, resolve the missing capability with available tools, retry the launch, and continue only after the app runs without the error.
 
-Step 1: use the run_shell tool with exactly this command:
-ufoagent-launch.cmd edge --no-first-run --no-default-browser-check $($script:BraveDownloadUrl)
-
-Step 2: in Microsoft Edge, wait for the Brave installer download to finish. If Edge asks, keep or allow the download.
-
-Step 3: use the run_shell tool with exactly this command:
-ufoagent-launch.cmd brave-setup
-
-Wait until Brave Browser is installed and a Brave window is visible. Do not stop after only downloading the installer.
+Finish only after Brave Browser is installed, Bambu Studio is installed, and Bambu Studio is running in a normal usable window with no error dialog visible.
 "@
-    $resp = Send-NodeCommand 'run_task' $bravePrompt
-    Write-Host "sent Brave install run_task: id=$($resp.id) status=$($resp.status)"
-    Write-ProgressEvent 'phase_update' 'thirdparty' "Brave command queued: $($resp.id)"
-    $script:thirdPartyId = $resp.id
-    $braveReady = Wait-For -TimeoutSec 900 -PollSec 5 -StreamAgentLog -Condition {
-      $c = Get-NodeCommand $script:thirdPartyId
-      if ($c -and $c.status -and $c.status -ne $script:lastBraveStatus) {
-        Write-ProgressEvent 'phase_update' 'thirdparty' "Brave command status: $($c.status)"
-        $script:lastBraveStatus = $c.status
-      }
-      if ($c -and $c.status -eq 'failed') { throw "Brave install run_task failed: $($c.result)" }
-      [bool](Get-BraveExe)
+  $resp = Send-NodeCommand 'run_task' $thirdPartyPrompt
+  Write-Host "sent third-party install run_task: id=$($resp.id) status=$($resp.status)"
+  Write-ProgressEvent 'phase_update' 'thirdparty' "third-party command queued: $($resp.id)"
+  $script:thirdPartyId = $resp.id
+
+  $done = Wait-For -TimeoutSec 2400 -PollSec 10 -StreamAgentLog -Condition {
+    $c = Get-NodeCommand $script:thirdPartyId
+    if ($c -and $c.status -and $c.status -ne $script:lastThirdPartyStatus) {
+      Write-ProgressEvent 'phase_update' 'thirdparty' "third-party command status: $($c.status)"
+      $script:lastThirdPartyStatus = $c.status
     }
-    if (-not $braveReady) {
-      $c = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
-      if ($c) { Write-Host "Brave install run_task result: status=$($c.status) result=$($c.result)" }
-      Show-FileTail 'agent log' $AgentLog 80
-      throw 'UFO did not install Brave'
-    }
-    $braveDone = Wait-CommandTerminalAfterState $script:thirdPartyId 'Brave install run_task' 'thirdparty' 120
-    Write-CommandResultProgress 'thirdparty' $braveDone
-    Assert-LauncherEvent 'edge' 'thirdparty'
-    Assert-LauncherEvent 'brave-setup' 'thirdparty'
-    $brave = Get-BraveExe
-  } else {
-    Write-Host "Brave already installed: $brave"
+    if ($c -and $c.status -eq 'failed') { throw "third-party install run_task failed: $($c.result)" }
+    $c -and $c.status -eq 'done'
   }
-  if (-not $brave) { throw 'Brave install completed but brave.exe was not found' }
-  Register-UfoAgentLaunchApp 'brave' $brave
+  $final = if ($script:thirdPartyId) { Get-NodeCommand $script:thirdPartyId } else { $null }
+  if (-not $done -or -not $final) {
+    if ($final) { Write-Host "third-party run_task result: status=$($final.status) result=$($final.result)" }
+    Show-FileTail 'agent log' $AgentLog 120
+    throw 'third-party run_task did not finish cleanly'
+  }
+  Write-CommandResultProgress 'thirdparty' $final
+  Assert-AgentUsedGeneralRunShell $script:thirdPartyId 'third-party run_task'
+
+  $brave = Get-BraveExe
+  if (-not $brave) { throw 'third-party run_task finished but Brave Browser was not installed' }
   Write-ProgressEvent 'phase_update' 'thirdparty' "Brave ready: $brave"
 
-  $bambuWasInstalled = Test-BambuStudioInstalled
-  if (-not $bambuWasInstalled) {
-    $bambuUrl = Resolve-BambuStudioInstallerUrl
-    Register-BambuInstallerLauncher
-    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio download run_task'
-    $bambuDownloadPrompt = @"
-Download the Bambu Studio Windows installer using Brave.
-
-When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type these commands into Command Prompt, PowerShell, Run, or any terminal window.
-
-Step 1: use the run_shell tool with exactly this command:
-ufoagent-launch.cmd brave --no-first-run --no-default-browser-check $bambuUrl
-
-Step 2: in Brave, wait for the Bambu Studio Windows installer download to finish. If Brave asks, keep or allow the download. Download the .exe installer, not the zip. Stop once the download is complete.
-"@
-    $resp = Send-NodeCommand 'run_task' $bambuDownloadPrompt
-    Write-Host "sent Bambu Studio download run_task: id=$($resp.id) status=$($resp.status)"
-    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download command queued: $($resp.id)"
-    $bambuDownloadId = $resp.id
-    $script:thirdPartyId = $bambuDownloadId
-    $bambuDownloaded = Wait-For -TimeoutSec 900 -PollSec 10 -StreamAgentLog -Condition {
-      $c = Get-NodeCommand $bambuDownloadId
-      if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
-        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu download command status: $($c.status)"
-        $script:lastBambuStatus = $c.status
-      }
-      $installer = Get-BambuInstallerDownload
-      if ($installer -and (Test-StableDownload $installer)) { return $true }
-      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio download run_task failed: $($c.result)" }
-      $false
-    }
-    if (-not $bambuDownloaded) {
-      $c = if ($bambuDownloadId) { Get-NodeCommand $bambuDownloadId } else { $null }
-      if ($c) { Write-Host "Bambu Studio download run_task result: status=$($c.status) result=$($c.result)" }
-      Show-FileTail 'agent log' $AgentLog 100
-      throw 'UFO did not download the Bambu Studio installer'
-    }
-    $bambuDownloadDone = Wait-CommandTerminalAfterState $bambuDownloadId 'Bambu Studio download run_task' 'thirdparty' 60
-    Write-CommandResultProgress 'thirdparty' $bambuDownloadDone
-    Assert-LauncherEvent 'brave' 'thirdparty'
-
-    $installer = Get-BambuInstallerDownload
-    if (-not $installer) { throw 'Bambu Studio installer download disappeared before setup' }
-    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu installer downloaded: $($installer.Name)"
-    Write-ProgressEvent 'phase_update' 'thirdparty' 'sending Bambu Studio setup run_task'
-    $bambuSetupPrompt = @"
-Install the already-downloaded Bambu Studio Windows installer.
-
-When a step says run_shell, call the CommandLineExecutor run_shell tool directly. Do not type this command into Command Prompt, PowerShell, Run, or any terminal window.
-
-Use the run_shell tool with exactly this command:
-ufoagent-launch.cmd bambu-setup
-
-Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or graphics error, leave that dialog visible and consider the install complete.
-"@
-    $resp = Send-NodeCommand 'run_task' $bambuSetupPrompt
-    Write-Host "sent Bambu Studio setup run_task: id=$($resp.id) status=$($resp.status)"
-    Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu setup command queued: $($resp.id)"
-    $bambuSetupId = $resp.id
-    $script:thirdPartyId = $bambuSetupId
-    $script:lastBambuStatus = ''
-    $bambuReady = Wait-For -TimeoutSec 900 -PollSec 10 -StreamAgentLog -Condition {
-      $c = Get-NodeCommand $bambuSetupId
-      if ($c -and $c.status -and $c.status -ne $script:lastBambuStatus) {
-        Write-ProgressEvent 'phase_update' 'thirdparty' "Bambu setup command status: $($c.status)"
-        $script:lastBambuStatus = $c.status
-      }
-      $installed = Test-BambuStudioInstalled
-      if ($c -and $c.status -eq 'failed') { throw "Bambu Studio setup run_task failed: $($c.result)" }
-      $installed
-    }
-    if (-not $bambuReady) {
-      $c = if ($bambuSetupId) { Get-NodeCommand $bambuSetupId } else { $null }
-      if ($c) { Write-Host "Bambu Studio setup run_task result: status=$($c.status) result=$($c.result)" }
-      Show-FileTail 'agent log' $AgentLog 100
-      throw 'UFO did not install Bambu Studio'
-    }
-    $bambuSetupDone = Wait-CommandTerminalAfterState $bambuSetupId 'Bambu Studio setup run_task' 'thirdparty' 120
-    Write-CommandResultProgress 'thirdparty' $bambuSetupDone
-    Assert-LauncherEvent 'bambu-setup' 'thirdparty'
-  } else {
-    Write-Host 'Bambu Studio already installed'
-  }
+  if (-not (Test-BambuStudioInstalled)) { throw 'third-party run_task finished but Bambu Studio was not installed' }
   $bambuExe = Get-BambuStudioExe
   if ($bambuExe) { Write-Host "Bambu Studio installed: $bambuExe" } else { Write-Host 'Bambu Studio installed: uninstall entry or shortcut detected' }
-  Set-CropAnyProcess @('Bambu Studio', 'BambuStudio', 'bambu-studio', 'brave')
+  Assert-BambuStudioLaunchesClean
+  Capture 'third-party-app'
   Start-Sleep 4
 }
 
@@ -931,7 +698,7 @@ Phase 'dashboard' {
     throw "screenshot command failed: status=$($c.status) result=$($c.result)"
   }
   Write-Host "screenshot captured: $($c.result)"
-  Stop-UfoWindows   # clear the remote-task Notepad before showing the browser
+  Stop-UfoWindows   # clear Notepad before showing the browser
 
   # Save the raw captured desktop still (published next to the gifs; powers dashboard previews).
   $shotUrl = "https://app.ufoagent.xyz/api/agents/$env:CI_AGENT_ID/screenshot/latest"
@@ -958,23 +725,21 @@ Phase 'dashboard' {
     throw 'Edge never opened a mission control window'
   }
   Start-Sleep 14   # let fonts + the inlined screenshot fully load and the layout settle before cropping
-  Set-Crop 'msedge'
+  Focus-Proc 'msedge'
+  Capture 'mission-control'
   # Only a real Edge window should anchor the crop; the launcher console is ~880px wide, the maximized
   # Edge app window is near full screen. If the crop looks like the console, drop it (full-frame gif).
-  if (-not $script:curCrop -or $script:curCrop.w -lt 1000) {
-    $w = if ($script:curCrop) { $script:curCrop.w } else { 0 }
-    $script:curCrop = $null
+  $missionRect = Get-FgRect
+  if (-not $missionRect -or $missionRect.w -lt 1000) {
+    $w = if ($missionRect) { $missionRect.w } else { 0 }
     Get-Process msedge -EA SilentlyContinue | Stop-Process -Force -EA SilentlyContinue
     throw "mission control was not foreground or was too small (w=$w)"
   }
   Start-Sleep 2
 
   # End the same moving proof clip with the tray/taskbar recap of what this node has been doing.
-  # Use full-frame cropping so the dashboard, taskbar interaction, menu, and dialog remain contiguous.
   if (-not $haveTok) { Write-Host 'not linked: skipping activity summary inside dashboard clip'; return }
-  $script:curCrop = $null
   $dlg = Open-TrayActivitySummary
-  $script:curCrop = $null
   Write-Host 'activity summary dialog opened from tray'
   Start-Sleep 8
 }

@@ -124,10 +124,9 @@ jobs:
           set -euo pipefail
           g=/mnt/ram/e2e/gifs
           rm -rf pub && mkdir pub
-          # The site uses install-screen.gif, link-screen.gif, mission-control.gif,
-          # and still fallbacks. third-party-app.gif is published for CI diagnostics.
-          # Publish gif + a still fallback for each; missing ones are skipped.
-          for f in install-screen link-screen remote-task third-party-app mission-control; do
+          # Website contract: installer, link, third-party app proof, mission control,
+          # plus the raw node desktop still. Publish gif + still fallback for each gif.
+          for f in install-screen link-screen third-party-app mission-control; do
             cp "$g/$f.gif" "pub/$f.gif" 2>/dev/null || true
             cp "$g/$f.png" "pub/$f.png" 2>/dev/null || true
           done
