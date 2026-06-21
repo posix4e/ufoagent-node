@@ -664,6 +664,7 @@ mod imp {
             match listener.accept() {
                 Ok((stream, addr)) => {
                     log::info!("warm worker control connected from {addr}");
+                    stream.set_nonblocking(false)?;
                     return Ok(stream);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
