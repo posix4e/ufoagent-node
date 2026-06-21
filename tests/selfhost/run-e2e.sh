@@ -57,7 +57,7 @@ emit_progress(){
 
 report_progress(){
   local tmp="$WORK/progress.tmp" total line
-  SSH 'if(Test-Path C:\e2e\out\progress.ndjson){Get-Content C:\e2e\out\progress.ndjson}' > "$tmp" 2>/dev/null || true
+  SSH '$p="C:\e2e\out\progress.ndjson"; if(Test-Path $p){ $fs=[System.IO.File]::Open($p,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try { $sr=New-Object System.IO.StreamReader($fs); try { $sr.ReadToEnd() } finally { $sr.Close() } } finally { $fs.Close() } }' > "$tmp" 2>/dev/null || true
   [ -s "$tmp" ] || return 0
   tr -d '\r' < "$tmp" > "$PROGRESS"
   total=$(wc -l < "$PROGRESS" | tr -d ' ')
@@ -211,7 +211,7 @@ echo "=== collect ==="
 SSH 'Get-Content C:\e2e\out\result.json -Raw' > "$WORK/result.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\phases.json -Raw' > "$WORK/phases.json" 2>/dev/null || true
 SSH 'Get-Content C:\e2e\out\journey.log -Raw' > "$WORK/journey.log" 2>/dev/null || true
-SSH 'Get-Content C:\e2e\out\progress.ndjson -Raw' > "$PROGRESS" 2>/dev/null || true
+SSH '$p="C:\e2e\out\progress.ndjson"; if(Test-Path $p){ $fs=[System.IO.File]::Open($p,[System.IO.FileMode]::Open,[System.IO.FileAccess]::Read,[System.IO.FileShare]::ReadWrite); try { $sr=New-Object System.IO.StreamReader($fs); try { $sr.ReadToEnd() } finally { $sr.Close() } } finally { $fs.Close() } }' > "$PROGRESS" 2>/dev/null || true
 # The real captured desktop still (binary -> SCP, not Get-Content). Lands in gifs/ so the publish step
 # ships it next to the gifs. Absent if the dashboard phase skipped (old agent / no Edge).
 mkdir -p "$WORK/gifs"

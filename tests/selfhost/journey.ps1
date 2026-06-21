@@ -657,11 +657,36 @@ function Close-ActivityDialog($dlg) {
   } catch {}
 }
 
+function Add-TelemetryLine([string]$path, [string]$line) {
+  $bytes = [System.Text.Encoding]::ASCII.GetBytes($line + [Environment]::NewLine)
+  for ($i = 0; $i -lt 10; $i++) {
+    $fs = $null
+    try {
+      $fs = [System.IO.File]::Open(
+        $path,
+        [System.IO.FileMode]::Append,
+        [System.IO.FileAccess]::Write,
+        [System.IO.FileShare]::ReadWrite
+      )
+      $fs.Write($bytes, 0, $bytes.Length)
+      return
+    } catch [System.IO.IOException] {
+      Start-Sleep -Milliseconds 50
+    } catch {
+      Write-Host "progress telemetry write skipped: $($_.Exception.Message)"
+      return
+    } finally {
+      if ($fs) { $fs.Dispose() }
+    }
+  }
+  Write-Host "progress telemetry write skipped after retries"
+}
+
 function Write-ProgressEvent([string]$kind, [string]$phase = '', [string]$detail = '') {
   $obj = [ordered]@{ ts = (Now); event = $kind }
   if ($phase) { $obj.phase = $phase }
   if ($detail) { $obj.detail = $detail }
-  ([pscustomobject]$obj | ConvertTo-Json -Compress) | Add-Content (Join-Path $OUT 'progress.ndjson') -Encoding Ascii
+  Add-TelemetryLine (Join-Path $OUT 'progress.ndjson') ([pscustomobject]$obj | ConvertTo-Json -Compress)
 }
 
 function Write-Result($status) {
