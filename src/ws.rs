@@ -33,10 +33,10 @@ const PROGRESS_MIN_INTERVAL: Duration = Duration::from_secs(2);
 type Sock = WebSocket<MaybeTlsStream<TcpStream>>;
 
 const PING_EVERY: Duration = Duration::from_secs(45);
-/// Wake the read loop often enough to flush background worker results/progress promptly. A long
-/// read timeout makes quick commands appear slow because queued outbound frames only drain after
-/// `socket.read()` returns.
-const READ_TIMEOUT: Duration = Duration::from_millis(500);
+/// Wake the synchronous read loop often enough to flush background worker results/progress promptly.
+/// Queued outbound frames only drain after `socket.read()` returns, so this bounds idle-socket
+/// outbound latency to roughly 50ms without changing the socket ownership model.
+const READ_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Shared with the login-agent loop: socket liveness, the control plane's
 /// minimum-version floor from the hello_ack (drives forced self-updates), and an outbound queue so
