@@ -441,7 +441,7 @@ mod imp {
                     recycle_reason = Some("worker memory threshold reached".to_string());
                 }
             }
-            Ok(recycle_reason.and_then(|reason| inner.proc.take().map(|proc| (proc, reason))))
+            Ok(inner.proc.take().zip(recycle_reason))
         }
 
         fn start_background(self: &Arc<Self>, sig: String, reason: &'static str) {
