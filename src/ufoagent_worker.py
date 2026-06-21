@@ -54,6 +54,7 @@ class UFOAgentWorker:
         port = int(os.environ["UFOAGENT_WORKER_PORT"])
         sock = socket.create_connection((host, port), timeout=10)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        sock.settimeout(None)
         return sock
 
     def redirect_stdio(self):
@@ -162,27 +163,48 @@ class UFOAgentWorker:
 
     def _start_reader(self, loop):
         def read_control():
-            control_in = self.sock.makefile("r", encoding="utf-8")
-            for raw in control_in:
-                raw = raw.strip()
-                if not raw:
-                    continue
+            try:
+                control_in = self.sock.makefile("r", encoding="utf-8")
+                for raw in control_in:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        command = json.loads(raw)
+                    except Exception as exc:
+                        self.protocol.emit(
+                            {"type": "error", "error": f"invalid command JSON: {exc}"}
+                        )
+                        continue
+                    kind = command.get("type")
+                    if kind == "resume":
+                        self.handle_resume(command)
+                    elif kind == "abort":
+                        self.handle_abort(command, loop)
+                    elif kind == "ping":
+                        self.protocol.emit({"type": "pong"})
+                    else:
+                        loop.call_soon_threadsafe(self.queue.put_nowait, command)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                self.log(
+                    "control_reader_error",
+                    error=error,
+                    traceback=traceback.format_exc(limit=20),
+                )
                 try:
-                    command = json.loads(raw)
-                except Exception as exc:
                     self.protocol.emit(
-                        {"type": "error", "error": f"invalid command JSON: {exc}"}
+                        {
+                            "type": "diag",
+                            "message": "control_reader_error",
+                            "error": error,
+                        }
                     )
-                    continue
-                kind = command.get("type")
-                if kind == "resume":
-                    self.handle_resume(command)
-                elif kind == "abort":
-                    self.handle_abort(command, loop)
-                elif kind == "ping":
-                    self.protocol.emit({"type": "pong"})
-                else:
-                    loop.call_soon_threadsafe(self.queue.put_nowait, command)
+                except Exception as emit_exc:
+                    self.log(
+                        "control_reader_error_emit_failed",
+                        error=f"{type(emit_exc).__name__}: {emit_exc}",
+                    )
 
         thread = threading.Thread(
             target=read_control, name="ufoagent-control", daemon=True
