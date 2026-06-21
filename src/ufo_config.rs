@@ -8,10 +8,10 @@ use crate::controlplane::Credential;
 const MANAGED_USE_MCP_LINE: &str =
     "USE_MCP: False  # Managed by ufoagent: use UI automation; UFO MCP can crash GUI tasks.";
 const MANAGED_MCP_YAML: &str = r#"# Managed by ufoagent - do not edit by hand.
-# Keep UFO's local UI data/action servers plus HostAgent's constrained app launcher. The managed
+# Keep UFO's local UI data/action servers plus HostAgent's CLI launcher. The managed
 # runner still needs local MCP for screenshots, window enumeration, clicks, typing, and opening GUI
-# apps. Avoid Office/HTTP MCP servers; prompt-level MCP tool loading is skipped separately when
-# USE_MCP=False.
+# apps/running commands. Avoid Office/HTTP MCP servers; prompt-level MCP tool loading is skipped
+# separately when USE_MCP=False.
 HostAgent:
   default:
     data_collection:
@@ -73,15 +73,13 @@ const MANAGED_APP_CONFIRMATION_BLOCK: &str = r#"        # Managed by ufoagent: r
         # Managed by ufoagent: unattended GUI tasks must not prompt on stdin; overseer is the safety layer.
         decision = True"#;
 #[cfg(test)]
-const MANAGED_CLI_ALLOWLIST_MARKER: &str =
-    "Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.";
-const MANAGED_CLI_ALLOWLIST_BLOCK: &str = r#"ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset(
-    {
-        # Managed by ufoagent: allow one constrained launcher instead of per-app shell entries.
-        "ufoagent-launch",
-        "ufoagent-launch.cmd",
-    }
-)"#;
+const MANAGED_CLI_POLICY_MARKER: &str =
+    "Managed by ufoagent: permit every CLI command; overseer is the safety layer.";
+const MANAGED_CLI_ALLOWLIST_BLOCK: &str = r#"# Managed by ufoagent: unused; CLI policy below permits every command.
+ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset()"#;
+const MANAGED_CLI_POLICY_FUNCTION: &str = r#"def _is_cli_command_allowed(command_str: str) -> bool:
+    """Managed by ufoagent: permit every CLI command; overseer is the safety layer."""
+    return True"#;
 
 fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -190,12 +188,15 @@ fn patch_app_confirmation(path: &Path) -> Result<bool> {
 fn patch_cli_allowlist(path: &Path) -> Result<bool> {
     let original = std::fs::read_to_string(path)
         .with_context(|| format!("reading UFO CLI launcher {}", path.display()))?;
-    let Some(patched) = replace_cli_allowlist_block(&original) else {
+    let Some(mut patched) = replace_cli_command_policy(&original) else {
         anyhow::bail!(
-            "could not find CLI launcher allow-list block in UFO file {}",
+            "could not find CLI launcher policy function in UFO file {}",
             path.display()
         );
     };
+    if let Some(with_allowlist) = replace_cli_allowlist_block(&patched) {
+        patched = with_allowlist;
+    }
     if patched == original {
         return Ok(false);
     }
@@ -212,6 +213,19 @@ fn replace_cli_allowlist_block(original: &str) -> Option<String> {
         String::with_capacity(original.len() - end + MANAGED_CLI_ALLOWLIST_BLOCK.len());
     patched.push_str(&original[..start]);
     patched.push_str(MANAGED_CLI_ALLOWLIST_BLOCK);
+    patched.push_str(&rest[end..]);
+    Some(patched)
+}
+
+fn replace_cli_command_policy(original: &str) -> Option<String> {
+    let start = original.find("def _is_cli_command_allowed(command_str: str) -> bool:")?;
+    let rest = &original[start..];
+    let end = rest.find("@MCPRegistry.register_factory_decorator")?;
+    let mut patched =
+        String::with_capacity(original.len() - end + MANAGED_CLI_POLICY_FUNCTION.len() + 2);
+    patched.push_str(&original[..start]);
+    patched.push_str(MANAGED_CLI_POLICY_FUNCTION);
+    patched.push_str("\n\n");
     patched.push_str(&rest[end..]);
     Some(patched)
 }
@@ -246,8 +260,8 @@ fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
 /// Apply UFOAgent-owned UFO defaults that keep the managed GUI runner stable.
 ///
 /// UFO's local MCP servers are also its UI automation transport. Keep the local UI servers available
-/// for screenshots/clicks/typing and the constrained HostAgent app launcher, but remove Office/HTTP
-/// MCP servers and skip prompt-level MCP tool loading while `USE_MCP` is false.
+/// for screenshots/clicks/typing and the HostAgent CLI launcher, but remove Office/HTTP MCP servers
+/// and skip prompt-level MCP tool loading while `USE_MCP` is false.
 pub fn apply_managed_defaults(ufo_home: &Path) -> Result<PathBuf> {
     apply_managed_mcp_config(ufo_home)?;
     apply_managed_mcp_loader_patches(ufo_home)?;
@@ -466,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_defaults_patch_cli_launcher_allowlist() {
+    fn managed_defaults_patch_cli_launcher_policy() {
         let home = temp_home("cli-allowlist");
         let cli = home
             .join("ufo")
@@ -477,7 +491,9 @@ mod tests {
         std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
         std::fs::write(
             &cli,
-            r#"from typing import FrozenSet
+            r#"import re
+import shlex
+from typing import FrozenSet, List
 
 ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset(
     {
@@ -492,33 +508,55 @@ ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset(
     }
 )
 
-def is_command_allowed(command: str) -> bool:
-    return command in ALLOWED_CLI_COMMANDS
+_DANGEROUS_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\bcurl\b|\bwget\b", re.IGNORECASE),
+]
+
+def _is_cli_command_allowed(command_str: str) -> bool:
+    if not command_str or not command_str.strip():
+        return False
+    tokens = shlex.split(command_str)
+    base = tokens[0].strip().lower()
+    if not any(base == allowed.lower() for allowed in ALLOWED_CLI_COMMANDS):
+        return False
+    for pattern in _DANGEROUS_PATTERNS:
+        if pattern.search(command_str):
+            return False
+    return True
+
+@MCPRegistry.register_factory_decorator("CommandLineExecutor")
+def create_cli_mcp_server(*args, **kwargs):
+    return None
 "#,
         )
         .unwrap();
 
         apply_managed_defaults(&home).unwrap();
         let patched = std::fs::read_to_string(&cli).unwrap();
-        assert!(patched.contains(MANAGED_CLI_ALLOWLIST_MARKER));
-        assert!(patched.contains("\"ufoagent-launch.cmd\""));
+        assert!(patched.contains(MANAGED_CLI_POLICY_MARKER));
+        assert!(patched.contains("ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset()"));
+        assert!(patched.contains("return True"));
+        assert!(patched.contains("@MCPRegistry.register_factory_decorator"));
+        assert!(
+            !patched.contains("any(base == allowed.lower() for allowed in ALLOWED_CLI_COMMANDS)")
+        );
+        assert!(!patched.contains("pattern.search(command_str)"));
         assert!(!patched.contains("\"msedge.exe\""));
         assert!(!patched.contains("\"code.exe\""));
         assert!(!patched.contains("\"notepad.exe\""));
         assert!(!patched.contains("\"notepad-plus-plus.cmd\""));
         assert!(!patched.contains("\"notepad++.exe\""));
-        assert!(patched.contains("def is_command_allowed"));
-        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
+        assert_eq!(patched.matches(MANAGED_CLI_POLICY_MARKER).count(), 1);
 
         apply_managed_defaults(&home).unwrap();
         let patched = std::fs::read_to_string(&cli).unwrap();
-        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
+        assert_eq!(patched.matches(MANAGED_CLI_POLICY_MARKER).count(), 1);
 
         let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]
-    fn managed_defaults_repairs_partial_managed_cli_launcher_allowlist() {
+    fn managed_defaults_repairs_partial_managed_cli_launcher_policy() {
         let home = temp_home("cli-allowlist-migrate");
         let cli = home
             .join("ufo")
@@ -529,7 +567,8 @@ def is_command_allowed(command: str) -> bool:
         std::fs::create_dir_all(cli.parent().unwrap()).unwrap();
         std::fs::write(
             &cli,
-            r#"from typing import FrozenSet
+            r#"import shlex
+from typing import FrozenSet
 
 ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset(
     {
@@ -546,20 +585,32 @@ ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset(
         "ufoagent-launch.cmd",
     }
 )
+
+def _is_cli_command_allowed(command_str: str) -> bool:
+    tokens = shlex.split(command_str)
+    base = tokens[0].strip().lower()
+    return any(base == allowed.lower() for allowed in ALLOWED_CLI_COMMANDS)
+
+@MCPRegistry.register_factory_decorator("CommandLineExecutor")
+def create_cli_mcp_server(*args, **kwargs):
+    return None
 "#,
         )
         .unwrap();
 
         apply_managed_defaults(&home).unwrap();
         let patched = std::fs::read_to_string(&cli).unwrap();
-        assert!(patched.contains(MANAGED_CLI_ALLOWLIST_MARKER));
-        assert!(patched.contains("\"ufoagent-launch.cmd\""));
+        assert!(patched.contains(MANAGED_CLI_POLICY_MARKER));
+        assert!(patched.contains("ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset()"));
+        assert!(patched.contains("return True"));
+        assert!(!patched.contains("allow one constrained launcher"));
+        assert!(!patched.contains("\"ufoagent-launch.cmd\""));
         assert!(!patched.contains("\"msedge.exe\""));
         assert!(!patched.contains("\"chrome.exe\""));
         assert!(!patched.contains("\"code.exe\""));
         assert!(!patched.contains("\"bambu-studio.cmd\""));
         assert!(!patched.contains("\"notepad-plus-plus.cmd\""));
-        assert_eq!(patched.matches(MANAGED_CLI_ALLOWLIST_MARKER).count(), 1);
+        assert_eq!(patched.matches(MANAGED_CLI_POLICY_MARKER).count(), 1);
 
         let _ = std::fs::remove_dir_all(home);
     }
