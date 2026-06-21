@@ -54,8 +54,6 @@ pub struct WsState {
 #[derive(Clone)]
 struct InflightTask {
     abort: Arc<AtomicBool>,
-    task: String,
-    request: Option<String>,
 }
 
 impl WsState {
@@ -83,8 +81,8 @@ impl WsState {
     fn register_run_task(
         &self,
         id: String,
-        task: String,
-        request: Option<String>,
+        _task: String,
+        _request: Option<String>,
     ) -> Arc<AtomicBool> {
         let abort = Arc::new(AtomicBool::new(false));
         if let Ok(mut g) = self.inflight.lock() {
@@ -92,8 +90,6 @@ impl WsState {
                 id,
                 InflightTask {
                     abort: abort.clone(),
-                    task,
-                    request,
                 },
             );
         }
@@ -256,7 +252,7 @@ fn handle_message(socket: &mut Sock, state: &Arc<WsState>, cfg: &Config, txt: &s
         return Ok(());
     }
     if kind == Some("interject") {
-        handle_interject(state, cfg, &msg);
+        handle_interject(state, &msg);
         return Ok(());
     }
     if kind != Some("command") {
@@ -332,13 +328,14 @@ fn handle_halt(state: &Arc<WsState>, msg: &Value) {
         .unwrap_or("overseer requested halt");
     if state.halt_run_task(id).is_some() {
         log::warn!("ws: halting run_task {id}: {reason}");
+        crate::worker::abort_task(id);
         state.queue_send(json!({ "type": "status", "current_task": truncate(&format!("Halting: {reason}"), PROGRESS_MAX) }));
     } else {
         log::warn!("ws: halt requested for unknown run_task {id}: {reason}");
     }
 }
 
-fn handle_interject(state: &Arc<WsState>, cfg: &Config, msg: &Value) {
+fn handle_interject(state: &Arc<WsState>, msg: &Value) {
     let id = msg.get("cmd_id").and_then(Value::as_str).unwrap_or("");
     if id.is_empty() {
         return;
@@ -348,7 +345,7 @@ fn handle_interject(state: &Arc<WsState>, cfg: &Config, msg: &Value) {
         .and_then(Value::as_str)
         .unwrap_or("overseer requested correction")
         .to_string();
-    let Some(previous) = state.halt_run_task(id) else {
+    if !state.is_run_task_inflight(id) {
         log::warn!("ws: interject requested for unknown run_task {id}: {instruction}");
         if let Some(next_id) = msg.get("new_cmd_id").and_then(Value::as_str) {
             state.queue_send(json!({
@@ -359,44 +356,38 @@ fn handle_interject(state: &Arc<WsState>, cfg: &Config, msg: &Value) {
             }));
         }
         return;
-    };
+    }
 
-    let args = msg.get("args").unwrap_or(&Value::Null);
-    let next_id = msg
+    let new_cmd_id = msg
         .get("new_cmd_id")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .unwrap_or_else(|| format!("{id}-interject"));
-    let task = args
-        .get("task")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .unwrap_or(previous.task);
-    let request = args
-        .get("request")
-        .and_then(Value::as_str)
-        .filter(|s| !s.trim().is_empty())
-        .map(str::to_string)
-        .or_else(|| {
-            previous
-                .request
-                .map(|r| format!("{r}\n\nOverseer correction:\n{instruction}"))
-        });
+        .map(str::to_string);
 
-    log::warn!("ws: interjecting run_task {id}; starting corrected run_task {next_id}");
+    log::warn!("ws: interjecting run_task {id}; injecting correction into warm UFO session");
     state.queue_send(json!({ "type": "status", "current_task": truncate(&format!("Interjecting: {instruction}"), PROGRESS_MAX) }));
-    let next_state = state.clone();
-    let control_plane = cfg.control_plane_url();
-    let previous_id = id.to_string();
-    std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while next_state.is_run_task_inflight(&previous_id) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
+    if crate::worker::resume_task(id, &instruction) {
+        if let Some(next_id) = new_cmd_id.filter(|next_id| next_id != id) {
+            state.queue_send(json!({
+                "type": "result",
+                "id": next_id,
+                "status": "done",
+                "result": format!("overseer correction injected into active command {id}")
+            }));
         }
-        spawn_run_task(next_state, next_id, task, request, control_plane);
-    });
+    } else {
+        log::warn!("ws: warm resume failed for run_task {id}; halting instead");
+        state.halt_run_task(id);
+        crate::worker::abort_task(id);
+        if let Some(next_id) = new_cmd_id {
+            state.queue_send(json!({
+                "type": "result",
+                "id": next_id,
+                "status": "failed",
+                "result": "warm UFO resume failed"
+            }));
+        }
+    }
 }
 
 fn execute(cfg: &Config, kind: &str) -> (&'static str, String) {

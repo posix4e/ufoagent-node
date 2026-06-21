@@ -80,6 +80,78 @@ ALLOWED_CLI_COMMANDS: FrozenSet[str] = frozenset()"#;
 const MANAGED_CLI_POLICY_FUNCTION: &str = r#"def _is_cli_command_allowed(command_str: str) -> bool:
     """Managed by ufoagent: permit every CLI command; overseer is the safety layer."""
     return True"#;
+const UFOAGENT_WORKER: &str = include_str!("ufoagent_worker.py");
+const MANAGED_RESUME_MARKER: &str =
+    "Managed by ufoagent: queued resume requests for warm worker chains.";
+const BASE_SESSION_INIT_SENTINEL: &str = r#"        self._rounds: Dict[int, BaseRound] = {}"#;
+const BASE_SESSION_INIT_PATCH: &str = r#"        self._rounds: Dict[int, BaseRound] = {}
+
+        # Managed by ufoagent: queued resume requests for warm worker chains.
+        self._ufoagent_injected_requests = []
+        self._ufoagent_resume_round_in_progress = False"#;
+const BASE_SESSION_METHOD_SENTINEL: &str = r#"    @abstractmethod
+    def request_to_evaluate(self) -> str:"#;
+const BASE_SESSION_METHOD_PATCH: &str = r#"    # Managed by ufoagent: queued resume requests for warm worker chains.
+    def ufoagent_inject_request(self, request: str) -> bool:
+        request = (request or "").strip()
+        if not request:
+            return False
+        if not hasattr(self, "_ufoagent_injected_requests"):
+            self._ufoagent_injected_requests = []
+        self._ufoagent_injected_requests.append(request)
+        self._finish = False
+        return True
+
+    def ufoagent_has_injected_request(self) -> bool:
+        return bool(getattr(self, "_ufoagent_injected_requests", []))
+
+    def ufoagent_next_injected_request(self) -> str:
+        requests = getattr(self, "_ufoagent_injected_requests", [])
+        if not requests:
+            return ""
+        self._ufoagent_resume_round_in_progress = True
+        self._finish = False
+        return requests.pop(0)
+
+    @abstractmethod
+    def request_to_evaluate(self) -> str:"#;
+const BASE_SESSION_IS_FINISHED_SENTINEL: &str = r#"        if (
+            self._finish
+            or self.step >= ufo_config.system.max_step
+            or self.total_rounds >= ufo_config.system.max_round
+        ):
+            return True"#;
+const BASE_SESSION_IS_FINISHED_PATCH: &str = r#"        # Managed by ufoagent: queued resume requests may add correction rounds
+        # beyond UFO's configured max_round while preserving the same Session context.
+        has_resume = self.ufoagent_has_injected_request()
+        resume_round = bool(getattr(self, "_ufoagent_resume_round_in_progress", False))
+        if self._finish and not has_resume and not resume_round:
+            return True
+        if self.step >= ufo_config.system.max_step:
+            return True
+        if self.total_rounds >= ufo_config.system.max_round and not has_resume and not resume_round:
+            return True"#;
+const SESSION_NEXT_REQUEST_SENTINEL: &str = r#"        else:
+            request, iscomplete = interactor.new_request()
+            if iscomplete:
+                self._finish = True
+            return request"#;
+const SESSION_NEXT_REQUEST_PATCH: &str = r#"        else:
+            injected = self.ufoagent_next_injected_request()
+            if injected:
+                return injected
+            request, iscomplete = interactor.new_request()
+            if iscomplete:
+                self._finish = True
+            return request"#;
+const SESSION_ADD_ROUND_SENTINEL: &str = r#"        self.add_round(round.id, round)
+
+        return round"#;
+const SESSION_ADD_ROUND_PATCH: &str = r#"        self.add_round(round.id, round)
+        if getattr(self, "_ufoagent_resume_round_in_progress", False):
+            self._ufoagent_resume_round_in_progress = False
+
+        return round"#;
 
 fn yaml_escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -122,6 +194,22 @@ pub fn system_yaml_path(ufo_home: &Path) -> PathBuf {
 
 pub fn mcp_yaml_path(ufo_home: &Path) -> PathBuf {
     ufo_home.join("config").join("ufo").join("mcp.yaml")
+}
+
+pub fn worker_path(ufo_home: &Path) -> PathBuf {
+    ufo_home.join("ufoagent_worker.py")
+}
+
+pub fn install_worker(ufo_home: &Path) -> Result<PathBuf> {
+    std::fs::create_dir_all(ufo_home)
+        .with_context(|| format!("creating UFO home {}", ufo_home.display()))?;
+    let path = worker_path(ufo_home);
+    match std::fs::read_to_string(&path) {
+        Ok(current) if current == UFOAGENT_WORKER => {}
+        _ => std::fs::write(&path, UFOAGENT_WORKER)
+            .with_context(|| format!("writing managed UFO worker {}", path.display()))?,
+    }
+    Ok(path)
 }
 
 fn apply_managed_mcp_config(ufo_home: &Path) -> Result<PathBuf> {
@@ -205,6 +293,63 @@ fn patch_cli_allowlist(path: &Path) -> Result<bool> {
     Ok(true)
 }
 
+fn patch_resume_base_session(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO session loop {}", path.display()))?;
+    if original.contains(MANAGED_RESUME_MARKER) {
+        return Ok(false);
+    }
+    let mut patched = original.replacen(BASE_SESSION_INIT_SENTINEL, BASE_SESSION_INIT_PATCH, 1);
+    patched = patched.replacen(BASE_SESSION_METHOD_SENTINEL, BASE_SESSION_METHOD_PATCH, 1);
+    patched = patched.replacen(
+        BASE_SESSION_IS_FINISHED_SENTINEL,
+        BASE_SESSION_IS_FINISHED_PATCH,
+        1,
+    );
+    if patched == original
+        || !patched.contains(BASE_SESSION_INIT_PATCH)
+        || !patched.contains("def ufoagent_inject_request")
+        || !patched.contains("has_resume = self.ufoagent_has_injected_request()")
+    {
+        anyhow::bail!(
+            "could not find BaseSession resume sentinels in UFO file {}",
+            path.display()
+        );
+    }
+    std::fs::write(path, patched)
+        .with_context(|| format!("writing managed UFO resume patch {}", path.display()))?;
+    Ok(true)
+}
+
+fn patch_resume_windows_session(path: &Path) -> Result<bool> {
+    let original = std::fs::read_to_string(path)
+        .with_context(|| format!("reading UFO Windows session {}", path.display()))?;
+    if original.contains("injected = self.ufoagent_next_injected_request()")
+        && original.contains("_ufoagent_resume_round_in_progress")
+    {
+        return Ok(false);
+    }
+    let mut patched =
+        original.replacen(SESSION_NEXT_REQUEST_SENTINEL, SESSION_NEXT_REQUEST_PATCH, 1);
+    patched = patched.replacen(SESSION_ADD_ROUND_SENTINEL, SESSION_ADD_ROUND_PATCH, 1);
+    if patched == original
+        || !patched.contains("injected = self.ufoagent_next_injected_request()")
+        || !patched.contains("_ufoagent_resume_round_in_progress")
+    {
+        anyhow::bail!(
+            "could not find Windows Session resume sentinels in UFO file {}",
+            path.display()
+        );
+    }
+    std::fs::write(path, patched).with_context(|| {
+        format!(
+            "writing managed UFO Windows resume patch {}",
+            path.display()
+        )
+    })?;
+    Ok(true)
+}
+
 fn replace_cli_allowlist_block(original: &str) -> Option<String> {
     let start = original.find("ALLOWED_CLI_COMMANDS")?;
     let rest = &original[start..];
@@ -254,6 +399,18 @@ fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
     if cli.exists() {
         patch_cli_allowlist(&cli)?;
     }
+    let basic = ["ufo", "module", "basic.py"]
+        .iter()
+        .fold(ufo_home.to_path_buf(), |p, c| p.join(c));
+    if basic.exists() {
+        patch_resume_base_session(&basic)?;
+    }
+    let session = ["ufo", "module", "sessions", "session.py"]
+        .iter()
+        .fold(ufo_home.to_path_buf(), |p, c| p.join(c));
+    if session.exists() {
+        patch_resume_windows_session(&session)?;
+    }
     Ok(())
 }
 
@@ -263,6 +420,7 @@ fn apply_managed_mcp_loader_patches(ufo_home: &Path) -> Result<()> {
 /// for screenshots/clicks/typing and the HostAgent CLI launcher, but remove Office/HTTP MCP servers
 /// and skip prompt-level MCP tool loading while `USE_MCP` is false.
 pub fn apply_managed_defaults(ufo_home: &Path) -> Result<PathBuf> {
+    install_worker(ufo_home)?;
     apply_managed_mcp_config(ufo_home)?;
     apply_managed_mcp_loader_patches(ufo_home)?;
 
@@ -611,6 +769,70 @@ def create_cli_mcp_server(*args, **kwargs):
         assert!(!patched.contains("\"bambu-studio.cmd\""));
         assert!(!patched.contains("\"notepad-plus-plus.cmd\""));
         assert_eq!(patched.matches(MANAGED_CLI_POLICY_MARKER).count(), 1);
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn managed_defaults_install_worker_and_patch_resume_adapter() {
+        let home = temp_home("warm-worker");
+        let basic = home.join("ufo").join("module").join("basic.py");
+        let session = home
+            .join("ufo")
+            .join("module")
+            .join("sessions")
+            .join("session.py");
+        std::fs::create_dir_all(basic.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &basic,
+            format!(
+                r#"class BaseSession:
+    def __init__(self):
+{BASE_SESSION_INIT_SENTINEL}
+
+    def is_finished(self) -> bool:
+{BASE_SESSION_IS_FINISHED_SENTINEL}
+
+{BASE_SESSION_METHOD_SENTINEL}
+        pass
+"#
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &session,
+            format!(
+                r#"class Session:
+    def create_new_round(self):
+        round = object()
+{SESSION_ADD_ROUND_SENTINEL}
+
+    def next_request(self) -> str:
+        if self.total_rounds == 0:
+            return self._init_request
+{SESSION_NEXT_REQUEST_SENTINEL}
+"#
+            ),
+        )
+        .unwrap();
+
+        apply_managed_defaults(&home).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(worker_path(&home)).unwrap(),
+            UFOAGENT_WORKER
+        );
+        let basic_patched = std::fs::read_to_string(&basic).unwrap();
+        assert!(basic_patched.contains(MANAGED_RESUME_MARKER));
+        assert!(basic_patched.contains("def ufoagent_inject_request"));
+        assert!(basic_patched.contains("has_resume = self.ufoagent_has_injected_request()"));
+        let session_patched = std::fs::read_to_string(&session).unwrap();
+        assert!(session_patched.contains("injected = self.ufoagent_next_injected_request()"));
+        assert!(session_patched.contains("_ufoagent_resume_round_in_progress"));
+
+        apply_managed_defaults(&home).unwrap();
+        let basic_patched = std::fs::read_to_string(&basic).unwrap();
+        assert_eq!(basic_patched.matches(MANAGED_RESUME_MARKER).count(), 2);
 
         let _ = std::fs::remove_dir_all(home);
     }

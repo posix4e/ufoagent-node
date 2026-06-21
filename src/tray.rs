@@ -202,10 +202,28 @@ mod imp {
         });
     }
 
-    /// Run one remote task in this interactive session: `ufoagent run --task <task> -r <request>`.
+    pub(super) fn run_one(
+        req: &runtime::RemoteTaskRequest,
+        progress: runtime::ProgressCallback,
+        abort: runtime::AbortSignal,
+    ) -> runtime::RemoteTaskResult {
+        match crate::worker::run_task(req, progress.clone(), abort.clone()) {
+            Ok(result) => result,
+            Err(e) => {
+                log::warn!(
+                    "tray: warm worker unavailable for task {} ({}); falling back to cold UFO2: {e:#}",
+                    req.id,
+                    req.task
+                );
+                run_one_cold(req, progress, abort)
+            }
+        }
+    }
+
+    /// Cold fallback: run one remote task via `ufoagent run --task <task> -r <request>`.
     /// Streams UFO2 output to the dashboard, captures the full transcript to
     /// tasks\logs\<id>.txt, and returns the exit + a tail as the result.
-    pub(super) fn run_one(
+    fn run_one_cold(
         req: &runtime::RemoteTaskRequest,
         progress: runtime::ProgressCallback,
         abort: runtime::AbortSignal,
@@ -428,6 +446,7 @@ mod imp {
                 log::error!("login agent loop failed: {e:#}");
             }
         });
+        crate::worker::prewarm();
 
         // Best-effort system-tray icon + menu. If it can't be built, don't take the worker down with
         // it — log and park so the threads above keep the node usable as a headless login agent.
