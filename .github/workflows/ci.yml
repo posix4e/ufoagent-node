@@ -116,6 +116,14 @@ jobs:
           UFOAGENT_INSTALLER_PATH: ${{ github.workspace }}/selfhost-installer/ufoagent-setup.exe
         run: bash tests/selfhost/run-e2e.sh
 
+      - name: Upload warm worker logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: warm-worker-logs
+          path: /mnt/ram/e2e/warm-worker-logs
+          if-no-files-found: warn
+
       - name: Publish the marketing gifs to the screenshots branch
         if: success()
         env:

@@ -25,6 +25,8 @@ mod ufo_config;
 mod update;
 mod util;
 #[cfg_attr(not(windows), allow(dead_code))]
+mod worker;
+#[cfg_attr(not(windows), allow(dead_code))]
 mod ws;
 
 use anyhow::Result;
