@@ -96,7 +96,6 @@ mod imp {
     struct WorkerProc {
         child: Child,
         control: TcpStream,
-        started_sig: String,
         ready: bool,
         tasks_completed: usize,
         last_used: Instant,
@@ -331,7 +330,7 @@ mod imp {
                     .inner
                     .lock()
                     .map_err(|_| anyhow!("worker lock poisoned"))?;
-                if let Some((proc, reason)) = self.take_unusable_proc_locked(&mut inner, &sig)? {
+                if let Some((proc, reason)) = self.take_unusable_proc_locked(&mut inner)? {
                     log::info!("warm worker recycling: {reason}");
                     stale_proc = Some(proc);
                 }
@@ -425,7 +424,6 @@ mod imp {
         fn take_unusable_proc_locked(
             &self,
             inner: &mut Inner,
-            sig: &str,
         ) -> Result<Option<(WorkerProc, String)>> {
             let mut recycle_reason = None;
             if let Some(proc) = inner.proc.as_mut() {
@@ -433,8 +431,6 @@ mod imp {
                     recycle_reason = Some(format!("worker exited with {status}"));
                 } else if proc.tasks_completed >= MAX_TASKS_PER_WORKER {
                     recycle_reason = Some("max task count reached".to_string());
-                } else if proc.started_sig != sig {
-                    recycle_reason = Some("managed UFO config changed".to_string());
                 } else if working_set_bytes(proc.child.id())
                     .is_some_and(|bytes| bytes > MAX_WORKING_SET_BYTES)
                 {
@@ -453,11 +449,7 @@ mod imp {
                         return;
                     }
                 };
-                if inner
-                    .proc
-                    .as_ref()
-                    .is_some_and(|proc| proc.started_sig == sig)
-                {
+                if inner.proc.is_some() {
                     false
                 } else if inner.starting_sig.is_some() {
                     log::info!("warm worker start already pending");
@@ -476,7 +468,7 @@ mod imp {
             let manager = Arc::clone(self);
             std::thread::spawn(move || {
                 log::info!("warm worker background start requested: {reason}");
-                let started = spawn_worker(sig.clone());
+                let started = spawn_worker();
                 let mut discard_proc = None;
                 match started {
                     Ok(proc) => {
@@ -601,7 +593,7 @@ mod imp {
         }
     }
 
-    fn spawn_worker(sig: String) -> Result<WorkerProc> {
+    fn spawn_worker() -> Result<WorkerProc> {
         let cfg = Config::load();
         let home = cfg.ufo_home_path();
         let python = cfg
@@ -660,7 +652,6 @@ mod imp {
         Ok(WorkerProc {
             child,
             control,
-            started_sig: sig,
             ready: false,
             tasks_completed: 0,
             last_used: Instant::now(),
