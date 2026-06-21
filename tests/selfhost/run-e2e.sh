@@ -151,6 +151,9 @@ while [ "$(date +%s)" -lt "$d" ]; do
 done
 report_progress || true
 
+echo "=== stop in-guest UFO task processes ==="
+SSH 'Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { ($_.CommandLine + "") -match "ProgramData\\UFOAgent\\ufo" -and ($_.Name + "") -match "^(python|pythonw|cmd|powershell|pwsh)\\.exe$" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "guest ufo task cleanup done"' || true
+
 echo "=== stop recorder ==="
 touch "$WORK/stop"; wait "$RECPID" 2>/dev/null || true
 echo "frames=$(ls "$REC" 2>/dev/null | wc -l)"
