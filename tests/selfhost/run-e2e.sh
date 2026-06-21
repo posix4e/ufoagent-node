@@ -12,8 +12,10 @@ IP=""
 SSH(){ sshpass -p "$PW" ssh -n -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=12 "$GUSER@$IP" "$@"; }
 SCP(){ sshpass -p "$PW" scp -O -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"; }
 PROGRESS="$WORK/progress.ndjson"
+WARM_LOGS="$WORK/warm-worker-logs"
 progress_seen=0
 staged_installer=0
+warm_worker_event_count=0
 
 gha_escape(){
   local s="${1:-}"
@@ -65,6 +67,51 @@ report_progress(){
     emit_progress "$(progress_message "$line")"
   done < <(tail -n +"$((progress_seen + 1))" "$PROGRESS")
   progress_seen="$total"
+}
+
+collect_warm_worker_logs(){
+  local tag="${1:-snapshot}" safe remote_dir
+  safe=$(printf '%s' "$tag" | tr -c 'A-Za-z0-9_.-' '_')
+  remote_dir="C:\\e2e\\out\\warm-worker-logs\\$safe"
+  mkdir -p "$WARM_LOGS"
+  SSH "\$dst='$remote_dir'; New-Item -ItemType Directory -Force \$dst | Out-Null; \$files=@('C:\\ProgramData\\UFOAgent\\ufo\\logs\\ufoagent_worker.log','C:\\ProgramData\\UFOAgent\\ufo\\logs\\ufoagent_worker_stdio.log','C:\\ProgramData\\UFOAgent\\ufo\\logs\\ufoagent_worker_faults.log','C:\\ProgramData\\UFOAgent\\ufo\\logs\\ufoagent_worker_ufo.log','C:\\ProgramData\\UFOAgent\\logs\\ufoagent.log'); foreach(\$f in \$files){ if(Test-Path \$f){ Copy-Item \$f (Join-Path \$dst (Split-Path \$f -Leaf)) -Force -ErrorAction SilentlyContinue } }; 'warm worker logs copied'" >/dev/null 2>&1 || true
+  SCP -r "$GUSER@$IP:C:/e2e/out/warm-worker-logs/$safe" "$WARM_LOGS/" 2>/dev/null || true
+}
+
+print_warm_worker_logs(){
+  local dir="$1" f
+  [ -d "$dir" ] || return 0
+  echo "=== warm worker logs: $(basename "$dir") ==="
+  for f in \
+    "$dir/ufoagent_worker.log" \
+    "$dir/ufoagent_worker_stdio.log" \
+    "$dir/ufoagent_worker_faults.log" \
+    "$dir/ufoagent_worker_ufo.log" \
+    "$dir/ufoagent.log"; do
+    echo "--- $(basename "$f") ---"
+    if [ -f "$f" ]; then
+      cat "$f"
+    else
+      echo "(missing)"
+    fi
+  done
+}
+
+warm_worker_events_seen(){
+  SSH "if(Test-Path 'C:\\ProgramData\\UFOAgent\\logs\\ufoagent.log'){ (Select-String -Path 'C:\\ProgramData\\UFOAgent\\logs\\ufoagent.log' -Pattern 'warm worker (spawned|background start|control socket closed|recycling|already exited|still importing|unavailable)' -ErrorAction SilentlyContinue | Measure-Object).Count } else { 0 }" 2>/dev/null | tr -dc '0-9' | head -c 10
+}
+
+report_warm_worker_events(){
+  local count tag dir
+  count=$(warm_worker_events_seen)
+  count=${count:-0}
+  [ "$count" -gt "$warm_worker_event_count" ] 2>/dev/null || return 0
+  tag="event-$count"
+  echo "=== warm worker event observed ($warm_worker_event_count -> $count); collecting logs ==="
+  collect_warm_worker_logs "$tag"
+  dir="$WARM_LOGS/$tag"
+  print_warm_worker_logs "$dir"
+  warm_worker_event_count="$count"
 }
 
 echo "=== revert $SNAP + start $VM ==="
@@ -125,7 +172,7 @@ fi
 SSH 'Get-ChildItem C:\e2e -Recurse -Filter *.ps1 | ForEach-Object { $c=[IO.File]::ReadAllText($_.FullName); [IO.File]::WriteAllText($_.FullName, $c, (New-Object System.Text.UTF8Encoding $true)) }; "reencoded utf8-bom"'
 
 echo "=== start recorder (virsh screenshot loop) ==="
-rm -rf "$REC" "$WORK/gifs" "$WORK/stop" "$WORK/result.json" "$WORK/phases.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp"
+rm -rf "$REC" "$WORK/gifs" "$WORK/stop" "$WORK/result.json" "$WORK/phases.json" "$WORK/journey.log" "$PROGRESS" "$WORK/progress.tmp" "$WARM_LOGS"
 mkdir -p "$REC"   # clear stale frames+gifs/logs so a failed run can't publish or report old ones
 ( while [ ! -f "$WORK/stop" ]; do
     sudo virsh screenshot "$VM" "$REC/frame-$(( $(date +%s%N) / 1000000 )).png" >/dev/null 2>&1 || true
@@ -144,12 +191,14 @@ echo "=== poll result (<=75m) ==="
 status="PENDING"; d=$(( $(date +%s) + 75*60 ))
 while [ "$(date +%s)" -lt "$d" ]; do
   report_progress || true
+  report_warm_worker_events || true
   status=$(SSH 'if(Test-Path C:\e2e\out\result.json){(Get-Content C:\e2e\out\result.json -Raw | ConvertFrom-Json).status}else{"PENDING"}' 2>/dev/null | tr -dc 'A-Za-z')
   echo "  $(date +%T) status=$status"
   case "$status" in PASS|FAIL) break;; esac
   sleep 10
 done
 report_progress || true
+report_warm_worker_events || true
 
 echo "=== stop in-guest UFO task processes ==="
 SSH 'Get-Process notepad,python,pythonw -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object { ($_.CommandLine + "") -match "ProgramData\\UFOAgent\\ufo" -and ($_.Name + "") -match "^(python|pythonw|cmd|powershell|pwsh)\\.exe$" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "guest ufo task cleanup done"' || true
@@ -171,6 +220,9 @@ rm -rf "$WORK/trajectory"; mkdir -p "$WORK/trajectory"
 SCP -r "$GUSER@$IP:C:/e2e/out/ufo-trajectories" "$WORK/trajectory/" 2>/dev/null || true
 SCP "$GUSER@$IP:C:/ProgramData/UFOAgent/ufo/config/ufo/agents.yaml" "$WORK/agents.yaml" 2>/dev/null || true
 SSH 'schtasks /Delete /TN UFOJourney /F 2>$null | Out-Null; "task cleaned"' >/dev/null 2>&1 || true
+echo "=== collect warm worker logs (final) ==="
+collect_warm_worker_logs final
+print_warm_worker_logs "$WARM_LOGS/final"
 echo "--- journey.log (tail) ---"; tail -40 "$WORK/journey.log" 2>/dev/null
 echo "--- progress ---"; cat "$PROGRESS" 2>/dev/null
 echo "--- phases ---"; cat "$WORK/phases.json" 2>/dev/null
