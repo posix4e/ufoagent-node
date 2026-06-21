@@ -34,8 +34,9 @@ mod imp {
     use serde::{Deserialize, Serialize};
     use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, ChildStdin, Command, Stdio};
+    use std::process::{Child, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
     use std::sync::{Arc, Mutex, Once, OnceLock};
     use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -47,8 +48,9 @@ mod imp {
     const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
     const ABORT_GRACE: Duration = Duration::from_secs(5);
     const RECV_POLL: Duration = Duration::from_millis(200);
-    const WORKER_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
+    const WORKER_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
     const WORKER_FIRST_STEP_TIMEOUT: Duration = Duration::from_secs(120);
+    const WORKER_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
     const MAX_TASKS_PER_WORKER: usize = 12;
     const MAX_WORKING_SET_BYTES: u64 = 1536 * 1024 * 1024;
 
@@ -93,7 +95,7 @@ mod imp {
 
     struct WorkerProc {
         child: Child,
-        stdin: ChildStdin,
+        control: TcpStream,
         started_sig: String,
         tasks_completed: usize,
         last_used: Instant,
@@ -333,11 +335,11 @@ mod imp {
                 .proc
                 .as_mut()
                 .ok_or_else(|| anyhow!("warm worker is not running"))?;
-            serde_json::to_writer(&mut proc.stdin, &command)?;
-            proc.stdin.write_all(b"\n")?;
-            proc.stdin.flush()?;
+            serde_json::to_writer(&mut proc.control, &command)?;
+            proc.control.write_all(b"\n")?;
+            proc.control.flush()?;
             proc.last_used = Instant::now();
-            log::info!("warm worker command sent");
+            log::info!("warm worker command sent over tcp");
             Ok(())
         }
 
@@ -353,11 +355,11 @@ mod imp {
                 kill_proc(inner.proc.take());
                 bail!("warm worker already exited with {status}");
             }
-            serde_json::to_writer(&mut proc.stdin, &command)?;
-            proc.stdin.write_all(b"\n")?;
-            proc.stdin.flush()?;
+            serde_json::to_writer(&mut proc.control, &command)?;
+            proc.control.write_all(b"\n")?;
+            proc.control.flush()?;
             proc.last_used = Instant::now();
-            log::info!("warm worker control command sent");
+            log::info!("warm worker control command sent over tcp");
             Ok(())
         }
 
@@ -462,59 +464,87 @@ mod imp {
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("UFO2 not provisioned; run `ufoagent bootstrap` first"))?;
         let script = ufo_config::install_worker(&home)?;
+        let logs = home.join("logs");
+        std::fs::create_dir_all(&logs)?;
+        let stdio_log = logs.join("ufoagent_worker_stdio.log");
+        let stdout = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&stdio_log)
+            .with_context(|| format!("opening worker stdio log {}", stdio_log.display()))?;
+        let stderr = stdout.try_clone()?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .with_context(|| "binding warm worker control socket")?;
+        listener.set_nonblocking(true)?;
+        let port = listener.local_addr()?.port();
         let mut cmd = Command::new(python);
         cmd.arg(&script)
             .current_dir(&home)
             .env("PYTHONUTF8", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .env("UFOAGENT_WORKER_HOST", "127.0.0.1")
+            .env("UFOAGENT_WORKER_PORT", port.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(stdout))
+            .stderr(Stdio::from(stderr));
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         cmd.creation_flags(CREATE_NO_WINDOW);
         let mut child = cmd.spawn().with_context(|| "spawning warm UFO worker")?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow!("warm worker stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("warm worker stdout unavailable"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("warm worker stderr unavailable"))?;
+        let control = accept_worker_control(&listener, &mut child)?;
+        control.set_nodelay(true)?;
+        let read_control = control.try_clone()?;
         let manager = Manager::global();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(|l| l.ok()) {
+            for line in BufReader::new(read_control).lines().map_while(|l| l.ok()) {
                 match serde_json::from_str::<WorkerEvent>(&line) {
                     Ok(event) => manager.dispatch(event),
-                    Err(e) => log::warn!("warm worker emitted non-JSON stdout ({e}): {line}"),
+                    Err(e) => log::warn!("warm worker emitted non-JSON control ({e}): {line}"),
                 }
             }
-            log::warn!("warm worker stdout closed");
-        });
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines().map_while(|l| l.ok()) {
-                if !line.trim().is_empty() {
-                    log::warn!("warm worker stderr: {line}");
-                }
-            }
+            log::warn!("warm worker control socket closed");
         });
         log::info!(
-            "warm worker spawned: pid={} script={} cwd={}",
+            "warm worker spawned: pid={} script={} cwd={} control=127.0.0.1:{} stdio_log={}",
             child.id(),
             script.display(),
-            home.display()
+            home.display(),
+            port,
+            stdio_log.display()
         );
         Ok(WorkerProc {
             child,
-            stdin,
+            control,
             started_sig: sig,
             tasks_completed: 0,
             last_used: Instant::now(),
         })
+    }
+
+    fn accept_worker_control(listener: &TcpListener, child: &mut Child) -> Result<TcpStream> {
+        let deadline = Instant::now() + WORKER_CONNECT_TIMEOUT;
+        loop {
+            match listener.accept() {
+                Ok((stream, addr)) => {
+                    log::info!("warm worker control connected from {addr}");
+                    return Ok(stream);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if let Some(status) = child.try_wait()? {
+                        bail!("warm worker exited before control connection: {status}");
+                    }
+                    if Instant::now() >= deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        bail!(
+                            "warm worker did not connect control socket within {}s",
+                            WORKER_CONNECT_TIMEOUT.as_secs()
+                        );
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(e) => return Err(e).with_context(|| "accepting warm worker control socket"),
+            }
+        }
     }
 
     fn prepare_ufo_home() -> Result<()> {

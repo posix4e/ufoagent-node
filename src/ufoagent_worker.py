@@ -1,8 +1,8 @@
 import asyncio
-import contextlib
-import io
+import faulthandler
 import json
 import os
+import socket
 import sys
 import threading
 import time
@@ -10,8 +10,9 @@ import traceback
 
 
 class Protocol:
-    def __init__(self):
-        self._out = sys.stdout
+    def __init__(self, sock):
+        self._sock = sock
+        self._out = sock.makefile("w", encoding="utf-8", newline="\n")
         self._lock = threading.Lock()
 
     def emit(self, payload):
@@ -19,45 +20,6 @@ class Protocol:
             self._out.write(json.dumps(payload, ensure_ascii=False, default=str))
             self._out.write("\n")
             self._out.flush()
-
-
-class CapturedStream(io.TextIOBase):
-    def __init__(self, protocol, name, current_cmd_id):
-        self.protocol = protocol
-        self.name = name
-        self.current_cmd_id = current_cmd_id
-        self._buffer = ""
-
-    def writable(self):
-        return True
-
-    def write(self, data):
-        if not data:
-            return 0
-        text = str(data)
-        self._buffer += text
-        while "\n" in self._buffer:
-            line, self._buffer = self._buffer.split("\n", 1)
-            self._emit(line.rstrip("\r"))
-        return len(text)
-
-    def flush(self):
-        if self._buffer.strip():
-            self._emit(self._buffer.strip())
-        self._buffer = ""
-
-    def _emit(self, line):
-        line = line.strip()
-        if not line:
-            return
-        prefix = "[stderr] " if self.name == "stderr" else ""
-        self.protocol.emit(
-            {
-                "type": "progress",
-                "cmd_id": self.current_cmd_id(),
-                "message": prefix + line,
-            }
-        )
 
 
 class ActiveTask:
@@ -72,7 +34,8 @@ class ActiveTask:
 
 class UFOAgentWorker:
     def __init__(self):
-        self.protocol = Protocol()
+        self.sock = self.connect_control()
+        self.protocol = Protocol(self.sock)
         self.queue = None
         self.active = None
         self.SessionFactory = None
@@ -80,6 +43,32 @@ class UFOAgentWorker:
         self.clear_config_cache = None
         self.get_ufo_config = None
         self.log_path = os.path.abspath(os.path.join("logs", "ufoagent_worker.log"))
+        self.ufo_stdio_path = os.path.abspath(
+            os.path.join("logs", "ufoagent_worker_ufo.log")
+        )
+        self._stdio_file = None
+        self._fault_file = None
+
+    def connect_control(self):
+        host = os.environ.get("UFOAGENT_WORKER_HOST", "127.0.0.1")
+        port = int(os.environ["UFOAGENT_WORKER_PORT"])
+        sock = socket.create_connection((host, port), timeout=10)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        return sock
+
+    def redirect_stdio(self):
+        os.makedirs(os.path.dirname(self.ufo_stdio_path), exist_ok=True)
+        self._stdio_file = open(self.ufo_stdio_path, "a", encoding="utf-8", buffering=1)
+        sys.stdout = self._stdio_file
+        sys.stderr = self._stdio_file
+
+    def enable_fault_dumps(self):
+        path = os.path.abspath(os.path.join("logs", "ufoagent_worker_faults.log"))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        self._fault_file = open(path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=self._fault_file)
+        faulthandler.dump_traceback_later(30, repeat=True, file=self._fault_file)
+        self.log("faulthandler_enabled", path=path)
 
     def log(self, message, **fields):
         try:
@@ -107,9 +96,14 @@ class UFOAgentWorker:
 
     def import_ufo(self):
         self.log("import_ufo_start", cwd=os.getcwd(), argv=sys.argv)
+        self.log("import_config_loader_start")
         from config.config_loader import clear_config_cache, get_ufo_config
+
+        self.log("import_config_loader_done")
+        self.log("import_session_pool_start")
         from ufo.module.session_pool import SessionFactory, SessionPool
 
+        self.log("import_session_pool_done")
         self.clear_config_cache = clear_config_cache
         self.get_ufo_config = get_ufo_config
         self.SessionFactory = SessionFactory
@@ -146,30 +140,30 @@ class UFOAgentWorker:
         self.queue = asyncio.Queue()
         loop = asyncio.get_running_loop()
         self._start_reader(loop)
-        stdout = CapturedStream(self.protocol, "stdout", self.current_cmd_id)
-        stderr = CapturedStream(self.protocol, "stderr", self.current_cmd_id)
-        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-            try:
-                self.import_ufo()
-                self.refresh_config()
-                self.log("worker_ready")
-                self.protocol.emit({"type": "ready"})
-                while True:
-                    command = await self.queue.get()
-                    await self.handle(command)
-            except Exception as exc:
-                self.protocol.emit(
-                    {
-                        "type": "fatal",
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "traceback": traceback.format_exc(limit=20),
-                    }
-                )
-                raise
+        self.redirect_stdio()
+        self.enable_fault_dumps()
+        try:
+            self.import_ufo()
+            self.refresh_config()
+            self.log("worker_ready")
+            self.protocol.emit({"type": "ready"})
+            while True:
+                command = await self.queue.get()
+                await self.handle(command)
+        except Exception as exc:
+            self.protocol.emit(
+                {
+                    "type": "fatal",
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "traceback": traceback.format_exc(limit=20),
+                }
+            )
+            raise
 
     def _start_reader(self, loop):
-        def read_stdin():
-            for raw in sys.stdin:
+        def read_control():
+            control_in = self.sock.makefile("r", encoding="utf-8")
+            for raw in control_in:
                 raw = raw.strip()
                 if not raw:
                     continue
@@ -190,7 +184,9 @@ class UFOAgentWorker:
                 else:
                     loop.call_soon_threadsafe(self.queue.put_nowait, command)
 
-        thread = threading.Thread(target=read_stdin, name="ufoagent-stdin", daemon=True)
+        thread = threading.Thread(
+            target=read_control, name="ufoagent-control", daemon=True
+        )
         thread.start()
 
     async def handle(self, command):
