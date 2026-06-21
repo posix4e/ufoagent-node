@@ -97,6 +97,7 @@ mod imp {
         child: Child,
         control: TcpStream,
         started_sig: String,
+        ready: bool,
         tasks_completed: usize,
         last_used: Instant,
     }
@@ -104,6 +105,7 @@ mod imp {
     #[derive(Default)]
     struct Inner {
         proc: Option<WorkerProc>,
+        starting_sig: Option<String>,
     }
 
     #[derive(Default)]
@@ -132,11 +134,7 @@ mod imp {
             }
             prepare_ufo_home()?;
             let sig = config_signature(&Config::load().ufo_home_path());
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("worker lock poisoned"))?;
-            self.ensure_started_locked(&mut inner, sig)?;
+            self.start_background(sig, "prewarm");
             Ok(())
         }
 
@@ -325,45 +323,110 @@ mod imp {
             }
         }
 
-        fn send_command(&self, command: WorkerCommand<'_>, sig: String) -> Result<()> {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("worker lock poisoned"))?;
-            self.ensure_started_locked(&mut inner, sig)?;
-            let proc = inner
-                .proc
-                .as_mut()
-                .ok_or_else(|| anyhow!("warm worker is not running"))?;
-            serde_json::to_writer(&mut proc.control, &command)?;
-            proc.control.write_all(b"\n")?;
-            proc.control.flush()?;
-            proc.last_used = Instant::now();
-            log::info!("warm worker command sent over tcp");
-            Ok(())
+        fn send_command(self: &Arc<Self>, command: WorkerCommand<'_>, sig: String) -> Result<()> {
+            let mut stale_proc = None;
+            let mut spawn_reason = None;
+            let outcome = {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("worker lock poisoned"))?;
+                if let Some((proc, reason)) = self.take_unusable_proc_locked(&mut inner, &sig)? {
+                    log::info!("warm worker recycling: {reason}");
+                    stale_proc = Some(proc);
+                }
+                if let Some(proc) = inner.proc.as_mut() {
+                    if !proc.ready {
+                        return Err(anyhow!("warm worker is still importing UFO"));
+                    }
+                    let write_result = (|| -> Result<()> {
+                        serde_json::to_writer(&mut proc.control, &command)?;
+                        proc.control.write_all(b"\n")?;
+                        proc.control.flush()?;
+                        Ok(())
+                    })();
+                    match write_result {
+                        Ok(()) => {
+                            proc.last_used = Instant::now();
+                            log::info!("warm worker command sent over tcp");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            stale_proc = inner.proc.take();
+                            if inner.starting_sig.is_none() {
+                                inner.starting_sig = Some(sig.clone());
+                                spawn_reason = Some("send failure restart");
+                            }
+                            Err(anyhow!("warm worker command send failed: {e}"))
+                        }
+                    }
+                } else {
+                    let message = if let Some(existing_sig) = inner.starting_sig.as_deref() {
+                        if existing_sig == sig {
+                            "warm worker is still starting in the background".to_string()
+                        } else {
+                            "warm worker is starting with an older config; cold fallback will run"
+                                .to_string()
+                        }
+                    } else {
+                        inner.starting_sig = Some(sig.clone());
+                        spawn_reason = Some("run_task");
+                        "warm worker is not connected; background start queued".to_string()
+                    };
+                    Err(anyhow!(message))
+                }
+            };
+            kill_proc(stale_proc);
+            if let Some(reason) = spawn_reason {
+                self.spawn_marked_start(sig, reason);
+            }
+            outcome
         }
 
         fn send_command_if_running(&self, command: WorkerCommand<'_>) -> Result<()> {
-            let mut inner = self
-                .inner
-                .lock()
-                .map_err(|_| anyhow!("worker lock poisoned"))?;
-            let Some(proc) = inner.proc.as_mut() else {
-                bail!("warm worker is not running");
+            let mut stale_proc = None;
+            let outcome = {
+                let mut inner = self
+                    .inner
+                    .lock()
+                    .map_err(|_| anyhow!("worker lock poisoned"))?;
+                let Some(proc) = inner.proc.as_mut() else {
+                    bail!("warm worker is not running");
+                };
+                if let Some(status) = proc.child.try_wait()? {
+                    stale_proc = inner.proc.take();
+                    Err(anyhow!("warm worker already exited with {status}"))
+                } else if !proc.ready {
+                    Err(anyhow!("warm worker is still importing UFO"))
+                } else {
+                    let write_result = (|| -> Result<()> {
+                        serde_json::to_writer(&mut proc.control, &command)?;
+                        proc.control.write_all(b"\n")?;
+                        proc.control.flush()?;
+                        Ok(())
+                    })();
+                    match write_result {
+                        Ok(()) => {
+                            proc.last_used = Instant::now();
+                            log::info!("warm worker control command sent over tcp");
+                            Ok(())
+                        }
+                        Err(e) => {
+                            stale_proc = inner.proc.take();
+                            Err(anyhow!("warm worker control send failed: {e}"))
+                        }
+                    }
+                }
             };
-            if let Some(status) = proc.child.try_wait()? {
-                kill_proc(inner.proc.take());
-                bail!("warm worker already exited with {status}");
-            }
-            serde_json::to_writer(&mut proc.control, &command)?;
-            proc.control.write_all(b"\n")?;
-            proc.control.flush()?;
-            proc.last_used = Instant::now();
-            log::info!("warm worker control command sent over tcp");
-            Ok(())
+            kill_proc(stale_proc);
+            outcome
         }
 
-        fn ensure_started_locked(&self, inner: &mut Inner, sig: String) -> Result<()> {
+        fn take_unusable_proc_locked(
+            &self,
+            inner: &mut Inner,
+            sig: &str,
+        ) -> Result<Option<(WorkerProc, String)>> {
             let mut recycle_reason = None;
             if let Some(proc) = inner.proc.as_mut() {
                 if let Some(status) = proc.child.try_wait()? {
@@ -378,18 +441,93 @@ mod imp {
                     recycle_reason = Some("worker memory threshold reached".to_string());
                 }
             }
-            if let Some(reason) = recycle_reason {
-                log::info!("warm worker recycling: {reason}");
-                kill_proc(inner.proc.take());
+            Ok(recycle_reason.and_then(|reason| inner.proc.take().map(|proc| (proc, reason))))
+        }
+
+        fn start_background(self: &Arc<Self>, sig: String, reason: &'static str) {
+            let should_spawn = {
+                let mut inner = match self.inner.lock() {
+                    Ok(inner) => inner,
+                    Err(_) => {
+                        log::warn!("warm worker start skipped: worker lock poisoned");
+                        return;
+                    }
+                };
+                if inner
+                    .proc
+                    .as_ref()
+                    .is_some_and(|proc| proc.started_sig == sig)
+                {
+                    false
+                } else if inner.starting_sig.is_some() {
+                    log::info!("warm worker start already pending");
+                    false
+                } else {
+                    inner.starting_sig = Some(sig.clone());
+                    true
+                }
+            };
+            if should_spawn {
+                self.spawn_marked_start(sig, reason);
             }
-            if inner.proc.is_none() {
-                inner.proc = Some(spawn_worker(sig)?);
-            }
-            Ok(())
+        }
+
+        fn spawn_marked_start(self: &Arc<Self>, sig: String, reason: &'static str) {
+            let manager = Arc::clone(self);
+            std::thread::spawn(move || {
+                log::info!("warm worker background start requested: {reason}");
+                let started = spawn_worker(sig.clone());
+                let mut discard_proc = None;
+                match started {
+                    Ok(proc) => {
+                        let mut inner = match manager.inner.lock() {
+                            Ok(inner) => inner,
+                            Err(_) => {
+                                log::warn!(
+                                    "warm worker background start discarded: worker lock poisoned"
+                                );
+                                kill_proc(Some(proc));
+                                return;
+                            }
+                        };
+                        if inner.starting_sig.as_deref() == Some(sig.as_str())
+                            && inner.proc.is_none()
+                        {
+                            inner.starting_sig = None;
+                            inner.proc = Some(proc);
+                            log::info!("warm worker background start connected");
+                        } else {
+                            if inner.starting_sig.as_deref() == Some(sig.as_str()) {
+                                inner.starting_sig = None;
+                            }
+                            discard_proc = Some(proc);
+                        }
+                    }
+                    Err(e) => {
+                        if let Ok(mut inner) = manager.inner.lock() {
+                            if inner.starting_sig.as_deref() == Some(sig.as_str()) {
+                                inner.starting_sig = None;
+                            }
+                        }
+                        log::warn!("warm worker background start failed: {e:#}");
+                    }
+                }
+                kill_proc(discard_proc);
+            });
         }
 
         fn dispatch(&self, event: WorkerEvent) {
-            if matches!(event.kind.as_str(), "ready" | "pong") {
+            if event.kind == "ready" {
+                if let Ok(mut inner) = self.inner.lock() {
+                    if let Some(proc) = inner.proc.as_mut() {
+                        proc.ready = true;
+                        proc.last_used = Instant::now();
+                    }
+                }
+                log::info!("warm worker event: ready");
+                return;
+            }
+            if event.kind == "pong" {
                 log::info!("warm worker event: {}", event.kind);
                 return;
             }
@@ -435,23 +573,31 @@ mod imp {
 
         fn recycle(&self, reason: &str) {
             log::info!("warm worker recycling: {reason}");
-            if let Ok(mut inner) = self.inner.lock() {
-                kill_proc(inner.proc.take());
-            }
+            let proc = self
+                .inner
+                .lock()
+                .ok()
+                .and_then(|mut inner| inner.proc.take());
+            kill_proc(proc);
         }
 
         fn recycle_if_idle(&self) {
-            if let Ok(mut inner) = self.inner.lock() {
+            let proc = self.inner.lock().ok().and_then(|mut inner| {
                 let idle = inner
                     .proc
                     .as_ref()
                     .map(|proc| proc.last_used.elapsed() >= IDLE_TIMEOUT)
                     .unwrap_or(false);
                 if idle {
-                    log::info!("warm worker recycling: idle timeout");
-                    kill_proc(inner.proc.take());
+                    inner.proc.take()
+                } else {
+                    None
                 }
+            });
+            if proc.is_some() {
+                log::info!("warm worker recycling: idle timeout");
             }
+            kill_proc(proc);
         }
     }
 
@@ -515,6 +661,7 @@ mod imp {
             child,
             control,
             started_sig: sig,
+            ready: false,
             tasks_completed: 0,
             last_used: Instant::now(),
         })
@@ -648,9 +795,9 @@ mod imp {
     }
 
     pub fn prewarm() {
-        let manager = Manager::global();
-        Manager::start_monitor(manager.clone());
         std::thread::spawn(move || {
+            let manager = Manager::global();
+            Manager::start_monitor(manager.clone());
             if let Err(e) = manager.prewarm() {
                 log::info!("warm worker prewarm skipped: {e:#}");
             }
