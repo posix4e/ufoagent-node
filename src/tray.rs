@@ -215,6 +215,9 @@ mod imp {
                     req.id,
                     req.task
                 );
+                progress(format!(
+                    "Warm UFO worker unavailable; falling back to cold UFO2: {e:#}"
+                ));
                 run_one_cold(req, progress, abort)
             }
         }

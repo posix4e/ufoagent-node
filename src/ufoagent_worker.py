@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import threading
+import time
 import traceback
 
 
@@ -78,11 +79,34 @@ class UFOAgentWorker:
         self.SessionPool = None
         self.clear_config_cache = None
         self.get_ufo_config = None
+        self.log_path = os.path.abspath(os.path.join("logs", "ufoagent_worker.log"))
+
+    def log(self, message, **fields):
+        try:
+            os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+            record = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "message": message,
+                **fields,
+            }
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False, default=str))
+                f.write("\n")
+        except Exception:
+            pass
+
+    def emit_diag(self, message, cmd_id=None, **fields):
+        self.log(message, cmd_id=cmd_id, **fields)
+        payload = {"type": "diag", "message": message, **fields}
+        if cmd_id:
+            payload["cmd_id"] = cmd_id
+        self.protocol.emit(payload)
 
     def current_cmd_id(self):
         return self.active.cmd_id if self.active else None
 
     def import_ufo(self):
+        self.log("import_ufo_start", cwd=os.getcwd(), argv=sys.argv)
         from config.config_loader import clear_config_cache, get_ufo_config
         from ufo.module.session_pool import SessionFactory, SessionPool
 
@@ -90,8 +114,10 @@ class UFOAgentWorker:
         self.get_ufo_config = get_ufo_config
         self.SessionFactory = SessionFactory
         self.SessionPool = SessionPool
+        self.log("import_ufo_done")
 
     def refresh_config(self):
+        self.log("refresh_config_start")
         cfg = None
         if self.clear_config_cache:
             self.clear_config_cache()
@@ -114,6 +140,7 @@ class UFOAgentWorker:
                 legacy_config.Config._instance = None
         except Exception:
             pass
+        self.log("refresh_config_done", reloaded=cfg is not None)
 
     async def run(self):
         self.queue = asyncio.Queue()
@@ -125,6 +152,7 @@ class UFOAgentWorker:
             try:
                 self.import_ufo()
                 self.refresh_config()
+                self.log("worker_ready")
                 self.protocol.emit({"type": "ready"})
                 while True:
                     command = await self.queue.get()
@@ -182,6 +210,7 @@ class UFOAgentWorker:
         cmd_id = str(command.get("cmd_id") or "")
         task = str(command.get("task") or "adhoc")
         request = command.get("request") or task
+        self.emit_diag("run_received", cmd_id=cmd_id or None, task=task)
         if not cmd_id:
             self.protocol.emit({"type": "error", "error": "run missing cmd_id"})
             return
@@ -204,7 +233,23 @@ class UFOAgentWorker:
                 plan="",
                 request=request,
             )
+            session_log_paths = [
+                os.path.abspath(getattr(session, "log_path", "")) for session in sessions
+            ]
+            self.emit_diag(
+                "session_created",
+                cmd_id=cmd_id,
+                task=task,
+                cwd=os.getcwd(),
+                log_paths=session_log_paths,
+                session_count=len(sessions),
+            )
         except Exception as exc:
+            self.emit_diag(
+                "session_create_failed",
+                cmd_id=cmd_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
             self.protocol.emit(
                 {
                     "type": "result",
@@ -217,6 +262,7 @@ class UFOAgentWorker:
 
         self.active = ActiveTask(cmd_id, task, sessions)
         self.active.future = asyncio.create_task(self._run_active(self.active))
+        self.emit_diag("run_scheduled", cmd_id=cmd_id, task=task)
 
     def handle_resume(self, command):
         cmd_id = str(command.get("cmd_id") or "")
@@ -245,6 +291,7 @@ class UFOAgentWorker:
         if not correction:
             correction = "Overseer requested a correction. Reassess and continue safely."
         ok = bool(inject(f"Overseer correction:\n{correction}"))
+        self.emit_diag("resume_injected", cmd_id=cmd_id, ok=ok)
         self.protocol.emit({"type": "resume_ack", "cmd_id": cmd_id, "ok": ok})
         self.protocol.emit(
             {
@@ -258,6 +305,7 @@ class UFOAgentWorker:
         cmd_id = str(command.get("cmd_id") or "")
         if self.active and self.active.cmd_id == cmd_id:
             self.active.halted = True
+            self.emit_diag("abort_received", cmd_id=cmd_id)
             if self.active.future and not self.active.future.done():
                 if loop:
                     loop.call_soon_threadsafe(self.active.future.cancel)
@@ -271,15 +319,23 @@ class UFOAgentWorker:
         status = "failed"
         result = ""
         try:
+            self.emit_diag("ufo_run_start", cmd_id=active.cmd_id, task=active.task)
             await self.SessionPool(active.sessions).run_all()
             status = "halted" if active.halted else "done"
             result = self._summary(active.sessions)
+            self.emit_diag("ufo_run_finished", cmd_id=active.cmd_id, status=status)
         except asyncio.CancelledError:
             status = "halted"
             result = "halted by overseer"
+            self.emit_diag("ufo_run_cancelled", cmd_id=active.cmd_id)
         except Exception as exc:
             status = "failed"
             result = f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=20)}"
+            self.emit_diag(
+                "ufo_run_failed",
+                cmd_id=active.cmd_id,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         finally:
             if active.halted and status != "failed":
                 status = "halted"
@@ -293,6 +349,7 @@ class UFOAgentWorker:
                     "result": result[-8192:],
                 }
             )
+            self.emit_diag("result_sent", cmd_id=active.cmd_id, status=status)
             if self.active is active:
                 self.active = None
 

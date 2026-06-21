@@ -47,6 +47,8 @@ mod imp {
     const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
     const ABORT_GRACE: Duration = Duration::from_secs(5);
     const RECV_POLL: Duration = Duration::from_millis(200);
+    const WORKER_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(45);
+    const WORKER_FIRST_STEP_TIMEOUT: Duration = Duration::from_secs(120);
     const MAX_TASKS_PER_WORKER: usize = 12;
     const MAX_WORKING_SET_BYTES: u64 = 1536 * 1024 * 1024;
 
@@ -144,7 +146,17 @@ mod imp {
         ) -> Result<runtime::RemoteTaskResult> {
             prepare_ufo_home()?;
             let cfg = Config::load();
-            let sig = config_signature(&cfg.ufo_home_path());
+            let home = cfg.ufo_home_path();
+            let sig = config_signature(&home);
+            let response_log = response_log_path(&home, &req.task);
+            let response_log_baseline = response_log_line_count(&response_log);
+            log::info!(
+                "warm worker dispatch: cmd={} task={} response_log={} baseline_lines={}",
+                req.id,
+                req.task,
+                response_log.display(),
+                response_log_baseline
+            );
             let rx = self.register_waiter(&req.id)?;
             let send_result = self.send_command(
                 WorkerCommand::Run {
@@ -161,6 +173,9 @@ mod imp {
 
             let mut abort_sent = false;
             let mut abort_deadline: Option<Instant> = None;
+            let started_at = Instant::now();
+            let mut saw_worker_event = false;
+            let mut saw_response_step = false;
             loop {
                 if abort.load(std::sync::atomic::Ordering::Relaxed) && !abort_sent {
                     abort_sent = true;
@@ -176,15 +191,56 @@ mod imp {
                         result: "halted by overseer; warm worker was restarted".into(),
                     });
                 }
+                if !saw_response_step
+                    && response_log_line_count(&response_log) > response_log_baseline
+                {
+                    saw_response_step = true;
+                    log::info!(
+                        "warm worker first UFO response.log step observed: cmd={} task={}",
+                        req.id,
+                        req.task
+                    );
+                }
+                if !saw_worker_event && started_at.elapsed() >= WORKER_FIRST_EVENT_TIMEOUT {
+                    self.recycle("worker accepted task but emitted no task event");
+                    self.unregister_waiter(&req.id);
+                    bail!(
+                        "warm worker produced no task event within {}s after dispatch; recycled for cold fallback",
+                        WORKER_FIRST_EVENT_TIMEOUT.as_secs()
+                    );
+                }
+                if saw_worker_event
+                    && !saw_response_step
+                    && started_at.elapsed() >= WORKER_FIRST_STEP_TIMEOUT
+                {
+                    self.recycle("worker emitted diagnostics but no UFO response.log step");
+                    self.unregister_waiter(&req.id);
+                    bail!(
+                        "warm worker produced no new {} line within {}s after dispatch; recycled for cold fallback",
+                        response_log.display(),
+                        WORKER_FIRST_STEP_TIMEOUT.as_secs()
+                    );
+                }
 
                 match rx.recv_timeout(RECV_POLL) {
                     Ok(ev) => match ev.kind.as_str() {
+                        "diag" => {
+                            saw_worker_event = true;
+                            log::info!(
+                                "warm worker diag cmd={}: {}",
+                                req.id,
+                                ev.message.unwrap_or_else(|| "diagnostic".into())
+                            );
+                        }
                         "progress" => {
+                            saw_worker_event = true;
                             if let Some(message) = ev.message {
+                                log::info!("warm worker progress cmd={}: {}", req.id, message);
                                 progress(message);
                             }
                         }
                         "resume_ack" => {
+                            saw_worker_event = true;
                             if ev.ok == Some(false) {
                                 log::warn!(
                                     "warm worker resume rejected for {}: {}",
@@ -193,8 +249,16 @@ mod imp {
                                 );
                             }
                         }
-                        "abort_ack" => {}
+                        "abort_ack" => {
+                            saw_worker_event = true;
+                            log::info!("warm worker abort_ack cmd={}", req.id);
+                        }
                         "result" => {
+                            log::info!(
+                                "warm worker result cmd={} status={}",
+                                req.id,
+                                ev.status.clone().unwrap_or_else(|| "failed".into())
+                            );
                             self.unregister_waiter(&req.id);
                             self.mark_task_done();
                             return Ok(runtime::RemoteTaskResult {
@@ -203,7 +267,10 @@ mod imp {
                                 result: ev.result.unwrap_or_default(),
                             });
                         }
-                        other => log::debug!("warm worker event for {}: {}", req.id, other),
+                        other => {
+                            saw_worker_event = true;
+                            log::debug!("warm worker event for {}: {}", req.id, other);
+                        }
                     },
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {
@@ -270,6 +337,7 @@ mod imp {
             proc.stdin.write_all(b"\n")?;
             proc.stdin.flush()?;
             proc.last_used = Instant::now();
+            log::info!("warm worker command sent");
             Ok(())
         }
 
@@ -289,6 +357,7 @@ mod imp {
             proc.stdin.write_all(b"\n")?;
             proc.stdin.flush()?;
             proc.last_used = Instant::now();
+            log::info!("warm worker control command sent");
             Ok(())
         }
 
@@ -345,6 +414,11 @@ mod imp {
                 .and_then(|waiters| waiters.get(&cmd_id).cloned());
             if let Some(waiter) = waiter {
                 let _ = waiter.send(event);
+            } else {
+                log::info!(
+                    "warm worker event without waiter for {cmd_id}: {}",
+                    event.kind
+                );
             }
         }
 
@@ -428,7 +502,12 @@ mod imp {
                 }
             }
         });
-        log::info!("warm worker spawned");
+        log::info!(
+            "warm worker spawned: pid={} script={} cwd={}",
+            child.id(),
+            script.display(),
+            home.display()
+        );
         Ok(WorkerProc {
             child,
             stdin,
@@ -492,6 +571,16 @@ mod imp {
             modified.as_secs(),
             modified.subsec_nanos()
         )
+    }
+
+    fn response_log_path(home: &Path, task: &str) -> PathBuf {
+        home.join("logs").join(task).join("response.log")
+    }
+
+    fn response_log_line_count(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .map(|raw| raw.lines().count())
+            .unwrap_or(0)
     }
 
     fn kill_proc(proc: Option<WorkerProc>) {
