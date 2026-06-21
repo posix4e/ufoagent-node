@@ -1,0 +1,63 @@
+{
+  "generated_at": 1782070718,
+  "model": "gpt-4o",
+  "source": "UFO response.log snapshots from self-hosted e2e",
+  "steps": [
+    {
+      "id": "bambu-download-cmd_gja2hf0ui1c2huvj0j23:2",
+      "phase": "bambu-download",
+      "cmd_id": "cmd_gja2hf0ui1c2huvj0j23",
+      "round": 0,
+      "step": 2,
+      "agent_type": "AppAgent",
+      "status": "CONFIRM",
+      "observation": "Ready to confirm the download of the Bambu Studio Windows installer by clicking 'Save'.",
+      "thought": "",
+      "plan": "",
+      "control_text": "Save",
+      "action": "[\"[Action] click_input(id='37', name='Save', button='left', double=False)\\n[Target] kind=TargetKind.CONTROL, name=Save, id=37, type=Button\\n[Status] ResultStatus.SUCCESS\\n[Result] Click action has been executed, with parameters: {'button': 'left', 'double': False}\"]",
+      "overseer": {},
+      "label": "Step 1: Prepare for Download",
+      "caption": "The agent is prepared to confirm the download of the Bambu Studio Windows installer by clicking 'Save'."
+    },
+    {
+      "id": "bambu-download-cmd_gja2hf0ui1c2huvj0j23:3",
+      "phase": "bambu-download",
+      "cmd_id": "cmd_gja2hf0ui1c2huvj0j23",
+      "round": 0,
+      "step": 3,
+      "agent_type": "AppAgent",
+      "status": "FINISH",
+      "observation": "Successfully confirmed the download of the Bambu Studio Windows installer in Brave by clicking the 'Save' button. The download should now be in progress or completed.",
+      "thought": "",
+      "plan": "",
+      "control_text": "",
+      "action": "[]",
+      "overseer": {
+        "verdict": "on_track",
+        "action": "continue",
+        "reasoning": "The agent has successfully executed all the previous steps. Brave was launched with the correct URL, and the 'Save' button was clicked to confirm the download. The next natural step is to wait for the download to complete in Brave."
+      },
+      "label": "Step 2: Confirm Download",
+      "caption": "Successfully confirmed the download of the Bambu Studio Windows installer in Brave, indicating that the download should now be in progress or completed."
+    },
+    {
+      "id": "remote-cmd_hcz4pck5zychiguoio36:2",
+      "phase": "remote",
+      "cmd_id": "cmd_hcz4pck5zychiguoio36",
+      "round": 0,
+      "step": 2,
+      "agent_type": "AppAgent",
+      "status": "FINISH",
+      "observation": "Successfully typed 'hello from ufoagent' into the Notepad application.",
+      "thought": "",
+      "plan": "",
+      "control_text": "Text Editor",
+      "action": "[\"[Action] set_edit_text(id='1', name='Text Editor', text='hello from ufoagent')\\n[Target] kind=TargetKind.CONTROL, name=Text Editor, id=1, type=Edit\\n[Status] ResultStatus.SUCCESS\\n[Result] Executed action set_edit_text(text='hello from ufoagent', clear_current_text=False), please check the application for whether it took effect.\"]",
+      "overseer": {},
+      "label": "Step 3: Verify Installation",
+      "caption": "Notepad is used to verify successful interaction by typing 'hello from ufoagent' into the application."
+    }
+  ],
+  "candidate_count": 9
+}
