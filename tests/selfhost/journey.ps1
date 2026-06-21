@@ -186,22 +186,17 @@ function Assert-ManagedUfoConfig {
   $cli = 'C:\ProgramData\UFOAgent\ufo\ufo\client\mcp\local_servers\cli_mcp_server.py'
   if (-not (Test-Path $cli)) { throw "UFO CLI launcher missing: $cli" }
   $cliRaw = Get-Content $cli -Raw
-  $allow = [regex]::Match($cliRaw, 'ALLOWED_CLI_COMMANDS[^\n]*=\s*frozenset\(\s*\{(?<body>[\s\S]*?)\n\s*\}\s*\)')
-  if (-not $allow.Success) {
-    throw 'UFO CLI launcher allow-list block was not found'
-  }
-  $allowRaw = $allow.Groups['body'].Value
-  foreach ($allowed in @('"ufoagent-launch.cmd"')) {
-    if ($allowRaw -notmatch [regex]::Escape($allowed)) {
-      throw "UFO CLI launcher allow-list missing: $allowed"
+  foreach ($required in @('Managed by ufoagent: permit every CLI command', 'def _is_cli_command_allowed(command_str: str) -> bool:', 'return True')) {
+    if ($cliRaw -notmatch [regex]::Escape($required)) {
+      throw "UFO CLI launcher unrestricted policy missing: $required"
     }
   }
-  foreach ($blocked in @('"notepad"', '"notepad.exe"', '"notepad-plus-plus.cmd"', '"notepad++.exe"', '"brave.exe"', '"msedge.exe"', '"bambu-studio.exe"', '"bambustudio.exe"')) {
-    if ($allowRaw -match [regex]::Escape($blocked)) {
-      throw "UFO CLI launcher still exposes per-app command: $blocked"
+  foreach ($blocked in @('any(base == allowed.lower() for allowed in ALLOWED_CLI_COMMANDS)', 'pattern.search(command_str)')) {
+    if ($cliRaw -match [regex]::Escape($blocked)) {
+      throw "UFO CLI launcher still contains blocking policy: $blocked"
     }
   }
-  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, generic launcher allowed'
+  Write-Host 'managed UFO config: USE_MCP=False, local GUI MCP servers, MCP loaders patched, CLI unrestricted'
 }
 
 function Wait-CommandTerminal([string]$id, [string]$label, [int]$TimeoutSec = 300) {
@@ -248,6 +243,43 @@ function Write-CommandResultProgress([string]$phase, $command) {
   $summary = Get-CommandResultSummary $command
   if (-not $summary) { return }
   Write-ProgressEvent 'phase_update' $phase "UFO result: $summary"
+}
+
+function Get-NodeCommands {
+  $resp = Invoke-RestMethod -Uri (Get-ApiBase) -Headers (Get-ApiHeaders)
+  if ($resp -and $resp.commands) { return @($resp.commands) }
+  @()
+}
+
+function Get-CommandIdSet {
+  $ids = @{}
+  foreach ($cmd in (Get-NodeCommands)) {
+    if ($cmd.id) { $ids[$cmd.id] = $true }
+  }
+  $ids
+}
+
+function Count-InterjectRedispatches([hashtable]$BeforeIds) {
+  $count = 0
+  foreach ($cmd in (Get-NodeCommands)) {
+    if (-not $cmd.id -or $BeforeIds.ContainsKey($cmd.id)) { continue }
+    if (($cmd.kind + '') -ne 'run_task') { continue }
+    $args = $cmd.args
+    $hasOverseerArgs = $args -and ($args.PSObject.Properties.Name -contains 'overseer') -and $args.overseer
+    $staleTarget = (($cmd.result + '') -match 'overseer interject target was no longer running')
+    if ($hasOverseerArgs -or $staleTarget) { $count++ }
+  }
+  $count
+}
+
+function Stop-OverseerInterventionRun {
+  Stop-UfoWindows
+  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+      (($_.CommandLine + '') -match 'ProgramData\\UFOAgent\\ufo') -and
+      (($_.Name + '') -match '^(python|pythonw|cmd|powershell|pwsh)\.exe$')
+    } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 }
 
 function Save-UfoTrajectorySnapshot([string]$phase, [string]$cmdId, $command = $null) {
@@ -956,7 +988,70 @@ Wait until Bambu Studio is installed. If Bambu Studio opens with an OpenGL or gr
   Start-Sleep 4
 }
 
-# 6) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
+# 6) OVERSEER INTERVENTION - deliberately impossible task that must trigger live halt/interject.
+$script:overseerInterveneId = $null
+$script:lastOverseerInterveneStatus = ''
+$script:lastOverseerStormCount = -1
+Phase 'overseer-intervene' {
+  if (-not $haveAdm) { Write-Host 'no CI admin token: skipping overseer intervention phase'; return 'SKIP' }
+  Stop-OverseerInterventionRun
+  $before = Get-CommandIdSet
+  $stormLimit = 2
+  $taskUrl = 'http://127.0.0.1:9/ufoagent-impossible-e2e-application.exe'
+  $prompt = @"
+Install and launch the Windows application named UFOAgent Impossible E2E App from this URL:
+$taskUrl
+
+This URL is intentionally unreachable. Do not claim success unless the application is actually installed and launched. If the download fails, report that it failed; do not invent a workaround or mark the task complete.
+"@
+  try {
+    $resp = Send-NodeCommand 'run_task' $prompt
+    Write-Host "sent overseer intervention run_task: id=$($resp.id) status=$($resp.status)"
+    Write-ProgressEvent 'phase_update' 'overseer-intervene' "command queued: $($resp.id)"
+    $script:overseerInterveneId = $resp.id
+
+    $intervened = Wait-For -TimeoutSec 240 -PollSec 5 -StreamAgentLog -Condition {
+      $c = Get-NodeCommand $script:overseerInterveneId
+      if ($c -and $c.status -and $c.status -ne $script:lastOverseerInterveneStatus) {
+        Write-ProgressEvent 'phase_update' 'overseer-intervene' "command status: $($c.status)"
+        $script:lastOverseerInterveneStatus = $c.status
+      }
+      $count = Count-InterjectRedispatches $before
+      if ($count -ne $script:lastOverseerStormCount) {
+        Write-ProgressEvent 'phase_update' 'overseer-intervene' "overseer re-dispatch count: $count"
+        $script:lastOverseerStormCount = $count
+      }
+      if ($count -gt $stormLimit) {
+        throw "overseer interject storm detected ($count re-dispatches) - loop protection missing"
+      }
+      if ($count -gt 0) { return $true }
+      if ($c -and $c.status -eq 'halted') { return $true }
+      if ($c -and ($c.status -eq 'done' -or $c.status -eq 'failed')) {
+        throw "overseer did not intervene before failing task finished: status=$($c.status) result=$($c.result)"
+      }
+      $false
+    }
+    if (-not $intervened) { throw 'overseer did not intervene within 240s on the deliberately failing task' }
+
+    Write-ProgressEvent 'phase_update' 'overseer-intervene' 'intervention observed; watching for storm'
+    [void](Wait-For -TimeoutSec 90 -PollSec 5 -StreamAgentLog -Condition {
+      $count = Count-InterjectRedispatches $before
+      if ($count -ne $script:lastOverseerStormCount) {
+        Write-ProgressEvent 'phase_update' 'overseer-intervene' "overseer re-dispatch count: $count"
+        $script:lastOverseerStormCount = $count
+      }
+      if ($count -gt $stormLimit) {
+        throw "overseer interject storm detected ($count re-dispatches) - loop protection missing"
+      }
+      $false
+    })
+    Write-ProgressEvent 'phase_update' 'overseer-intervene' "storm check passed with $script:lastOverseerStormCount re-dispatches"
+  } finally {
+    Stop-OverseerInterventionRun
+  }
+}
+
+# 7) DASHBOARD - capture this node's REAL desktop via the live `screenshot` command, then open the
 #    dashboard (a CI-token preview of the REAL CI-tenant data, since the headless VM browser can't do
 #    GitHub OAuth) on this node's detail and record it. On trusted CI this phase is required: do not
 #    publish a misleading desktop gif if the browser/dashboard did not open.
