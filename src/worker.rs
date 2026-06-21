@@ -131,10 +131,16 @@ mod imp {
         }
 
         fn prewarm(self: &Arc<Self>) -> Result<()> {
+            if self.has_worker_or_starting()? {
+                return Ok(());
+            }
             self.prewarm_with_reason("prewarm")
         }
 
         fn prewarm_with_reason(self: &Arc<Self>, reason: &'static str) -> Result<()> {
+            if self.has_worker_or_starting()? {
+                return Ok(());
+            }
             if env::gate(env::UFO2).is_some() {
                 return Ok(());
             }
@@ -151,6 +157,14 @@ mod imp {
                     log::info!("warm worker re-prewarm skipped after {reason}: {e:#}");
                 }
             });
+        }
+
+        fn has_worker_or_starting(&self) -> Result<bool> {
+            let inner = self
+                .inner
+                .lock()
+                .map_err(|_| anyhow!("worker lock poisoned"))?;
+            Ok(inner.proc.is_some() || inner.starting_sig.is_some())
         }
 
         fn run_task(
@@ -592,11 +606,7 @@ mod imp {
                         log::warn!("warm worker background start failed: {e:#}");
                     }
                 }
-                let discarded_worker = discard_proc.is_some();
                 kill_proc(discard_proc);
-                if discarded_worker {
-                    manager.reprewarm_after_removal("discarded worker");
-                }
             });
         }
 
