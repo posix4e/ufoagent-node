@@ -1,0 +1,13 @@
+# PPO RL fine-tuning (clipped actor-critic alternative to GRPO).
+algo: ppo
+iterations: 150
+rollouts_per_task: 8
+epochs: 4              # surrogate epochs reusing each batch of rollouts
+batch_size: 256
+lr: 0.01
+clip: 0.2
+gamma: 0.99
+vf_coef: 0.5
+ent_coef: 0.01
+repair_a11y: true
+seed: 0

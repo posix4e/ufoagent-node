@@ -1,0 +1,5 @@
+# Behavior cloning (offline bootstrap from logged trajectories).
+epochs: 30
+batch_size: 64
+lr: 0.05
+seed: 0

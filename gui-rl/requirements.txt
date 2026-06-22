@@ -1,0 +1,10 @@
+# Core runtime (CPU, runs the full pipeline against the mock backend).
+numpy>=1.21
+gymnasium>=0.29
+
+# Dev / tests
+pytest>=7.0
+
+# Optional extras (install as needed; see pyproject.toml):
+#   pip install '.[torch]'     # VLM policy + GPU training
+#   pip install '.[windows]'   # real Windows backend + dynamic instrumentation

@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gui-rl"
+version = "0.1.0"
+description = "From-scratch reinforcement-learning framework for Windows GUI agents: pixels + a11y observations, grounded actions, dynamic-instrumentation reward oracle, offline-first (behavior cloning -> GRPO/PPO)."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "UFOAgent, Inc." }]
+dependencies = [
+    "numpy>=1.21",
+    "gymnasium>=0.29",
+]
+
+[project.optional-dependencies]
+# Real-hardware policy (VLM) and training on GPU.
+torch = ["torch>=2.1", "transformers>=4.40"]
+# Real Windows backend + dynamic instrumentation.
+windows = ["uiautomation>=2.0", "pywinauto>=0.6", "mss>=9.0", "pillow>=10.0", "frida>=16.0"]
+dev = ["pytest>=7.0", "pyyaml>=6.0"]
+
+[project.scripts]
+gui-rl = "gui_rl.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["gui_rl*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

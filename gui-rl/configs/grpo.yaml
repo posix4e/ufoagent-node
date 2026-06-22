@@ -1,0 +1,8 @@
+# GRPO RL fine-tuning (the primary recipe). Used after behavior cloning.
+algo: grpo
+iterations: 150
+group_size: 10        # episodes per task per iteration; advantage = group-normalised return
+lr: 0.03
+ent_coef: 0.01        # entropy bonus to keep exploring
+repair_a11y: true     # use dynamic instrumentation to repair the a11y observation
+seed: 0
